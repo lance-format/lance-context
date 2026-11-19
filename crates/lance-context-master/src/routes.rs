@@ -998,6 +998,10 @@ async fn drain_executor(
 /// Build the admin API router (mounted under `/api/v1`).
 pub fn api_router() -> Router<Arc<MasterState>> {
     Router::new()
+        .route(
+            "/stores/{kind}/{name}/flush",
+            post(crate::publication::flush_table),
+        )
         .route("/executor", get(executor_status))
         .route("/merge-retirements", post(crate::legacy_retirement::route))
         .route("/merge-progress", get(merge_progress))
@@ -1123,6 +1127,7 @@ mod tests {
             merge_wal_min_generations: 8,
             merge_wal_admission_targets: vec![],
             worker_endpoints: vec![],
+            table_flush_timeout_secs: 20,
             task_concurrency: 4,
             merge_wal_concurrency: 4,
             legacy_merge_wait_concurrency: 32,
