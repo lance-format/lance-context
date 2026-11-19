@@ -25,6 +25,16 @@ duration. An optional `--disk-directory /tmp/example-wal` counts allocated block
 in a flat directory, deduplicates hard links and rejects symlinks or subdirectories.
 Files removed concurrently by collection may disappear during the scan.
 
+The process record also separates `user_ticks` and `system_ticks` and reports
+cumulative `minor_faults` and `major_faults` from the existing stat read, excluding
+waited-for children. `cpu_ticks` remains the sum of user and system ticks.
+With `--threads`, each observed thread exposes the same counters. Compare deltas
+only for the same PID/TID and start time; thread snapshots may omit exited
+threads and must not be added to process totals. These fields require no additional
+procfs reads. Minor faults do not imply disk I/O or identify an allocation or
+copying bottleneck by themselves; major faults and cgroup memory events have
+different meanings and scopes.
+
 `--tcp-port 7800` adds an optional `tcp` object. The sampler intersects socket
 inodes from the target's open file descriptors with its network namespace's
 IPv4/IPv6 TCP tables. Namespace neighbors are excluded and duplicated descriptors

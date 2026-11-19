@@ -20,6 +20,10 @@ struct Thread {
     state: char,
     start_ticks: u64,
     cpu_ticks: u64,
+    user_ticks: u64,
+    system_ticks: u64,
+    minor_faults: u64,
+    major_faults: u64,
 }
 
 fn parse(tid: u32, text: &str, page_bytes: u64) -> Result<Thread> {
@@ -33,6 +37,10 @@ fn parse(tid: u32, text: &str, page_bytes: u64) -> Result<Thread> {
         state: value.state,
         start_ticks: value.start_ticks,
         cpu_ticks: value.cpu_ticks,
+        user_ticks: value.user_ticks,
+        system_ticks: value.system_ticks,
+        minor_faults: value.minor_faults,
+        major_faults: value.major_faults,
     })
 }
 
@@ -76,6 +84,8 @@ mod tests {
         assert_eq!(thread.name, "worker ) (cpu");
         assert_eq!(thread.start_ticks, 1234);
         assert_eq!(thread.cpu_ticks, 23);
+        assert_eq!((thread.user_ticks, thread.system_ticks), (11, 12));
+        assert_eq!((thread.minor_faults, thread.major_faults), (7, 9));
         assert!(parse(43, text, 4096).is_err());
         assert!(parse(42, "42 (worker) R 0", 4096).is_err());
         Ok(())
