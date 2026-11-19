@@ -70,6 +70,8 @@ struct Policy {
     #[serde(default)]
     aggregate_merge_slots: usize,
     endpoints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_worker_kind: Option<String>,
     fence_legacy: bool,
     owned: Vec<String>,
     draining: Vec<String>,
@@ -113,6 +115,11 @@ impl Policy {
                 config.task_concurrency.max(1)
             },
             endpoints: config.worker_endpoints.clone(),
+            managed_worker_kind: config
+                .worker_discovery
+                .managed_worker_service
+                .as_ref()
+                .and(config.managed_store_kind.clone()),
             fence_legacy: config.merge_rollout.fence_legacy,
             owned: config.merge_rollout.owned_targets.clone(),
             draining: config.merge_rollout.drain_targets.clone(),
@@ -151,7 +158,14 @@ impl Policy {
             .is_ok();
         let ordinary = self.automatic
             && !self.draining.iter().any(|t| t == target)
-            && (!self.endpoints.is_empty() || dynamic || self.local.iter().any(|t| t == target));
+            && (!self.endpoints.is_empty()
+                || dynamic
+                || self.local.iter().any(|t| t == target)
+                || self.managed_worker_kind.as_ref().is_some_and(|kind| {
+                    target
+                        .strip_prefix(kind)
+                        .is_some_and(|rest| rest.starts_with(':'))
+                }));
         ordinary
             || self.fence_legacy
             || self.owned.iter().any(|t| t == target)
@@ -1001,6 +1015,31 @@ mod tests {
 
     fn config() -> MasterConfig {
         MasterConfig::parse_from(["test"])
+    }
+
+    #[test]
+    fn discovered_workers_admit_only_their_registered_store_kind() {
+        let cfg = MasterConfig::parse_from([
+            "test",
+            "--managed-store-kind",
+            "events",
+            "--managed-worker-service",
+            "workers",
+            "--merge-wal-interval-secs",
+            "60",
+        ]);
+        let policy = Policy::from_config(&cfg);
+        assert!(policy.admits_request("events:table", None));
+        assert!(cfg.has_workers_for("events:table"));
+        for target in ["rollout", "generic:table", "eventstuff:table"] {
+            assert!(!policy.admits_request(target, None));
+            assert!(!cfg.has_workers_for(target));
+        }
+        // Old controller policies without the new optional field remain readable.
+        let mut old = serde_json::to_value(&policy).unwrap();
+        old.as_object_mut().unwrap().remove("managed_worker_kind");
+        let old: Policy = serde_json::from_value(old).unwrap();
+        assert!(!old.admits_request("events:table", None));
     }
 
     pub(super) async fn fixture() -> (tempfile::TempDir, MasterConfig, TaskStore) {

@@ -112,6 +112,7 @@ pub struct MasterState {
         tokio::sync::watch::Sender<Option<Arc<Vec<crate::scanner::ScanEntry>>>>,
     /// Shared HTTP client for fanning `MergeWal` tasks out to worker endpoints.
     pub http: reqwest::Client,
+    pub(crate) managed_workers: Option<crate::worker_discovery::KubernetesWorkers>,
     pub(crate) legacy_response_waiters: Arc<Semaphore>,
     /// Explicit resident-master staging shares one byte budget and cache session.
     pub(crate) local_append: Option<crate::rollout_append::LocalStaging>,
@@ -150,6 +151,9 @@ impl MasterState {
         before_init_release: impl std::future::Future<Output = ()>,
     ) -> lance::Result<Arc<Self>> {
         config.validate_registered_store()?;
+        let managed_workers =
+            crate::worker_discovery::KubernetesWorkers::in_cluster(&config.worker_discovery)
+                .map_err(lance::Error::invalid_input)?;
         config.merge_rollout.validate().map_err(lance::Error::io)?;
         config.catchup.validate().map_err(lance::Error::io)?;
         config
@@ -298,6 +302,7 @@ impl MasterState {
             admission: Arc::new(crate::admission::Admission::default()),
             retirement_catalog: tokio::sync::watch::channel(None).0,
             http: worker_http_client().map_err(|error| lance::Error::io(error.to_string()))?,
+            managed_workers,
             local_append,
             compaction_permits: Arc::new(Semaphore::new(compaction_concurrency)),
             stats_maintenance_failures: std::sync::atomic::AtomicU64::new(0),
@@ -321,6 +326,13 @@ impl MasterState {
     pub(crate) fn registered_target<'a>(&'a self, target: &'a str) -> Option<(&'a str, &'a str)> {
         let kind = self.config.managed_store_kind.as_deref()?;
         Some((kind, target.strip_prefix(kind)?.strip_prefix(':')?))
+    }
+
+    pub(crate) async fn managed_worker_endpoints(&self) -> Result<Vec<String>, String> {
+        match &self.managed_workers {
+            Some(workers) => Ok(workers.snapshot().await?.endpoints()),
+            None => Ok(self.config.worker_endpoints.clone()),
+        }
     }
 
     pub(crate) async fn target_uri(&self, target: &str) -> lance::Result<Option<String>> {
@@ -435,6 +447,7 @@ mod tests {
             merge_wal_admission_targets: vec![],
             worker_endpoints: vec![],
             table_flush_timeout_secs: 20,
+            worker_discovery: Default::default(),
             task_concurrency: 4,
             merge_wal_concurrency: 4,
             legacy_merge_wait_concurrency: 32,

@@ -1315,7 +1315,7 @@ pub(crate) async fn enqueue_merge_request(
     // that same queue without enrolling the table in owned/native execution.
     let ordinary_automatic = state.config.merge_wal_interval_secs > 0
         && !state.config.merge_rollout.draining(&request.target)
-        && (!state.config.worker_endpoints.is_empty()
+        && (state.config.has_workers_for(&request.target)
             || crate::local_merge::selected(&state.config, &request.target));
     if !ordinary_automatic
         && !state.config.merge_rollout.owned(&request.target)
@@ -1748,6 +1748,7 @@ mod tests {
             merge_wal_admission_targets: vec![],
             worker_endpoints: vec![],
             table_flush_timeout_secs: 20,
+            worker_discovery: Default::default(),
             task_concurrency: 4,
             merge_wal_concurrency: 4,
             legacy_merge_wait_concurrency: 32,
