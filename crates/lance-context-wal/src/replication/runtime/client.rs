@@ -12,7 +12,7 @@ use crate::{
 };
 use anyhow::{ensure, Context, Result};
 use bincode::Options as _;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -310,9 +310,16 @@ fn decode_prefix(fixed: &[u8; PREFIX], max_body: usize) -> Result<(u64, usize, u
     Ok((id, meta, body))
 }
 async fn receive<R: AsyncRead + Unpin>(io: &mut R, bytes: usize) -> Result<Bytes> {
-    let mut body = vec![0; bytes];
-    io.read_exact(&mut body).await?;
-    Ok(body.into())
+    let mut body = BytesMut::with_capacity(bytes);
+    // Fill spare capacity without first zeroing the entire frame. Limit the
+    // reader so any extra capacity cannot consume bytes from the next frame.
+    let mut limited = io.take(bytes as u64);
+    while limited.limit() > 0 {
+        if limited.read_buf(&mut body).await? == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+    }
+    Ok(body.freeze())
 }
 async fn send<W: AsyncWrite + Unpin>(
     io: &mut W,
