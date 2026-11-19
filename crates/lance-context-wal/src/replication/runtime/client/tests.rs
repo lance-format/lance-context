@@ -14,6 +14,7 @@ mod closed_connection;
 mod deadline;
 mod observation;
 mod publication_window;
+mod receive;
 mod reconnect;
 mod routing;
 mod routing_hint;
