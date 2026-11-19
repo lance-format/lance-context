@@ -28,7 +28,12 @@ so scaling does not require editing that list. A load-balanced worker Service UR
 alone is insufficient: each worker may hold unpublished data. Empty membership
 fails with 503. Each request contacts all
 workers, with up to eight requests in flight, and does not report partial success.
-Redirects, HTTP statuses other than 204, and transport failures fail publication.
+Each worker must return HTTP 204. Connection/request transport errors and HTTP
+408, 429, 500, 502, 503 and 504 receive up to three additional attempts for that
+worker. Successful workers are not called again. Retries use exponential backoff
+with jitter: 250–500 ms, 500–1000 ms, then 1–2 seconds. A worker's `Retry-After`
+header (seconds or HTTP date) sets a minimum wait. Redirects, other HTTP statuses,
+and exhausted retries fail publication.
 Other workers are still awaited after an individual failure, up to the overall
 deadline.
 
@@ -37,6 +42,11 @@ discovery and the entire fan-out. Configure the caller's timeout above it. A tim
 503; some workers may already have published. Publication must be safe to repeat,
 so the caller can retry through another master replica. No leader election or
 shared publication task is required.
+
+All attempts, retry waits and the final membership check share this deadline;
+retries do not reset it. A slow attempt can consume the remaining time without
+leaving room for another attempt. Changed membership still fails the whole barrier
+so the caller can start again with a fresh worker list.
 
 Clients can continue using their existing application Service: its flush handler
 forwards to the master without holding a local store lock, and the master calls
@@ -47,6 +57,9 @@ unavailable.
 `master_table_flush_total{result="ok"|"failed"}` and
 `master_table_flush_duration_seconds` measure master publication outcomes and
 latency. Worker metrics remain necessary for diagnosing storage failures.
+`master_table_flush_worker_retries_total` counts additional worker publication
+attempts actually started; waiting for a retry that is cancelled by the deadline
+does not increment it.
 
 ## Kubernetes Service discovery
 
