@@ -250,14 +250,19 @@ pub(crate) async fn run_merge_wal(
 // Compatibility path is chosen only by explicit configuration, never after a
 // failed owned RPC. It retains legacy limitations until that table is drained.
 async fn run_legacy(state: &Arc<MasterState>, claim: &TaskClaim) -> Result<String, String> {
-    if state.config.worker_endpoints.is_empty() {
+    let endpoints = if state.registered_target(&claim.task.target).is_some() {
+        state.managed_worker_endpoints().await?
+    } else {
+        state.config.worker_endpoints.clone()
+    };
+    if endpoints.is_empty() {
         return Err("no worker endpoints configured".into());
     }
     let coordinator = state.task_store.merge_coordinator();
     let proof = state.task_store.merge_claim(claim);
     run_legacy_workers_admitted(
         &state.http,
-        &state.config.worker_endpoints,
+        &endpoints,
         &claim.task.target,
         LegacyOwnership::Durable {
             coordinator: &coordinator,

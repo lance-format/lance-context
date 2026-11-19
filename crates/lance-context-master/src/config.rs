@@ -189,6 +189,9 @@ pub struct MasterConfig {
     #[arg(long, env = "WORKER_ENDPOINTS", value_delimiter = ',')]
     pub worker_endpoints: Vec<String>,
 
+    #[command(flatten)]
+    pub worker_discovery: crate::worker_discovery::WorkerDiscoveryConfig,
+
     /// Deadline for synchronous registered-table publication, including all workers.
     /// Keep this below the caller's HTTP timeout. Publication does not enqueue a merge.
     #[arg(long, env = "TABLE_FLUSH_TIMEOUT_SECS", default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..))]
@@ -294,6 +297,11 @@ pub struct MasterConfig {
 impl MasterConfig {
     pub(crate) fn validate_registered_store(&self) -> lance::Result<()> {
         let Some(kind) = &self.managed_store_kind else {
+            if self.worker_discovery.managed_worker_service.is_some() {
+                return Err(lance::Error::invalid_input(
+                    "worker Service discovery requires a managed store kind",
+                ));
+            }
             return Ok(());
         };
         if kind.is_empty()
@@ -331,6 +339,16 @@ impl MasterConfig {
                 .merge_wal_admission_targets
                 .iter()
                 .any(|name| name == target)
+    }
+
+    pub(crate) fn has_workers_for(&self, target: &str) -> bool {
+        !self.worker_endpoints.is_empty()
+            || (self.worker_discovery.managed_worker_service.is_some()
+                && self.managed_store_kind.as_ref().is_some_and(|kind| {
+                    target
+                        .strip_prefix(kind)
+                        .is_some_and(|rest| rest.starts_with(':'))
+                }))
     }
 }
 

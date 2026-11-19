@@ -1128,6 +1128,7 @@ mod tests {
             merge_wal_admission_targets: vec![],
             worker_endpoints: vec![],
             table_flush_timeout_secs: 20,
+            worker_discovery: Default::default(),
             task_concurrency: 4,
             merge_wal_concurrency: 4,
             legacy_merge_wait_concurrency: 32,

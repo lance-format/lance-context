@@ -41,7 +41,12 @@ pub(crate) async fn flush_table(
                     "store '{name}' does not exist"
                 )));
             }
-            flush_workers(&state.http, &state.config.worker_endpoints, &kind, &name).await
+            match &state.managed_workers {
+                Some(workers) => flush_discovered(&state.http, workers, &kind, &name).await,
+                None => {
+                    flush_workers(&state.http, &state.config.worker_endpoints, &kind, &name).await
+                }
+            }
         },
     )
     .await
@@ -55,6 +60,23 @@ pub(crate) async fn flush_table(
     metrics::counter!("master_table_flush_total", "result" => if result.is_ok() { "ok" } else { "failed" })
         .increment(1);
     result.map(|()| StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn flush_discovered(
+    http: &reqwest::Client,
+    workers: &crate::worker_discovery::KubernetesWorkers,
+    kind: &str,
+    name: &str,
+) -> Result<(), MasterError> {
+    let before = workers.snapshot().await.map_err(MasterError::Unavailable)?;
+    flush_workers(http, &before.endpoints(), kind, name).await?;
+    let after = workers.snapshot().await.map_err(MasterError::Unavailable)?;
+    if before != after {
+        return Err(MasterError::Unavailable(
+            "worker Service membership changed during publication; retry the barrier".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn flush_workers(

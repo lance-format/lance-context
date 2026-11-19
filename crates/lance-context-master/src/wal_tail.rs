@@ -38,7 +38,9 @@ struct Cursor {
 fn enabled(config: &MasterConfig) -> bool {
     config.wal_tail.wal_tail_interval_secs > 0
         && config.merge_wal_interval_secs > 0
-        && (!config.worker_endpoints.is_empty() || crate::local_merge::enabled(config))
+        && (!config.worker_endpoints.is_empty()
+            || config.worker_discovery.managed_worker_service.is_some()
+            || crate::local_merge::enabled(config))
         && config.wal_tail.wal_tail_stats_max_age_secs > 0
 }
 
@@ -58,7 +60,7 @@ fn candidates(
                 && row.scanned_at <= now
                 && now.saturating_sub(row.scanned_at) <= age
                 && !config.merge_rollout.draining(&row.name)
-                && (!config.worker_endpoints.is_empty()
+                && (config.has_workers_for(&row.name)
                     || crate::local_merge::selected(config, &row.name))
                 && after.is_none_or(|after| row.name.as_str() > after)
         })

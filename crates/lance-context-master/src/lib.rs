@@ -36,5 +36,6 @@ pub mod stats_store;
 pub mod task_store;
 mod wal_sweep_refresh;
 pub mod wal_tail;
+mod worker_discovery;
 
 pub(crate) mod demand_controller;
