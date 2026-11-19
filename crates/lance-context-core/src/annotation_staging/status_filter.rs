@@ -6,6 +6,10 @@ use std::collections::BTreeSet;
 pub const MAX_STATUS_MATCHES: usize = 1024;
 const SCAN_ROWS: usize = 1024;
 const MIN_SCAN_ROWS: usize = 32;
+// One status vector, four native late-materialization batches, two storage
+// prefetch windows, and row-address/headroom. Native index allocations and
+// oversized storage pages can still exceed these workspace estimates.
+const ADAPTIVE_SCAN_VECTORS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct StatusMatches {
@@ -34,6 +38,7 @@ pub struct StatusRead {
     response_bytes: usize,
     value_bytes: usize,
     scan_rows: usize,
+    adaptive_tail: bool,
     _reader: OwnedSemaphorePermit,
 }
 
@@ -108,6 +113,7 @@ impl AnnotationStaging {
             response_bytes,
             value_bytes: self.limits.value_bytes,
             scan_rows: SCAN_ROWS,
+            adaptive_tail: true,
             _reader: reader,
         })
     }
@@ -118,16 +124,28 @@ impl StatusRead {
     /// accommodate the preferred batch. Keep the previous 32-row minimum so
     /// existing small budgets can still serve queries without tiny scan batches.
     pub fn cap_scan_workspace(&mut self, budget: usize) -> Result<()> {
-        let rows = self
+        let available = self
             .response_bytes
             .checked_add(64 << 10)
-            .and_then(|fixed| budget.checked_sub(fixed))
-            .zip(self.value_bytes.checked_mul(2))
-            .and_then(|(bytes, row_bytes)| bytes.checked_div(row_bytes))
-            .unwrap_or(0);
+            .and_then(|fixed| budget.checked_sub(fixed));
+        let rows_for = |vectors| {
+            available
+                .zip(self.value_bytes.checked_mul(vectors))
+                .and_then(|(bytes, row_bytes)| bytes.checked_div(row_bytes))
+                .unwrap_or(0)
+        };
+        let mut adaptive = self.adaptive_tail;
+        let mut rows = rows_for(if adaptive { ADAPTIVE_SCAN_VECTORS } else { 2 });
+        if adaptive && rows < MIN_SCAN_ROWS {
+            // Preserve the original minimum-budget path when bounded prefetch
+            // cannot fit. This selection happens before any native scan starts.
+            adaptive = false;
+            rows = rows_for(2);
+        }
         if rows < MIN_SCAN_ROWS {
             return Err(invalid("status filter workspace exceeds budget"));
         }
+        self.adaptive_tail = adaptive;
         // Keep whole batch sizes instead of expanding a partial batch to fill
         // every remaining byte of the shared budget.
         while self.scan_rows > rows {
@@ -140,6 +158,10 @@ impl StatusRead {
     /// can fall back to the previous minimum while other work holds capacity.
     pub fn reduce_scan_batch(&mut self) -> bool {
         if self.scan_rows <= MIN_SCAN_ROWS {
+            if self.adaptive_tail {
+                self.adaptive_tail = false;
+                return true;
+            }
             return false;
         }
         self.scan_rows /= 2;
@@ -150,7 +172,14 @@ impl StatusRead {
     /// This is not a hard cap on native index/query allocations or total I/O.
     pub fn workspace_bytes(&self) -> Result<usize> {
         self.value_bytes
-            .checked_mul(self.scan_rows * 2)
+            .checked_mul(
+                self.scan_rows
+                    * if self.adaptive_tail {
+                        ADAPTIVE_SCAN_VECTORS
+                    } else {
+                        2
+                    },
+            )
             .and_then(|n| n.checked_add(self.response_bytes))
             .and_then(|n| n.checked_add(64 << 10))
             .ok_or_else(|| invalid("status filter workspace overflow"))
@@ -194,41 +223,78 @@ impl StatusRead {
         if charged > self.response_bytes {
             return Err(invalid("status filter metadata exceeds response bound"));
         }
-        let mut scan = self.base.scan();
-        scan.project(&["id"])?;
-        scan.filter_expr(self.status.as_ref().map_or_else(
-            || col("status").is_null(),
-            |status| col("status").eq(lit(status.clone())),
-        ));
-        scan.limit(Some(self.limit as i64 + 1), None)?;
-        scan.batch_size(self.scan_rows)
-            .batch_readahead(1)
-            .fragment_readahead(1);
-        let mut stream = scan.try_into_stream().await?;
-        while let Some(batch) = stream.try_next().await? {
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| invalid("invalid annotation id"))?;
-            for id in ids.iter() {
-                let id = id
-                    .filter(|s| !s.is_empty() && s.len() <= self.value_bytes)
-                    .ok_or_else(|| invalid("invalid status filter turn key"))?;
-                // JSON escaping can expand each byte to six bytes. Charge the
-                // quotes/comma before cloning a result, including one lookahead.
-                let next = id
-                    .len()
-                    .checked_mul(6)
-                    .and_then(|n| n.checked_add(3))
-                    .and_then(|n| charged.checked_add(n))
-                    .ok_or_else(|| invalid("status filter result size overflow"))?;
-                if result.ids.len() == self.limit || next > self.response_bytes {
-                    result.truncated = true;
-                    return Ok(result);
+        let selections = if self.adaptive_tail && result.unindexed_fragments > 0 {
+            let (covered, mut tail): (Vec<_>, Vec<_>) =
+                self.base.fragments().iter().cloned().partition(|fragment| {
+                    u32::try_from(fragment.id)
+                        .ok()
+                        .is_some_and(|id| indexed.contains(&id))
+                });
+            let rest = tail.split_off(1);
+            let mut selections = Vec::new();
+            if !covered.is_empty() {
+                selections.push((true, Some(covered), 1));
+            }
+            // Many capped queries finish in this first fragment. Only open
+            // later fragments if the global lookahead still needs a result.
+            selections.push((false, Some(tail), 1));
+            if !rest.is_empty() {
+                selections.push((false, Some(rest), 4));
+            }
+            selections
+        } else {
+            vec![(true, None, 1)]
+        };
+        for (use_index, fragments, prefetch) in selections {
+            let mut scan = self.base.scan();
+            scan.project(&["id"])?;
+            scan.filter_expr(self.status.as_ref().map_or_else(
+                || col("status").is_null(),
+                |status| col("status").eq(lit(status.clone())),
+            ));
+            scan.limit(Some((self.limit + 1 - result.ids.len()) as i64), None)?;
+            scan.batch_size(self.scan_rows)
+                .batch_readahead(1)
+                .fragment_readahead(prefetch)
+                .use_scalar_index(use_index);
+            if self.adaptive_tail {
+                // Both the status scan and the ID take receive this target;
+                // their windows are included in the reserved workspace.
+                let io_bytes = self
+                    .value_bytes
+                    .checked_mul(self.scan_rows)
+                    .ok_or_else(|| invalid("status filter I/O workspace overflow"))?;
+                scan.io_buffer_size(io_bytes as u64);
+            }
+            if let Some(fragments) = fragments {
+                scan.with_fragments(fragments);
+            }
+            let mut stream = scan.try_into_stream().await?;
+            while let Some(batch) = stream.try_next().await? {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| invalid("invalid annotation id"))?;
+                for id in ids.iter() {
+                    let id = id
+                        .filter(|s| !s.is_empty() && s.len() <= self.value_bytes)
+                        .ok_or_else(|| invalid("invalid status filter turn key"))?;
+                    // JSON escaping can expand each byte to six bytes. Charge the
+                    // quotes/comma before cloning a result, including one lookahead.
+                    let next = id
+                        .len()
+                        .checked_mul(6)
+                        .and_then(|n| n.checked_add(3))
+                        .and_then(|n| charged.checked_add(n))
+                        .ok_or_else(|| invalid("status filter result size overflow"))?;
+                    if result.ids.len() == self.limit || next > self.response_bytes {
+                        result.truncated = true;
+                        return Ok(result);
+                    }
+                    charged = next;
+                    result.ids.push(id.to_owned());
                 }
-                charged = next;
-                result.ids.push(id.to_owned());
             }
         }
         Ok(result)

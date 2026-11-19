@@ -49,6 +49,34 @@ async fn status_filter_reports_owner_memory_pressure_without_masking_query_failu
         serde_json::from_value::<std::collections::BTreeSet<String>>(initial["ids"].clone())?,
         expected
     );
+    // Leave one whole memory permit available. The adaptive minimum needs
+    // two permits, so a query must fall back to the original sequential path
+    // without waiting for the unrelated reservation to be released.
+    let held_bytes = budget.limit() - (1 << 20);
+    let partial = budget.reserve(held_bytes).await;
+    let (partial_result, partial_reservation) = service
+        .filter_status_owned(
+            Some("pending".into()),
+            16,
+            64 << 10,
+            0,
+            Duration::from_secs(3),
+        )
+        .await?
+        .context("status filter refused the available minimum workspace")?;
+    assert!(partial_reservation.bytes() <= 1 << 20);
+    assert_eq!(
+        partial_result
+            .ids
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected
+    );
+    assert_eq!(budget.reserved(), held_bytes + partial_reservation.bytes());
+    drop(partial_reservation);
+    assert_eq!(budget.reserved(), held_bytes);
+    assert_eq!(service.observation().await.0.readers, 0);
+    drop(partial);
     let occupied = budget.reserve(budget.limit()).await;
     let pressured = tokio::time::timeout(Duration::from_secs(3), query()).await;
     drop(occupied);

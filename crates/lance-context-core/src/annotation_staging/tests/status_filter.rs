@@ -216,3 +216,90 @@ async fn status_filter_bounds_rows_escaped_response_bytes_and_retained_readers()
     assert!(limited.truncated);
     Ok(())
 }
+
+#[tokio::test]
+async fn status_filter_preserves_union_and_global_lookahead_across_tail_fragments() -> Result<()> {
+    for stable in [false, true] {
+        for indexed in [false, true] {
+            let root = tempfile::tempdir()?;
+            let seed = super::point_scan::batch(vec!["seed".into()], "shared")?;
+            let params = WriteParams {
+                enable_stable_row_ids: stable,
+                max_rows_per_file: 512,
+                ..Default::default()
+            };
+            let mut base = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(seed.clone())], seed.schema()),
+                root.path().join("turns.lance").to_str().unwrap(),
+                Some(params.clone()),
+            )
+            .await?;
+            if indexed {
+                base.create_index_builder(
+                    &["status"],
+                    IndexType::BTree,
+                    &ScalarIndexParams::default(),
+                )
+                .name("status".into())
+                .await?;
+            }
+            let tail = super::point_scan::batch(
+                (0..1536).map(|id| format!("tail-{id}")).collect(),
+                "tail",
+            )?;
+            let last = super::point_scan::batch(vec!["late-shared".into()], "shared")?;
+            base.append(
+                RecordBatchIterator::new(vec![Ok(tail), Ok(last)], seed.schema()),
+                Some(params),
+            )
+            .await?;
+            let staging = AnnotationStaging::new(
+                Arc::new(base),
+                scope(),
+                0,
+                Limits {
+                    value_bytes: 4096,
+                    ..Default::default()
+                },
+            )?;
+            let run = |status: &str, limit, budget| {
+                let status = status.to_owned();
+                let staging = &staging;
+                async move {
+                    let mut read = staging
+                        .capture_status(Some(status), limit, 64 << 10)
+                        .await?;
+                    read.cap_scan_workspace(budget)?;
+                    assert!(read.workspace_bytes()? <= budget);
+                    read.resolve().await
+                }
+            };
+            for budget in [64 << 20, (4096 * 2 * 32) + (128 << 10)] {
+                // The smaller budget exercises the original sequential path;
+                // the larger budget admits bounded adaptive prefetch.
+                let shared = run("shared", 16, budget).await?;
+                assert_eq!(shared.indexed_fragments, usize::from(indexed));
+                assert!(shared.unindexed_fragments >= 4);
+                assert_eq!(
+                    shared.ids.into_iter().collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["seed".into(), "late-shared".into()])
+                );
+                assert!(!shared.truncated);
+                let capped_shared = run("shared", 1, budget).await?;
+                assert_eq!(capped_shared.ids.len(), 1);
+                assert!(capped_shared.truncated);
+                for limit in [64, 512, MAX_STATUS_MATCHES] {
+                    let tail = run("tail", limit, budget).await?;
+                    assert_eq!(tail.ids.len(), limit);
+                    assert!(tail.truncated);
+                    let ids = tail.ids.into_iter().collect::<BTreeSet<_>>();
+                    assert_eq!(ids.len(), limit);
+                    assert!(ids.iter().all(|id| id.starts_with("tail-")));
+                }
+                let absent = run("absent", 16, budget).await?;
+                assert!(absent.ids.is_empty() && !absent.truncated);
+            }
+        }
+    }
+    Ok(())
+}
