@@ -585,8 +585,21 @@ fn async_persistence_tls_process_leader_crash_preserves_all_payloads() -> Result
     leader_crash_full_restart(false, true)
 }
 
+// Set WAL_TEST_ARTIFACTS to retain original stores, identities and child logs
+// after successful qualification. Failed runs already preserve their artifacts.
+fn process_artifacts() -> Result<(PathBuf, bool)> {
+    let destination = std::env::var_os("WAL_TEST_ARTIFACTS");
+    let directory = if let Some(path) = &destination {
+        fs::create_dir_all(path)?;
+        tempfile::tempdir_in(path)?
+    } else {
+        tempfile::tempdir()?
+    };
+    Ok((directory.keep(), destination.is_some()))
+}
+
 fn leader_crash_full_restart(pipeline_replication: bool, async_persistence: bool) -> Result<()> {
-    let root = tempfile::tempdir()?.keep();
+    let (root, retain_artifacts) = process_artifacts()?;
     eprintln!("TLS process qualification artifacts: {}", root.display());
     provision(&root)?;
     let mut c = Processes {
@@ -639,7 +652,9 @@ fn leader_crash_full_restart(pipeline_replication: bool, async_persistence: bool
             assert_eq!(node.read_accepted(group, *index)?, Some(body.clone()));
         }
     }
-    fs::remove_dir_all(root)?;
+    if !retain_artifacts {
+        fs::remove_dir_all(root)?;
+    }
     Ok(())
 }
 
@@ -684,7 +699,7 @@ fn snapshot_process_kill_mid_file(
     pipeline_replication: bool,
     async_persistence: bool,
 ) -> Result<()> {
-    let root = tempfile::tempdir()?.keep();
+    let (root, retain_artifacts) = process_artifacts()?;
     eprintln!(
         "TLS snapshot process qualification artifacts: {}",
         root.display()
@@ -789,7 +804,9 @@ fn snapshot_process_kill_mid_file(
             assert_eq!(node.read_accepted(10, *index)?, Some(batch.clone()));
         }
     }
-    fs::remove_dir_all(root)?;
+    if !retain_artifacts {
+        fs::remove_dir_all(root)?;
+    }
     Ok(())
 }
 fn process_batch(sequence: u64) -> Batch {
