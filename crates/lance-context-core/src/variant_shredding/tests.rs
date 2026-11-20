@@ -42,10 +42,10 @@ fn official_kernels_round_trip_null_missing_shapes_and_numeric_boundaries() {
     assert!(!result.is_null(2));
     let typed = result.typed_value_field().unwrap();
     assert!(typed.is_valid(0));
-    for row in [5, 6, 8, 10, 11, 12] {
+    for row in [10, 11] {
         assert!(
             typed.is_null(row),
-            "coercible or incompatible row {row} must stay residual"
+            "non-object row {row} must stay residual"
         );
     }
 }
@@ -175,4 +175,100 @@ fn accepts_upstream_json_arrays_literal_keys_and_empty_batches() {
         result.data_type(),
         layout.shred(&upstream).unwrap().data_type()
     );
+}
+
+#[test]
+fn type_drift_keeps_sibling_text_shredded_and_preserves_every_original_type() {
+    let selected = json!({
+        "body": "selected text", "count": 1, "ratio": 1.5, "flag": true,
+        "nested": {"text": "selected nested text", "count": 1}, "a.b": {"": 1}
+    });
+    let layout = AutoVariantLayout::infer(&[selected], &ShredPolicy::default()).unwrap();
+    let body = "unique sibling payload ".repeat(50_000);
+    let drift = [
+        json!(true),
+        json!(1.5),
+        json!("7"),
+        json!(u64::MAX),
+        json!(null),
+        json!({"key": [1, "text", null]}),
+        json!([1, false]),
+        json!(-9),
+    ];
+    let mut documents = drift
+        .iter()
+        .map(|value| {
+            Some(json!({
+                "body": body, "count": value, "ratio": value, "flag": value,
+                "nested": {"text": body, "count": value}, "a.b": {"": value}
+            }))
+        })
+        .collect::<Vec<_>>();
+    documents.extend([
+        Some(json!({"body": body, "nested": "changed object"})),
+        Some(json!({"body": body, "nested": null})),
+        Some(json!({"body": body})),
+        None,
+        Some(Value::Null),
+    ]);
+    let result = layout.shred(&input(&documents)).unwrap();
+    assert_eq!(decoded(&result), documents);
+    // Re-shredding and sliced Arrow inputs must retain the same semantics.
+    assert_eq!(decoded(&layout.shred(&result).unwrap()), documents);
+    let sliced = result.inner().slice(1, documents.len() - 2);
+    assert_eq!(
+        decoded(
+            &layout
+                .shred(&VariantArray::try_new(&sliced).unwrap())
+                .unwrap()
+        ),
+        documents[1..documents.len() - 1]
+    );
+    let typed = result
+        .typed_value_field()
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let body_field = typed
+        .column_by_name("body")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let text = body_field
+        .column_by_name("typed_value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for row in 0..documents.len() - 2 {
+        assert!(result.value_field().unwrap().is_null(row));
+        assert_eq!(text.value(row), body);
+        assert!(body_field.column_by_name("value").unwrap().is_null(row));
+    }
+    let nested = typed
+        .column_by_name("nested")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap()
+        .column_by_name("typed_value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    let nested_text = nested
+        .column_by_name("text")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    for row in 0..drift.len() {
+        assert!(nested_text
+            .column_by_name("typed_value")
+            .unwrap()
+            .is_valid(row));
+        assert!(nested_text.column_by_name("value").unwrap().is_null(row));
+    }
 }

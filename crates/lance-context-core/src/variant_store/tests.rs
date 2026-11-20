@@ -357,3 +357,49 @@ async fn sparse_large_text_stays_compressed_across_migration_and_append() {
         Some(json!({"body":body}))
     );
 }
+
+#[tokio::test]
+async fn type_drift_preserves_indexed_siblings_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().join("drift.lance");
+    let uri = uri.to_str().unwrap();
+    let mut store = VariantDocumentStore::create(uri, ShredPolicy::default(), None)
+        .await
+        .unwrap();
+    let documents = vec![
+        json!({"body": "first", "sequence": 1}),
+        json!({"body": "second", "sequence": 2}),
+        json!({"body": "needle sibling", "sequence": true}),
+    ];
+    let ids = store.add(documents.clone()).await.unwrap();
+    assert!(store
+        .layout()
+        .fields()
+        .iter()
+        .any(|field| field.path == ["sequence"]
+            && field.data_type == crate::shredding::ShredType::Int64));
+    store.prepare_text_search().await.unwrap();
+    drop(store);
+    let mut store = VariantDocumentStore::open(uri, None).await.unwrap();
+    let hits = store.search("needle", 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, ids[2]);
+    assert!(
+        hits[0].score > 0.0,
+        "sibling text must use the native index"
+    );
+    for (id, document) in ids.iter().zip(&documents) {
+        assert_eq!(store.get(id).await.unwrap(), Some(document.clone()));
+        assert_eq!(
+            store.get_path(id, &["sequence".into()]).await.unwrap(),
+            Some(document["sequence"].clone())
+        );
+    }
+    assert_eq!(
+        store
+            .filter_eq(&["sequence".into()], &json!(true), 10)
+            .await
+            .unwrap(),
+        vec![ids[2].clone()]
+    );
+}

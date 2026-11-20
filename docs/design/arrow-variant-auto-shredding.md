@@ -21,10 +21,16 @@ layout reached its budget. Changing an existing dataset's layout requires an
 atomic migration; inferring a new layout alone does not migrate stored data.
 
 Arrow's shredding casts permit conversions that change JSON types or values.
-The adapter validates the selected values before invoking the kernel. A row
-with an incompatible selected value remains entirely in the root residual.
-This preserves correctness but sacrifices typed extraction for the other fields
-in that row. The original text is not copied into an additional storage column.
+The adapter runs the upstream kernel, then restores any coerced scalar to its
+standard field-level `value` and clears that field's `typed_value`. Compatible
+siblings remain shredded and indexable, even inside a partially incompatible
+nested object. The upstream kernel already retains non-object values at an
+object boundary and handles missing fields and explicit nulls. Original Variant
+metadata is preserved; no custom binary codec or additional text column is used.
+
+This applies to newly written or migrated rows. Existing whole-row residuals
+remain readable and are not rewritten merely by opening a dataset or preparing
+an index; an automatic layout migration reshreds them using the new behavior.
 
 JSON input uses Arrow's Variant builder. This avoids Arrow 58's JSON-string
 parser converting unsigned integers above i64 through f64: the typed builder

@@ -29,7 +29,7 @@ fn read_bytes(snapshotter: &Snapshotter) -> u64 {
 }
 
 #[tokio::test]
-async fn variant_projection_does_not_read_unrelated_megabyte_text() {
+async fn variant_projection_and_search_skip_sibling_text_despite_type_drift() {
     let recorder = DebuggingRecorder::new();
     let snapshotter = recorder.snapshotter();
     metrics::set_global_recorder(recorder).unwrap();
@@ -51,19 +51,22 @@ async fn variant_projection_does_not_read_unrelated_megabyte_text() {
         .collect();
     let ids = store
         .add(vec![
-            json!({"body": body, "sequence": 7, "tags": ["wanted"]}),
+            json!({"body": "seed", "sequence": 7}),
+            json!({"body": "seed", "sequence": 8}),
+            json!({"body": body, "sequence": true, "tags": ["wanted"]}),
         ])
         .await
         .unwrap();
+    store.prepare_text_search().await.unwrap();
     drop(store);
-    let store = VariantDocumentStore::open(uri, None).await.unwrap();
+    let mut store = VariantDocumentStore::open(uri, None).await.unwrap();
     let before = read_bytes(&snapshotter);
     assert_eq!(
         store
             .filter_eq(&["tags".into()], &json!(["wanted"]), 1)
             .await
             .unwrap(),
-        ids
+        vec![ids[2].clone()]
     );
     let bytes = read_bytes(&snapshotter) - before;
     assert!(bytes > 0, "storage metrics must be active");
@@ -73,24 +76,33 @@ async fn variant_projection_does_not_read_unrelated_megabyte_text() {
     );
     let before = read_bytes(&snapshotter);
     assert_eq!(
-        store.get_path(&ids[0], &["tags".into()]).await.unwrap(),
+        store.get_path(&ids[2], &["tags".into()]).await.unwrap(),
         Some(json!(["wanted"]))
     );
     assert_eq!(
-        store.get_path(&ids[0], &["absent".into()]).await.unwrap(),
+        store.get_path(&ids[2], &["absent".into()]).await.unwrap(),
         None
     );
     assert_eq!(
-        store.get_path(&ids[0], &["sequence".into()]).await.unwrap(),
-        Some(json!(7))
+        store.get_path(&ids[2], &["sequence".into()]).await.unwrap(),
+        Some(json!(true))
     );
     let bytes = read_bytes(&snapshotter) - before;
     assert!(
         bytes < 1024 * 1024,
         "residual point reads fetched {bytes} bytes of unrelated text"
     );
+    // Load the index dictionary before measuring residual-scan I/O.
+    assert!(store.search("absentneedle", 10).await.unwrap().is_empty());
     let before = read_bytes(&snapshotter);
-    assert_eq!(store.get(&ids[0]).await.unwrap().unwrap()["body"], body);
+    assert!(store.search("absentneedle", 10).await.unwrap().is_empty());
+    let bytes = read_bytes(&snapshotter) - before;
+    assert!(
+        bytes < 1024 * 1024,
+        "no-hit search read {bytes} bytes, including compatible sibling text"
+    );
+    let before = read_bytes(&snapshotter);
+    assert_eq!(store.get(&ids[2]).await.unwrap().unwrap()["body"], body);
     let bytes = read_bytes(&snapshotter) - before;
     assert!(
         bytes > 1024 * 1024,
