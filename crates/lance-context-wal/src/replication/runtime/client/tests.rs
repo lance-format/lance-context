@@ -20,6 +20,7 @@ mod routing;
 mod routing_hint;
 mod routing_transport;
 mod source_read;
+mod timeout_diagnostics;
 
 struct RpcCluster {
     net: Cluster,

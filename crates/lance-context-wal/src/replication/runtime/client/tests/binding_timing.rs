@@ -134,7 +134,15 @@ async fn publisher_binding_response_timeout_finishes_timing() -> Result<()> {
     arrived.await?;
     let expired = c.client.request(leader, binding_request()).await;
     drop(release);
-    assert!(expired.is_err());
+    let error = expired
+        .err()
+        .context("held response unexpectedly completed")?;
+    let message = format!("{error:#}");
+    assert!(message.contains("stage=response_prefix"), "{message}");
+    assert!(message.contains("reused=true"), "{message}");
+    assert!(error
+        .downcast_ref::<tokio::time::error::Elapsed>()
+        .is_some());
     let response = &c.client.publisher_binding_timings()["response"];
     assert_eq!(response.started, 2);
     assert_eq!(response.finished, 2);

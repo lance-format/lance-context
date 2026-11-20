@@ -698,6 +698,28 @@ struct NodePools {
     control: Pool,
 }
 
+/// Kept outside the timed future so cancellation preserves its last boundary.
+/// Updating this state does not allocate or expose addresses and request values.
+#[derive(Default)]
+struct ExchangeProgress {
+    rpc: Option<(&'static str, u64, u64)>,
+    stage: &'static str,
+    reused: Option<bool>,
+}
+
+impl std::fmt::Display for ExchangeProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some((operation, group, node)) = self.rpc else {
+            return f.write_str("WAL RPC not started");
+        };
+        write!(f, "WAL RPC {operation} group={group} node={node}")?;
+        if let Some(reused) = self.reused {
+            write!(f, " reused={reused}")?;
+        }
+        write!(f, " stage={}", self.stage)
+    }
+}
+
 fn disconnected(error: &anyhow::Error) -> bool {
     use std::io::ErrorKind;
     error.downcast_ref::<std::io::Error>().is_some_and(|e| {
@@ -839,9 +861,13 @@ impl Client {
     /// retried. A read on a disconnected pooled stream may reconnect once within
     /// the original deadline; a cached leader hint is never treated as an ACK.
     pub async fn request(&self, node: u64, request: Request) -> Result<Response> {
-        timeout(self.options.timeout, self.exchange(node, request))
-            .await
-            .context("client exchange timed out; outcome unknown")?
+        let mut progress = ExchangeProgress::default();
+        timeout(
+            self.options.timeout,
+            self.exchange(node, request, &mut progress),
+        )
+        .await
+        .with_context(|| format!("client exchange timed out; {progress}; outcome unknown"))?
     }
     /// Follow configured-voter hints only when the remote confirms it did not
     /// submit the request. Unknown mutation outcomes require explicit exact retry.
@@ -853,6 +879,7 @@ impl Client {
     /// method's single overall deadline. Queries, source reads and payload fetches
     /// can move to another configured voter after a disconnect or refused connection.
     pub async fn request_routed(&self, request: Request) -> Result<Response> {
+        let mut progress = ExchangeProgress::default();
         timeout(self.options.timeout, async {
             let group = match &request {
                 Request::Append { group, .. }
@@ -873,7 +900,7 @@ impl Client {
             let mut visited = BTreeSet::new();
             loop {
                 visited.insert(node);
-                let response = match self.exchange(node, request.clone()).await {
+                let response = match self.exchange(node, request.clone(), &mut progress).await {
                     Ok(response) => response,
                     Err(error) => {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
@@ -895,6 +922,7 @@ impl Client {
                             node = next;
                             if visited.len() == voters.len() {
                                 visited.clear();
+                                progress.stage = "routing_backoff";
                                 tokio::time::sleep(Duration::from_millis(20)).await;
                             }
                             continue;
@@ -912,6 +940,7 @@ impl Client {
                         // Every voter explicitly declined before execution.
                         // Release reply credits and wait before refreshing the
                         // hints; a transient election is not a protocol fault.
+                        progress.stage = "routing_backoff";
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         visited.clear();
                         if voters.contains(&leader) {
@@ -952,6 +981,7 @@ impl Client {
                             drop(response);
                             node = next;
                             visited.clear();
+                            progress.stage = "routing_backoff";
                             tokio::time::sleep(Duration::from_millis(20)).await;
                             continue;
                         }
@@ -966,9 +996,14 @@ impl Client {
             }
         })
         .await
-        .context("routed exchange timed out; outcome unknown")?
+        .with_context(|| format!("routed exchange timed out; {progress}; outcome unknown"))?
     }
-    async fn exchange(&self, node: u64, request: Request) -> Result<Response> {
+    async fn exchange(
+        &self,
+        node: u64,
+        request: Request,
+        progress: &mut ExchangeProgress,
+    ) -> Result<Response> {
         let pools = self.nodes.get(&node).context("unknown client target")?;
         let (wire, body) = match request {
             Request::Append { group, batch } => {
@@ -999,6 +1034,11 @@ impl Client {
         };
         let data = wire.data();
         let (group, operation) = wire.diagnostic(self.catalog);
+        *progress = ExchangeProgress {
+            rpc: Some((operation, group, node)),
+            stage: "admission",
+            reused: None,
+        };
         let read_only = matches!(
             wire,
             WireRequest::Query { .. }
@@ -1048,12 +1088,14 @@ impl Client {
         // context only on failure; addresses, credentials and payloads stay out.
         let connection_error =
             |stage| format!("WAL RPC {operation} group={group} node={node} stage={stage}");
+        progress.stage = "pool_admission";
         let _slot = pool
             .slots
             .clone()
             .acquire_owned()
             .await
             .with_context(|| connection_error("pool_admission"))?;
+        progress.stage = "idle_connection";
         let mut idle = pool
             .take_idle()
             .await
@@ -1061,6 +1103,7 @@ impl Client {
         let mut reconnect_read = read_only && idle.is_some();
         loop {
             let reused = idle.is_some();
+            progress.reused = Some(reused);
             let mut stream = match idle.take() {
                 Some(stream) => stream,
                 None => {
@@ -1069,10 +1112,12 @@ impl Client {
                     } else {
                         &pools.endpoint.control_address
                     };
+                    progress.stage = "tcp_connect";
                     let tcp = TcpStream::connect(address)
                         .await
                         .with_context(|| connection_error("tcp_connect"))?;
                     tcp.set_nodelay(true)?;
+                    progress.stage = "tls_handshake";
                     let stream = self
                         .connector
                         .connect(
@@ -1091,7 +1136,7 @@ impl Client {
                 }
             };
             drop(connection.take());
-            let mut stage = "send";
+            progress.stage = "send";
             let response: Result<(Reply, Bytes)> = async {
                 let sending = timings.map(|c| c[2].start());
                 let id = self
@@ -1101,7 +1146,7 @@ impl Client {
                 send(&mut stream, id, &metadata, &body).await?;
                 drop(sending);
                 let _receiving = timings.map(|c| c[3].start());
-                stage = "response_prefix";
+                progress.stage = "response_prefix";
                 let (received_id, meta_len, body_len) =
                     prefix(&mut stream, if fetch { self.max_record } else { 0 }).await?;
                 ensure!(received_id == id, "client response correlation mismatch");
@@ -1109,7 +1154,7 @@ impl Client {
                     meta_len <= reply_meta,
                     "client response metadata exceeds request bound"
                 );
-                stage = "response_metadata";
+                progress.stage = "response_metadata";
                 let metadata = receive(&mut stream, meta_len).await?;
                 let (observed, reply): (Scope, Reply) = codec().deserialize(&metadata)?;
                 ensure!(observed == expected, "foreign client response scope");
@@ -1141,7 +1186,7 @@ impl Client {
                     Reply::Record(_) => anyhow::bail!("record reply for non-fetch request"),
                     _ => ensure!(body_len == 0 && !fetch, "unexpected response payload/type"),
                 }
-                stage = "response_body";
+                progress.stage = "response_body";
                 let body = receive(&mut stream, body_len).await?;
                 Ok((reply, body))
             }
@@ -1159,6 +1204,7 @@ impl Client {
                 Err(error) => {
                     // A transport stage does not establish whether a mutation
                     // committed. Preserve the cause and original retry policy.
+                    let stage = progress.stage;
                     return Err(error.context(format!(
                         "WAL RPC {operation} group={group} node={node} reused={reused} stage={stage}; outcome unknown"
                     )));
