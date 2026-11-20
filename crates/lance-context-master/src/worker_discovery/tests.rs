@@ -160,30 +160,106 @@ async fn discovery_failure_or_empty_membership_cannot_acknowledge_publication() 
 }
 
 #[tokio::test]
+async fn missing_or_empty_worker_identity_cannot_acknowledge_publication() {
+    let flushed = Arc::new(AtomicUsize::new(0));
+    let (worker, _worker_server) = serve(Router::new().route(
+        "/api/v1/events/table/flush-local",
+        post({
+            let flushed = flushed.clone();
+            move || {
+                let flushed = flushed.clone();
+                async move {
+                    flushed.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }
+        }),
+    ))
+    .await;
+    for target_ref in [
+        None,
+        Some(Value::Null),
+        Some(json!({})),
+        Some(json!({"uid": null})),
+        Some(json!({"uid": ""})),
+        Some(json!({"uid": " \t"})),
+    ] {
+        let mut endpoint_slice = slice(&worker, "original", true);
+        let endpoint = endpoint_slice["endpoints"][0].as_object_mut().unwrap();
+        if let Some(target_ref) = target_ref {
+            endpoint.insert("targetRef".into(), target_ref);
+        } else {
+            endpoint.remove("targetRef");
+        }
+        let (url, _api) = serve(Router::new().route(
+            "/",
+            get(move || {
+                let body = page(vec![endpoint_slice.clone()], "10", "");
+                async move { Json(body) }
+            }),
+        ))
+        .await;
+        let token = tempfile::NamedTempFile::new().unwrap();
+        let discovery = client(url, &token);
+        let result = crate::publication::flush_discovered(
+            &crate::state::worker_http_client().unwrap(),
+            &discovery,
+            "events",
+            "table",
+        )
+        .await;
+        assert!(matches!(result,
+            Err(crate::error::MasterError::Unavailable(message)) if message.contains("Pod UID")));
+        assert_eq!(
+            flushed.load(Ordering::SeqCst),
+            0,
+            "invalid identity must reject the complete membership before contacting workers"
+        );
+    }
+}
+
+#[tokio::test]
 async fn pagination_keeps_every_worker_and_rotated_tokens_are_used() {
     let required_token = Arc::new(Mutex::new("Bearer test-token".to_string()));
     let expected = required_token.clone();
-    let (url, _server) = serve(Router::new().route("/", get(
-        move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| {
-            let required_token = required_token.clone();
-            async move {
-                assert_eq!(headers.get("authorization").unwrap().to_str().unwrap(),
-                    *required_token.lock().unwrap());
-                assert_eq!(query.get("labelSelector").unwrap(),
-                    "kubernetes.io/service-name=workers");
-                assert!(!query.contains_key("resourceVersion"));
-                Json(if query.get("continue").is_some_and(|s| s == "next") {
-                    page(vec![json!({
-                        "addressType": "IPv6",
-                        "ports": [{"name": "http", "port": 3000}],
-                        "endpoints": [{"addresses": ["::1"], "conditions": {"ready": false}}]
-                    })], "10", "")
-                } else {
-                    page(vec![slice("http://127.0.0.1:3000", "first", true)], "10", "next")
-                })
-            }
-        }
-    ))).await;
+    let (url, _server) = serve(Router::new().route(
+        "/",
+        get(
+            move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| {
+                let required_token = required_token.clone();
+                async move {
+                    assert_eq!(
+                        headers.get("authorization").unwrap().to_str().unwrap(),
+                        *required_token.lock().unwrap()
+                    );
+                    assert_eq!(
+                        query.get("labelSelector").unwrap(),
+                        "kubernetes.io/service-name=workers"
+                    );
+                    assert!(!query.contains_key("resourceVersion"));
+                    Json(if query.get("continue").is_some_and(|s| s == "next") {
+                        page(
+                            vec![json!({
+                                "addressType": "IPv6",
+                                "ports": [{"name": "http", "port": 3000}],
+                                "endpoints": [{"addresses": ["::1"], "conditions": {"ready": false},
+                                    "targetRef": {"uid": "ipv6-worker"}}]
+                            })],
+                            "10",
+                            "",
+                        )
+                    } else {
+                        page(
+                            vec![slice("http://127.0.0.1:3000", "first", true)],
+                            "10",
+                            "next",
+                        )
+                    })
+                }
+            },
+        ),
+    ))
+    .await;
     let token = tempfile::NamedTempFile::new().unwrap();
     let discovery = client(url, &token);
     for rotated in [false, true] {

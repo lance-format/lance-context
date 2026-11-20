@@ -49,7 +49,7 @@ pub(crate) struct KubernetesWorkers {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Worker {
     url: String,
-    pod_uid: Option<String>,
+    pod_uid: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -217,10 +217,15 @@ impl KubernetesWorkers {
                             "worker EndpointSlice contains an endpoint without addresses".into(),
                         );
                     }
+                    let pod_uid = endpoint
+                        .target_ref
+                        .and_then(|target| target.uid)
+                        .filter(|uid| !uid.trim().is_empty())
+                        .ok_or("worker EndpointSlice endpoint is missing a non-empty Pod UID")?;
                     for address in endpoint.addresses {
                         workers.insert(Worker {
                             url: format!("http://{}", std::net::SocketAddr::new(address, port)),
-                            pod_uid: endpoint.target_ref.as_ref().and_then(|r| r.uid.clone()),
+                            pod_uid: pod_uid.clone(),
                         });
                     }
                 }
