@@ -7,11 +7,12 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::{Array, ArrayRef, BooleanArray, StructArray};
-use arrow_buffer::NullBuffer;
 use arrow_cast::cast;
 use arrow_schema::{ArrowError, DataType, Field, Fields};
 use parquet_variant::{ObjectFieldBuilder, Variant, VariantBuilderExt};
-use parquet_variant_compute::{shred_variant, unshred_variant, VariantArray, VariantArrayBuilder};
+use parquet_variant_compute::{
+    shred_variant, unshred_variant, VariantArray, VariantArrayBuilder, VariantValueArrayBuilder,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -186,14 +187,16 @@ impl AutoVariantLayout {
         Ok(root.data_type())
     }
 
-    /// Run Arrow's kernel with a losslessness guard. Its cast kernels permit
-    /// coercions such as true -> 1 or 1.5 -> 1. Rows with an incompatible selected
-    /// value stay entirely in the standard root residual. This is conservative:
-    /// no selected text is duplicated, but such rows receive no typed extraction.
-    /// Already-shredded input is first reconstructed by Arrow's unshred kernel.
+    /// Run Arrow's kernel, then restore only fields it coerced across JSON types.
+    /// Incompatible values live in their standard field-level residuals while
+    /// compatible siblings remain shredded. Already-shredded input is first
+    /// reconstructed by Arrow's unshred kernel.
     pub fn shred(&self, input: &VariantArray) -> Result<VariantArray> {
         let target = self.target_type()?;
         let input = unshred_variant(input)?;
+        // VariantArray::try_value uses shallow, panicking binary decoding in
+        // Arrow 58. Keep full validation before either the kernel or the guard
+        // traverses externally supplied metadata/value buffers.
         let metadata = cast(input.metadata_field(), &DataType::BinaryView)?;
         let value = cast(
             input
@@ -201,55 +204,30 @@ impl AutoVariantLayout {
                 .ok_or_else(|| invalid("missing Variant value"))?,
             &DataType::BinaryView,
         )?;
-        let metadata_bytes = metadata
+        let metadata = metadata
             .as_any()
             .downcast_ref::<arrow_array::BinaryViewArray>()
             .unwrap();
-        let value_bytes = value
+        let value = value
             .as_any()
             .downcast_ref::<arrow_array::BinaryViewArray>()
             .unwrap();
-        let mut eligible = Vec::with_capacity(input.len());
-        for row in 0..input.len() {
-            if input.is_null(row) {
-                eligible.push(false);
-                continue;
-            }
-            if metadata.is_null(row) || value.is_null(row) {
-                return Err(invalid("non-null Variant requires metadata and value"));
-            }
-            let value = Variant::try_new(metadata_bytes.value(row), value_bytes.value(row))
-                .map_err(|error| invalid(error.to_string()))?;
-            eligible.push(fits(&value, &target));
-        }
+        let originals = (0..input.len())
+            .map(|row| {
+                if input.is_null(row) {
+                    Ok(None)
+                } else if metadata.is_null(row) || value.is_null(row) {
+                    Err(invalid("non-null Variant requires metadata and value"))
+                } else {
+                    Variant::try_new(metadata.value(row), value.value(row)).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         if self.fields.is_empty() {
             return normalize(&input);
         }
-        let eligible = BooleanArray::from(eligible);
-        let masked = StructArray::try_new(
-            input.inner().fields().clone(),
-            input.inner().columns().to_vec(),
-            Some(NullBuffer::new(eligible.values().clone())),
-        )?;
-        let shredded = shred_variant(&VariantArray::try_new(&masked)?, &target)?;
-        let residual = shredded
-            .value_field()
-            .ok_or_else(|| invalid("missing shredded residual"))?;
-        let original = cast(&value, residual.data_type())?;
-        let residual = arrow_select::zip::zip(&eligible, residual, &original)?;
-        let mut columns = shredded.inner().columns().to_vec();
-        let index = shredded
-            .inner()
-            .fields()
-            .iter()
-            .position(|f| f.name() == "value")
-            .unwrap();
-        columns[index] = residual;
-        let restored = StructArray::try_new(
-            shredded.inner().fields().clone(),
-            columns,
-            input.nulls().cloned(),
-        )?;
+        let shredded = shred_variant(&input, &target)?;
+        let restored = restore_coerced_fields(&originals, &target, shredded.inner())?;
         normalize(&VariantArray::try_new(&restored)?)
     }
 }
@@ -272,25 +250,106 @@ impl TargetNode {
     }
 }
 
+// Arrow's default safe casts still allow true -> 1, 1.5 -> 1, and number ->
+// string. Keep its object routing, missing/null handling and binary encoding,
+// but replace such casts with the original value at the affected leaf only.
+// Value builders retain the original metadata dictionary, including object keys.
+fn restore_coerced_fields(
+    originals: &[Option<Variant<'_, '_>>],
+    target: &DataType,
+    shredded: &StructArray,
+) -> Result<StructArray> {
+    let typed_index = shredded
+        .fields()
+        .iter()
+        .position(|field| field.name() == "typed_value")
+        .ok_or_else(|| invalid("missing shredded typed_value"))?;
+    let typed = shredded.column(typed_index);
+    let mut columns = shredded.columns().to_vec();
+    if let DataType::Struct(fields) = target {
+        let children = typed
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| invalid("expected shredded object"))?;
+        let mut restored = Vec::with_capacity(fields.len());
+        for (index, field) in fields.iter().enumerate() {
+            let values = originals
+                .iter()
+                .map(|value| match value {
+                    Some(Variant::Object(object)) => object.get(field.name()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let child = children
+                .column(index)
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| invalid("expected shredded field"))?;
+            restored.push(
+                Arc::new(restore_coerced_fields(&values, field.data_type(), child)?) as ArrayRef,
+            );
+        }
+        columns[typed_index] = Arc::new(StructArray::try_new(
+            children.fields().clone(),
+            restored,
+            children.nulls().cloned(),
+        )?);
+    } else {
+        let restore = originals
+            .iter()
+            .enumerate()
+            .map(|(row, value)| {
+                typed.is_valid(row) && value.as_ref().is_some_and(|value| !fits(value, target))
+            })
+            .collect::<Vec<_>>();
+        if !restore.iter().any(|restore| *restore) {
+            return Ok(shredded.clone());
+        }
+        let mut residual = VariantValueArrayBuilder::new(originals.len());
+        for (value, restore) in originals.iter().zip(&restore) {
+            if *restore {
+                residual.append_value(value.as_ref().unwrap().clone());
+            } else {
+                residual.append_null();
+            }
+        }
+        let value_index = shredded
+            .fields()
+            .iter()
+            .position(|field| field.name() == "value")
+            .ok_or_else(|| invalid("missing shredded residual"))?;
+        let original: ArrayRef = Arc::new(residual.build()?);
+        let original = cast(&original, columns[value_index].data_type())?;
+        let restore = BooleanArray::from(restore);
+        columns[value_index] = arrow_select::zip::zip(&restore, &original, &columns[value_index])?;
+        columns[typed_index] = arrow_select::zip::zip(
+            &restore,
+            &arrow_array::new_null_array(typed.data_type(), typed.len()),
+            typed,
+        )?;
+    }
+    StructArray::try_new(
+        shredded.fields().clone(),
+        columns,
+        shredded.nulls().cloned(),
+    )
+}
+
 fn fits(value: &Variant<'_, '_>, target: &DataType) -> bool {
-    if matches!(value, Variant::Null) {
-        return true;
-    }
-    match (value, target) {
-        (Variant::Object(object), DataType::Struct(fields)) => fields.iter().all(|field| {
-            object
-                .get(field.name())
-                .is_none_or(|value| fits(&value, field.data_type()))
-        }),
-        (Variant::String(_) | Variant::ShortString(_), DataType::Utf8)
-        | (
-            Variant::Int8(_) | Variant::Int16(_) | Variant::Int32(_) | Variant::Int64(_),
-            DataType::Int64,
-        )
-        | (Variant::Double(_), DataType::Float64)
-        | (Variant::BooleanTrue | Variant::BooleanFalse, DataType::Boolean) => true,
-        _ => false,
-    }
+    matches!(
+        (value, target),
+        (Variant::Null, _)
+            | (Variant::String(_) | Variant::ShortString(_), DataType::Utf8)
+            | (
+                Variant::Int8(_) | Variant::Int16(_) | Variant::Int32(_) | Variant::Int64(_),
+                DataType::Int64,
+            )
+            | (Variant::Double(_), DataType::Float64)
+            | (
+                Variant::BooleanTrue | Variant::BooleanFalse,
+                DataType::Boolean
+            )
+    )
 }
 
 // Normalize views before Lance's write boundary, keeping this adapter independent
