@@ -1,5 +1,6 @@
 use super::*;
 use axum::{routing::post, Router};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 
 async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -99,6 +100,191 @@ async fn publication_rejects_redirects_instead_of_skipping_a_worker() {
         Err(MasterError::Unavailable(_))
     ));
     server.abort();
+}
+
+#[tokio::test]
+async fn publication_retries_transient_failures_without_repeating_successful_workers() {
+    for transient in [408, 429, 500, 502, 503, 504] {
+        let failed_calls = Arc::new(AtomicUsize::new(0));
+        let successful_calls = Arc::new(AtomicUsize::new(0));
+        let (failed, failed_server) = serve(Router::new().route(
+            "/api/v1/events/table/flush-local",
+            post({
+                let calls = failed_calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::from_u16(transient).unwrap()
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
+                    }
+                }
+            }),
+        ))
+        .await;
+        let (successful, successful_server) = serve(Router::new().route(
+            "/api/v1/events/table/flush-local",
+            post({
+                let calls = successful_calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        ))
+        .await;
+        flush_workers(
+            &crate::state::worker_http_client().unwrap(),
+            &[failed, successful],
+            "events",
+            "table",
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(successful_calls.load(Ordering::SeqCst), 1);
+        failed_server.abort();
+        successful_server.abort();
+    }
+}
+
+#[tokio::test]
+async fn publication_bounds_retries_and_does_not_retry_permanent_responses() {
+    for (status, attempts) in [
+        (503, 4),
+        (400, 1),
+        (401, 1),
+        (403, 1),
+        (404, 1),
+        (409, 1),
+        (200, 1),
+        (307, 1),
+        (501, 1),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = serve(Router::new().route(
+            "/api/v1/events/table/flush-local",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::from_u16(status).unwrap()
+                    }
+                }
+            }),
+        ))
+        .await;
+        assert!(matches!(
+            flush_workers(
+                &crate::state::worker_http_client().unwrap(),
+                &[endpoint],
+                "events",
+                "table",
+            )
+            .await,
+            Err(MasterError::Unavailable(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), attempts, "HTTP {status}");
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn publication_retries_a_lost_response_after_the_worker_received_the_request() {
+    use tokio::io::AsyncReadExt;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn({
+        let calls = calls.clone();
+        async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(connection.read_u8().await.unwrap());
+            }
+            assert!(request.starts_with(b"POST /api/v1/events/table/flush-local "));
+            calls.fetch_add(1, Ordering::SeqCst);
+            // The first worker received the flush, but lost its acknowledgement.
+            drop(connection);
+            let app = Router::new().route(
+                "/api/v1/events/table/flush-local",
+                post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        flush_workers(
+            &crate::state::worker_http_client().unwrap(),
+            &[endpoint],
+            "events",
+            "table",
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.abort();
+}
+
+#[tokio::test]
+async fn publication_honors_retry_after_without_outliving_the_deadline() {
+    for retry_after in [
+        "30".to_string(),
+        httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(30)),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = serve(Router::new().route(
+            "/api/v1/events/table/flush-local",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    let retry_after = retry_after.clone();
+                    async move {
+                        let status = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::NO_CONTENT
+                        };
+                        (status, [(RETRY_AFTER, retry_after)])
+                    }
+                }
+            }),
+        ))
+        .await;
+        // Longer than the first jittered backoff, shorter than Retry-After.
+        let result = tokio::time::timeout(
+            Duration::from_millis(750),
+            flush_workers(
+                &crate::state::worker_http_client().unwrap(),
+                &[endpoint],
+                "events",
+                "table",
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "the deadline must bound Retry-After too");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
 }
 
 #[tokio::test]
