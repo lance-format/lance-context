@@ -226,6 +226,11 @@ impl Service {
                 self.check_owner_observed(authority),
             )
             .await
+            .inspect_err(|error| {
+                // HTTP intentionally keeps its stable public error contract;
+                // retain the underlying cause in the service log for diagnosis.
+                eprintln!("annotation owner fence failed: {error:#}");
+            })
     }
 
     async fn check_owner_observed(

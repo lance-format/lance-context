@@ -134,12 +134,17 @@ async fn failed_read(failure: Failure) -> Result<()> {
             format!("{error:#}").contains("correlation mismatch"),
             "{error:#}"
         ),
-        Failure::Unsolicited => assert!(
-            error
-                .to_string()
-                .contains("unexpected application bytes on idle WAL connection"),
-            "{error:#}"
-        ),
+        Failure::Unsolicited => {
+            assert_eq!(
+                error.to_string(),
+                format!("WAL RPC status group=10 node={leader} stage=idle_connection")
+            );
+            assert!(
+                format!("{error:#}")
+                    .contains("unexpected application bytes on idle WAL connection"),
+                "{error:#}"
+            );
+        }
     }
     assert_eq!(
         connections.load(Ordering::Relaxed),
