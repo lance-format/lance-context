@@ -1,5 +1,6 @@
 //! Large narrow rewrites use the existing native preparation/reference encoding.
 use super::*;
+use crate::materializer::observation::{Counters, Phase};
 use lance::dataset::optimize::RewriteResult;
 use lance_context_core::annotation_staging::RESULTS_PROPERTY;
 
@@ -9,23 +10,30 @@ pub(crate) async fn descriptors(
     selection: &Selection,
     storage: &Storage,
     maximum: u64,
+    phases: &Arc<Counters>,
 ) -> Result<p::Descriptors> {
-    let mut transaction = Transaction::new_from_version(
-        base.version_id(),
-        lance_context_core::native_compaction::prepare_rewrite(
-            base,
-            result,
-            metadata::MAX_NATIVE_BYTES,
+    let rewrite = phases
+        .measure(
+            Phase::AnnotationCompactionRemap,
+            lance_context_core::native_compaction::prepare_rewrite(
+                base,
+                result,
+                metadata::MAX_NATIVE_BYTES,
+            ),
         )
-        .await?,
-    );
-    transaction.uuid = selection.pending.plan.transaction.to_string();
-    transaction.transaction_properties = base
-        .read_transaction()
-        .await?
-        .and_then(|t| t.transaction_properties);
-    validate(base, &transaction, selection).await?;
-    persist_transaction(base, &transaction, selection, storage, maximum).await
+        .await?;
+    phases
+        .measure(Phase::AnnotationCompactionMetadata, async {
+            let mut transaction = Transaction::new_from_version(base.version_id(), rewrite);
+            transaction.uuid = selection.pending.plan.transaction.to_string();
+            transaction.transaction_properties = base
+                .read_transaction()
+                .await?
+                .and_then(|t| t.transaction_properties);
+            validate(base, &transaction, selection).await?;
+            persist_transaction(base, &transaction, selection, storage, maximum).await
+        })
+        .await
 }
 
 pub(super) async fn validate(

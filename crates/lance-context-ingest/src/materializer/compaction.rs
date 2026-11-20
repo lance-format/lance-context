@@ -281,7 +281,7 @@ pub(super) async fn prepare(
         if result.row_addrs.is_some() {
             return if annotations {
                 crate::annotation_publication::compaction::descriptors(
-                    &dataset, result, &selection, &storage, maximum,
+                    &dataset, result, &selection, &storage, maximum, &phases,
                 )
                 .await
             } else {
@@ -291,7 +291,7 @@ pub(super) async fn prepare(
         let bytes = serde_json::to_vec(&result)?;
         if annotations && bytes.len() as u64 > maximum {
             crate::annotation_publication::compaction::descriptors(
-                &dataset, result, &selection, &storage, maximum,
+                &dataset, result, &selection, &storage, maximum, &phases,
             )
             .await
         } else {

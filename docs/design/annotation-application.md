@@ -324,6 +324,15 @@ catalog publication. They distinguish actual native work from the parent
 `compact` scheduling checks. Each child records one admitted native call, not
 one fragment, cloud request or successfully published version.
 
+After a narrow native rewrite, `annotation_compaction_remap` measures rewrite
+validation and native index remapping. `annotation_compaction_metadata` then
+measures transaction assembly, validation and descriptor persistence. These
+steps are outside `native_compaction`; an already completed file rewrite can
+still be waiting on index reads or metadata writes before publication. These
+phases cover narrow native descriptor preparation, not body-table maintenance.
+For all phase counters, `completed` includes `failed`; cancellations are counted
+separately. Fields are sampled independently and are not an atomic progress view.
+
 Annotation commit resolution reports four nested phases.
 `annotation_commit_base` loads the fixed predecessor;
 `annotation_commit_publish` validates and publishes the prepared target when it
