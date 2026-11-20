@@ -1,5 +1,7 @@
 # Automatic shredding: baseline and Arrow Variant
 
+Historical measurements below predate the [field-level fallback repair](variant-field-fallback-assessment.md). See that report for the subsequent mixed-type search results.
+
 Measured on 2026-11-17 using the repaired baseline and the separate Arrow Variant
 implementation in one release native extension. Both paths pass the correctness
 checks below. Variant provides the requested standard representation and automatic
