@@ -95,8 +95,12 @@ pub enum Phase {
     AnnotationMaintenancePrepare,
     /// Resolving, installing and finishing the prepared maintenance publication.
     AnnotationMaintenancePublish,
+    /// Validating a narrow rewrite and preparing its native index remaps.
+    AnnotationCompactionRemap,
+    /// Validating and persisting narrow rewrite metadata after index remapping.
+    AnnotationCompactionMetadata,
 }
-const NAMES: [&str; 51] = [
+const NAMES: [&str; 53] = [
     "claim",
     "acquire",
     "state",
@@ -148,6 +152,8 @@ const NAMES: [&str; 51] = [
     "annotation_maintenance_select",
     "annotation_maintenance_prepare",
     "annotation_maintenance_publish",
+    "annotation_compaction_remap",
+    "annotation_compaction_metadata",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
@@ -175,6 +181,7 @@ impl Default for Counters {
 pub struct Observation {
     pub phase: &'static str,
     pub started: u64,
+    /// Finished calls, including the failed subset below; excludes cancellation.
     pub completed: u64,
     pub failed: u64,
     pub cancelled: u64,
