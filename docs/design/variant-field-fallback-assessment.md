@@ -12,10 +12,10 @@ dependencies and Lance vendor sources are unchanged.
 Measured on 2026-11-20 (UTC).
 
 Measured source: `5095a05aa96a61f825f47b99c523a945ea1c6ed7`. Release native SHA-256:
-`b16592890169f5167565e0fcc49081ad19823b0f27b9986e7b36861b8de56297`. All 30 fresh-process runs validated full values,
-projected values and search results. The paired mixed case uses 8 records with
+`b16592890169f5167565e0fcc49081ad19823b0f27b9986e7b36861b8de56297`. All 30 fresh-process runs passed their scenario-specific correctness assertions. The paired mixed case uses 8 records with
 20 MiB of synthetic text each and a boolean in the final record's integer field.
-Each process takes 15 full/path samples and 5 samples for each search, after warmup.
+Each paired mixed-case process takes 15 full/path samples and 5 samples for each
+search, after warmup.
 The table shows the median of three process medians, with their min–max range.
 Times are milliseconds.
 
