@@ -73,6 +73,15 @@ budgets independently on the owner and both ingresses. The recorded experiments
 use 32 MiB each; the largest decoded input reservation exceeds 16 MiB. Staging
 and publication retain their separate bounds.
 
+`annotations.index_cache_bytes` sets the annotation owner's shared Lance index
+cache weight budget, including its body and narrow destinations. Omit it to keep
+Lance's default (currently 6 GiB), or set it to `0` to disable index caching.
+The owner's metadata/value cache remains 128 MiB. Size caches together with the
+upload, apply, publication and staging budgets for the container's memory limit;
+cache weights do not bound total RSS or native query allocations. Changing this
+owner setting on restart does not change the durable mutation contract. Smaller
+caches can increase storage reads, so qualify latency and throughput under load.
+
 Choose staging byte/entry and per-value limits before provisioning: they affect
 deterministic mutation rejection and are part of the durable schema fingerprint.
 Changing them when reopening the same generation is rejected. The publication

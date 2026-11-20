@@ -22,6 +22,7 @@ fn configuration(c: &network::Cluster, physical: &Physical, owner_url: String) -
         routes: vec![],
         wal_clusters: BTreeMap::new(),
         apply_memory_bytes: 8 << 20,
+        index_cache_bytes: None,
         staging: fixture::limits(),
         source: None,
         projection: None,

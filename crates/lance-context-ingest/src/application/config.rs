@@ -97,6 +97,10 @@ pub struct Annotations {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub wal_clusters: BTreeMap<String, WalConnection>,
     pub apply_memory_bytes: usize,
+    /// Owner's shared Lance index-cache weight budget. None uses Lance's
+    /// default; zero disables index caching. This is not a process RSS limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_cache_bytes: Option<usize>,
     #[serde(default)]
     pub staging: lance_context_core::annotation_staging::Limits,
     /// Fixed, quiesced source snapshot for the explicit annotation-bootstrap role.

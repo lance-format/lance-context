@@ -85,6 +85,7 @@ async fn frontend_with_settings(
         wal_clusters: BTreeMap::new(),
         owner_url: uri.into(),
         apply_memory_bytes: 8 << 20,
+        index_cache_bytes: None,
         staging: settings.limits,
         source: None,
         projection: None,

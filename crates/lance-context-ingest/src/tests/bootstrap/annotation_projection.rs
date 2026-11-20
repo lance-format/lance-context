@@ -392,6 +392,7 @@ async fn annotation_projection_application_config_routes_bootstrap_and_rejects_b
         wal_clusters: BTreeMap::new(),
         owner_url: "http://unused-owner:8080".into(),
         apply_memory_bytes: 8 << 20,
+        index_cache_bytes: None,
         staging: limits(),
         source: Some(source.snapshot.clone()),
         projection: Some(source),

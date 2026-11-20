@@ -169,6 +169,7 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         wal_clusters: BTreeMap::new(),
         owner_url: bases[0].clone(),
         apply_memory_bytes: 8 << 20,
+        index_cache_bytes: None,
         staging: limits.clone(),
         source: Some(source),
         projection: None,
