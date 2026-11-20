@@ -87,7 +87,12 @@ to Kubernetes' control-plane etcd.
 
 The master includes NotReady and terminating endpoints. Those workers may still
 hold acknowledged writes; excluding them could falsely report publication success.
-An unavailable endpoint, API error, missing port or empty list fails the request.
+Each endpoint must include a non-empty `targetRef.uid` identifying its Pod.
+Missing, null, empty or whitespace-only UIDs fail discovery with 503; address-only
+endpoints cannot distinguish a replacement Pod at the same address. Use Pod-backed
+Services whose EndpointSlices provide these identities. The requirement applies
+to both membership snapshots and the managed kind's background merge discovery.
+An unavailable endpoint, API error, missing port or empty list also fails the request.
 This favors recovery correctness over availability during worker replacement.
 
 The master needs its projected service-account token, cluster CA and access to
