@@ -2,7 +2,7 @@ use super::*;
 use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lance::{dataset::WriteParams, index::DatasetIndexInternalExt, Dataset};
+use lance::{dataset::WriteParams, index::DatasetIndexExt, Dataset};
 use lance_index::{scalar::ScalarIndexParams, IndexType};
 
 #[tokio::test]
