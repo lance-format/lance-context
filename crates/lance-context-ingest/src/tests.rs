@@ -85,7 +85,7 @@ fn session(bucket: u32) -> String {
         .find(|s| layout().session_bucket("tenant", "rollouts", s).unwrap() == bucket)
         .unwrap()
 }
-fn batch(ids: &[&str], sessions: &[&str]) -> Result<RecordBatch> {
+pub(crate) fn batch(ids: &[&str], sessions: &[&str]) -> Result<RecordBatch> {
     let schema = Arc::new(rollout_schema());
     let n = ids.len();
     ensure!(n == sessions.len(), "test row mismatch");

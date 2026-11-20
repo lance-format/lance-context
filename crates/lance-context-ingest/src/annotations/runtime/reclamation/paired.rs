@@ -5,6 +5,14 @@ use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAcces
 use lance_table::io::commit::{CommitHandler, ConditionalPutCommitHandler};
 use object_store::ObjectStoreExt;
 
+/// One fixed-size memo for the current closed candidate page and destination.
+/// Adjacent narrow roots often select the same immutable body snapshot.
+#[derive(Default)]
+pub(super) struct Protection(Option<(u64, [u8; 36], bool)>);
+
+#[cfg(test)]
+mod tests;
+
 pub(super) async fn store(storage: &Storage) -> Result<Arc<ObjectStore>> {
     let (store, base) = ObjectStore::from_uri_and_params(
         storage.session.store_registry(),
@@ -34,6 +42,7 @@ pub(super) async fn protect_body(
     budget: &Arc<MergeMemoryBudget>,
     already_reserved: usize,
     retain_data: bool,
+    protected: &mut Protection,
 ) -> Result<()> {
     let reference = BodySnapshot::read(narrow)
         .await?
@@ -42,6 +51,14 @@ pub(super) async fn protect_body(
         reference.uri == storage.uri && reference.table_instance == incarnation.to_string(),
         "protected body reference differs from authorized destination"
     );
+    let transaction: [u8; 36] = reference.transaction.as_bytes().try_into()?;
+    if protected.0.is_some_and(|(version, identity, data)| {
+        version == reference.version && identity == transaction && (data || !retain_data)
+    }) {
+        // The candidate page cannot gain paths during protection. Reopening
+        // the same body cannot remove any additional paths from this page.
+        return Ok(());
+    }
     // Bound a single body manifest before decoding it. Retained roots are opened
     // one at a time; they do not form another unbounded manifest/root cache.
     let location = ConditionalPutCommitHandler
@@ -72,5 +89,7 @@ pub(super) async fn protect_body(
         &location.path,
         &storage.base,
         retain_data,
-    )
+    )?;
+    protected.0 = Some((reference.version, transaction, retain_data));
+    Ok(())
 }
