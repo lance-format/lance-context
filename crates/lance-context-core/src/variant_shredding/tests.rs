@@ -278,12 +278,19 @@ fn malformed_external_variant_buffers_return_errors() {
     use arrow_array::BinaryArray;
     let layout = AutoVariantLayout::infer(&[json!({"count": 1})], &ShredPolicy::default()).unwrap();
     for metadata in [Some(&[0xff][..]), None] {
-        let malformed = VariantArray::from_parts(
-            Arc::new(BinaryArray::from(vec![metadata])),
-            Some(Arc::new(BinaryArray::from(vec![&[0xff][..]]))),
-            None,
+        let malformed = StructArray::new(
+            vec![
+                Field::new("metadata", DataType::Binary, true),
+                Field::new("value", DataType::Binary, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(BinaryArray::from(vec![metadata])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![&[0xff][..]])) as ArrayRef,
+            ],
             None,
         );
+        let malformed = VariantArray::try_new(&malformed).unwrap();
         assert!(layout.shred(&malformed).is_err());
     }
 }
