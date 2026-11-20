@@ -33,20 +33,16 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  test:
+  workspace-tests:
     runs-on: ubuntu-24.04
     # Keep workspace tests independent of the optional feature build graphs.
     timeout-minutes: 60
-    strategy:
-      matrix:
-        toolchain:
-          - stable
     steps:
       - uses: actions/checkout@v4
       - name: Setup rust toolchain
         run: |
-          rustup toolchain install ${{ matrix.toolchain }}
-          rustup default ${{ matrix.toolchain }}
+          rustup toolchain install stable
+          rustup default stable
       - name: Make room for the workspace build cache
         run: |
           # Match the HA job: these hosted-runner SDKs are unused by this build.
@@ -68,13 +64,6 @@ jobs:
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
           sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
-      - name: Vendored multipart upload regressions
-        run: |
-          cargo test --locked --manifest-path vendor/lance-io/Cargo.toml --lib object_store::throttle::tests
-          # Use Lance 14's pinned lint toolchain for its unchanged upstream code.
-          # Runtime tests above still use this repository's current stable Rust.
-          rustup toolchain install 1.98.1 --profile minimal --component clippy
-          cargo +1.98.1 clippy --locked --manifest-path vendor/lance-io/Cargo.toml --all-targets -- -D warnings
       - name: Build tests
         run: cargo test --workspace --all-targets --no-run
       - name: Run unit and integration tests
@@ -84,6 +73,55 @@ jobs:
         # regression test was dead weight in CI. `--workspace` covers the crates
         # that were silently untested (api, server, client, metrics, the facade).
         run: cargo test --workspace --all-targets
+
+  vendored-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lance-context-vendored-deps"
+          workspaces: "vendor/lance-io -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: |
+          # Use the official archive directly when the hosted image supplies a mirror list.
+          if [[ -f /etc/apt/apt-mirrors.txt ]]; then
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          fi
+          apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
+      - name: Vendored multipart upload regressions
+        run: |
+          cargo test --locked --manifest-path vendor/lance-io/Cargo.toml --lib object_store::throttle::tests
+          # Use Lance 14's pinned lint toolchain for its unchanged upstream code.
+          # Runtime tests above still use this repository's current stable Rust.
+          rustup toolchain install 1.98.1 --profile minimal --component clippy
+          cargo +1.98.1 clippy --locked --manifest-path vendor/lance-io/Cargo.toml --all-targets -- -D warnings
+
+  # Preserve the existing check name for branch protection. Skipped, cancelled
+  # or failed suites must fail the gate, including when a prerequisite fails.
+  test:
+    name: test (stable)
+    needs: [workspace-tests, vendored-tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require both test suites
+        env:
+          WORKSPACE_RESULT: ${{ needs.workspace-tests.result }}
+          VENDORED_RESULT: ${{ needs.vendored-tests.result }}
+        run: |
+          test "$WORKSPACE_RESULT" = success
+          test "$VENDORED_RESULT" = success
 
   wal-tests:
     runs-on: ubuntu-24.04
@@ -194,10 +232,15 @@ jobs:
           cargo test -p lance-context-wal --features lance-integration --lib replication::publication::lance
           cargo test -p lance-context-wal --features lance-integration --test replication_process lance_publication
 
-  ha-tests:
+  ha-suite:
     runs-on: ubuntu-24.04
-    # Allow the final cold service-feature build to reach the recovery tests.
+    # Compile independent feature graphs concurrently instead of rebuilding
+    # them sequentially on one runner. Keep each suite's existing test commands.
     timeout-minutes: 105
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [materializer, http, coordination, compaction, recovery]
     steps:
       - uses: actions/checkout@v4
       - name: Setup rust toolchain
@@ -212,7 +255,7 @@ jobs:
           df -h / "$RUNNER_TEMP"
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "lance-context-ha-deps"
+          shared-key: "lance-context-ha-${{ matrix.suite }}-deps"
           workspaces: "."
           # Saving a PR-scoped cache must not time out already passing tests.
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -227,17 +270,28 @@ jobs:
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
           sudo apt-get "${apt_options[@]}" install -y clang libclang-dev protobuf-compiler
       - name: Rollout materialization through the WAL client
+        if: matrix.suite == 'materializer'
         run: |
           cargo clippy -p lance-context-ingest --features materializer --all-targets -- -D warnings
           cargo test -p lance-context-ingest --features materializer --lib --test stable_index_selection
       - name: HTTP ingestion and recoverable producer journal
+        if: matrix.suite == 'http'
         run: |
           cargo clippy -p lance-context-ingest --features http --all-targets -- -D warnings
           cargo clippy -p lance-context-ingest --features http-client,materializer --all-targets -- -D warnings
           cargo test -p lance-context-ingest --features http-client,materializer --lib
       - name: Materializer worker feature checks
+        if: matrix.suite == 'http'
         run: cargo clippy -p lance-context-ingest --features worker --all-targets -- -D warnings
+      - name: Build isolated commit permit regressions
+        if: matrix.suite == 'coordination'
+        # The harness caps its build at ten minutes. The old serial job warmed
+        # these dependencies first; explicitly build them on this fresh runner.
+        run: cargo test --locked -p lance-context-merge --test private_permit_rpc --no-run
       - name: Start etcd for HA scheduler test
+        # Each matrix job has its own runner and etcd. In particular, compaction
+        # cannot invalidate watches or global RPC counts in the other suites.
+        if: contains(fromJSON('["coordination", "compaction", "recovery"]'), matrix.suite)
         run: |
           ETCD_VERSION=3.7.0
           curl -fsSL -o /tmp/etcd.tar.gz \
@@ -259,8 +313,10 @@ jobs:
       # single named test left the other 18 ignored tests — the scheduler,
       # routes, and state etcd paths — completely untested. Run the whole suite.
       - name: Isolated commit permit contention and response-loss regressions
+        if: matrix.suite == 'coordination'
         run: python3 scripts/ci/test_commit_permits.py --etcd /tmp/etcd/etcd --output /tmp/commit-permit-rpc
       - name: Run etcd-backed HA test suite
+        if: matrix.suite == 'coordination'
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
         run: |
@@ -293,9 +349,10 @@ jobs:
       # Aggregate admission tests also measure global RPC counts and compact
       # etcd. Keep the whole aggregate module out of the shared parallel suite;
       # the demand_controller:: filter below runs every test with both opt-ins.
-      # Compaction changes the entire etcd revision history. Run its explicit
-      # opt-in only after the parallel suites have finished using this instance.
+      # Compaction changes the entire etcd revision history. Keep these tests
+      # serial on the compaction suite's dedicated etcd instance.
       - name: Check scheduler recovery after etcd compaction
+        if: matrix.suite == 'compaction'
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
           ETCD_TEST_ALLOW_COMPACTION: "1"
@@ -348,6 +405,7 @@ jobs:
             -- --exact --ignored --test-threads=1
 
       - name: Ingestion application process recovery
+        if: matrix.suite == 'recovery'
         env:
           ETCD_TEST_ENDPOINTS: http://127.0.0.1:2379
           INGEST_TEST_BIN: ${{ github.workspace }}/target/debug/lance-context-ingest
@@ -368,13 +426,25 @@ jobs:
           cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::compaction::process::compaction_survives_sigkill
           cargo test -p lance-context-ingest --features service,http-client --lib tests::application -- --ignored
       - name: Save ingestion application failure logs
-        if: failure()
+        if: failure() && matrix.suite == 'recovery'
         uses: actions/upload-artifact@v4
         with:
           name: ingest-application-failure-logs
           path: ${{ runner.temp }}/ingest-application/**/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # Keep the original required check while all five independent suites run.
+  ha-tests:
+    needs: ha-suite
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every HA suite
+        env:
+          HA_RESULT: ${{ needs.ha-suite.result }}
+        run: test "$HA_RESULT" = success
 
   coverage:
     runs-on: ubuntu-24.04
