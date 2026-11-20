@@ -431,6 +431,8 @@ impl Collector {
         // occur after protection/sealing, even if a DELETE outlives this owner.
         phases
             .measure(Phase::CollectProtect, async {
+                // This memo never outlives the closed page or crosses destinations.
+                let mut protected_body = paired::Protection::default();
                 if body_storage.is_none() {
                     if let Some(source) = index_source {
                         // The job's original native snapshot remains readable
@@ -455,6 +457,7 @@ impl Collector {
                             budget,
                             page_charge,
                             true,
+                            &mut protected_body,
                         )
                         .await?;
                     } else {
@@ -523,6 +526,7 @@ impl Collector {
                             budget,
                             page_charge + charge,
                             retain_data,
+                            &mut protected_body,
                         )
                         .await?;
                         continue;
