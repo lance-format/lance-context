@@ -34,6 +34,10 @@ pub(in crate::tests) struct Proxy {
     pub client: Arc<Client>,
     pub dropped: Arc<AtomicUsize>,
     pub plans: Arc<AtomicUsize>,
+    pub plan_requests: Arc<std::sync::Mutex<Vec<p::PlanRequest>>>,
+    pub unknown_plans: Arc<AtomicBool>,
+    pub rpc_unknown_plans: Arc<AtomicBool>,
+    pub pause_plan_retry: Arc<AtomicBool>,
     pub prepares: Arc<AtomicUsize>,
     pub unknown_prepares: Arc<AtomicBool>,
     pub pause_uncommitted_prepare: Arc<AtomicBool>,
@@ -448,6 +452,10 @@ impl Proxy {
         let armed = Arc::new(AtomicBool::new(true));
         let dropped = Arc::new(AtomicUsize::new(0));
         let plans = Arc::new(AtomicUsize::new(0));
+        let plan_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unknown_plans = Arc::new(AtomicBool::new(false));
+        let rpc_unknown_plans = Arc::new(AtomicBool::new(false));
+        let pause_plan_retry = Arc::new(AtomicBool::new(false));
         let prepares = Arc::new(AtomicUsize::new(0));
         let unknown_prepares = Arc::new(AtomicBool::new(false));
         let pause_uncommitted_prepare = Arc::new(AtomicBool::new(false));
@@ -509,6 +517,10 @@ impl Proxy {
             let armed = armed.clone();
             let dropped = dropped.clone();
             let plans = plans.clone();
+            let plan_requests = plan_requests.clone();
+            let unknown_plans = unknown_plans.clone();
+            let rpc_unknown_plans = rpc_unknown_plans.clone();
+            let pause_plan_retry = pause_plan_retry.clone();
             let prepares = prepares.clone();
             let unknown_prepares = unknown_prepares.clone();
             let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
@@ -547,6 +559,10 @@ impl Proxy {
                             let (acceptor, connector, name, address, armed, dropped, committed, release) =
                                 (acceptor.clone(), connector.clone(), name.clone(), address.clone(), armed.clone(), dropped.clone(), committed.clone(), release.clone());
                             let plans = plans.clone();
+            let plan_requests = plan_requests.clone();
+            let unknown_plans = unknown_plans.clone();
+            let rpc_unknown_plans = rpc_unknown_plans.clone();
+            let pause_plan_retry = pause_plan_retry.clone();
                             let prepares = prepares.clone();
                             let unknown_prepares = unknown_prepares.clone();
                             let pause_uncommitted_prepare = pause_uncommitted_prepare.clone();
@@ -712,10 +728,22 @@ impl Proxy {
                                         }
                                     }
                                     if hold && matches!(point, Point::Plan { .. }) {
-                                        plans.fetch_add(1, Ordering::SeqCst);
-                                        if matches!(point, Point::Plan { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                        let previous = plans.fetch_add(1, Ordering::SeqCst);
+                                        let (_, _, command): (WireScope, u32, Command) = codec().reject_trailing_bytes().deserialize(&request.meta)?;
+                                        let Command::Plan(plan) = command else { bail!("expected a Plan command"); };
+                                        plan_requests.lock().unwrap().push(plan);
+                                        if previous > 0 && pause_plan_retry.swap(false, Ordering::SeqCst) {
+                                            committed.notify_one();
+                                            release.notified().await;
+                                        }
+                                        if unknown_plans.load(Ordering::SeqCst) || (matches!(point, Point::Plan { execute: false }) && armed.swap(false, Ordering::SeqCst)) {
                                             dropped.fetch_add(1, Ordering::SeqCst);
-                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            let reply = if rpc_unknown_plans.load(Ordering::SeqCst) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
                                             continue;
                                         }
                                     }
@@ -736,7 +764,7 @@ impl Proxy {
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
                                         if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Retire { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
-                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. } | Point::Retire { rpc_unknown: true, .. }) {
+                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. } | Point::Retire { rpc_unknown: true, .. }) || (matches!(point, Point::Plan { .. }) && rpc_unknown_plans.load(Ordering::SeqCst)) {
                                                 request.reply(Reply::Unknown)?
                                             } else {
                                                 request.unknown_reply()?
@@ -791,6 +819,10 @@ impl Proxy {
             )?),
             dropped,
             plans,
+            plan_requests,
+            unknown_plans,
+            rpc_unknown_plans,
+            pause_plan_retry,
             prepares,
             unknown_prepares,
             pause_uncommitted_prepare,
