@@ -272,3 +272,18 @@ fn type_drift_keeps_sibling_text_shredded_and_preserves_every_original_type() {
         assert!(nested_text.column_by_name("value").unwrap().is_null(row));
     }
 }
+
+#[test]
+fn malformed_external_variant_buffers_return_errors() {
+    use arrow_array::BinaryArray;
+    let layout = AutoVariantLayout::infer(&[json!({"count": 1})], &ShredPolicy::default()).unwrap();
+    for metadata in [Some(&[0xff][..]), None] {
+        let malformed = VariantArray::from_parts(
+            Arc::new(BinaryArray::from(vec![metadata])),
+            Some(Arc::new(BinaryArray::from(vec![&[0xff][..]]))),
+            None,
+            None,
+        );
+        assert!(layout.shred(&malformed).is_err());
+    }
+}

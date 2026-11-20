@@ -194,18 +194,38 @@ impl AutoVariantLayout {
     pub fn shred(&self, input: &VariantArray) -> Result<VariantArray> {
         let target = self.target_type()?;
         let input = unshred_variant(input)?;
-        if self.fields.is_empty() {
-            return normalize(&input);
-        }
+        // VariantArray::try_value uses shallow, panicking binary decoding in
+        // Arrow 58. Keep full validation before either the kernel or the guard
+        // traverses externally supplied metadata/value buffers.
+        let metadata = cast(input.metadata_field(), &DataType::BinaryView)?;
+        let value = cast(
+            input
+                .value_field()
+                .ok_or_else(|| invalid("missing Variant value"))?,
+            &DataType::BinaryView,
+        )?;
+        let metadata = metadata
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryViewArray>()
+            .unwrap();
+        let value = value
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryViewArray>()
+            .unwrap();
         let originals = (0..input.len())
             .map(|row| {
                 if input.is_null(row) {
                     Ok(None)
+                } else if metadata.is_null(row) || value.is_null(row) {
+                    Err(invalid("non-null Variant requires metadata and value"))
                 } else {
-                    input.try_value(row).map(Some)
+                    Variant::try_new(metadata.value(row), value.value(row)).map(Some)
                 }
             })
             .collect::<Result<Vec<_>>>()?;
+        if self.fields.is_empty() {
+            return normalize(&input);
+        }
         let shredded = shred_variant(&input, &target)?;
         let restored = restore_coerced_fields(&originals, &target, shredded.inner())?;
         normalize(&VariantArray::try_new(&restored)?)
