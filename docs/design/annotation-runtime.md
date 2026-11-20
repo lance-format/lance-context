@@ -62,11 +62,17 @@ Startup handles the durable states explicitly:
 - **Completed publication:** restore its exact value/result checkpoint and replay
   the remaining WAL suffix.
 
-An unknown Plan result first gets one bounded quorum observation. Publication
-continues only if the current authority, table binding and incarnation still match
-and the entire original pending plan is recorded. The command is not resubmitted;
-absence or different plan content remains unresolved. Concurrent updates stay in
-the active generation while the original frozen generation completes.
+An unknown Plan result first gets a quorum observation that checks the current
+authority, table binding and incarnation. The entire recorded pending plan must
+match before publication can continue. If an explicit unknown response has no
+recorded plan, the publisher checks the original read version and source
+checkpoints, waits 100 ms, and reissues the same authority and complete Plan.
+A late original commit and its exact retry resolve to the original plan index.
+Conflicting plans, changed predecessors and fencing still stop the operation.
+Transport errors get one observation and remain errors unless the original plan
+is confirmed. Cancellation stops retries without changing the recovery evidence.
+Concurrent updates retain the existing active/frozen staging bounds; retries do
+not select a new source prefix, upload files again, or replay business mutations.
 
 Other unresolved publication/protocol errors stop this runtime and its read
 barriers. A fenced restart reconciles the retained operation. The runtime
