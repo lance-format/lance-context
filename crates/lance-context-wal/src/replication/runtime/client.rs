@@ -1044,8 +1044,20 @@ impl Client {
         let metadata = codec().serialize(&(&expected, wire))?;
         let pool = if data { &pools.data } else { &pools.control };
         let mut connection = timings.map(|c| c[1].start());
-        let _slot = pool.slots.clone().acquire_owned().await?;
-        let mut idle = pool.take_idle().await?;
+        // Keep failures before the first frame distinguishable. Construct the
+        // context only on failure; addresses, credentials and payloads stay out.
+        let connection_error =
+            |stage| format!("WAL RPC {operation} group={group} node={node} stage={stage}");
+        let _slot = pool
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .with_context(|| connection_error("pool_admission"))?;
+        let mut idle = pool
+            .take_idle()
+            .await
+            .with_context(|| connection_error("idle_connection"))?;
         let mut reconnect_read = read_only && idle.is_some();
         loop {
             let reused = idle.is_some();
@@ -1057,7 +1069,9 @@ impl Client {
                     } else {
                         &pools.endpoint.control_address
                     };
-                    let tcp = TcpStream::connect(address).await?;
+                    let tcp = TcpStream::connect(address)
+                        .await
+                        .with_context(|| connection_error("tcp_connect"))?;
                     tcp.set_nodelay(true)?;
                     let stream = self
                         .connector
@@ -1065,7 +1079,8 @@ impl Client {
                             ServerName::try_from(pools.endpoint.server_name.clone())?,
                             tcp,
                         )
-                        .await?;
+                        .await
+                        .with_context(|| connection_error("tls_handshake"))?;
                     ensure!(
                         stream.get_ref().1.alpn_protocol() == Some(ALPN)
                             && certificate(stream.get_ref().1.peer_certificates())?
