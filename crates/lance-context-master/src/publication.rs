@@ -1,6 +1,9 @@
 //! Synchronous publication of worker-received data for a registered store.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use axum::{
     extract::{Path, State},
@@ -8,8 +11,12 @@ use axum::{
 };
 use futures::{stream, StreamExt};
 use lance_context_core::validate_store_name;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 
 use crate::{error::MasterError, state::MasterState};
+
+const WORKER_FLUSH_MAX_RETRIES: u32 = 3;
+const WORKER_FLUSH_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 /// Publish one managed store on every configured worker before recovery reads.
 /// Writers must already be quiesced. This neither drains client queues nor merges
@@ -116,18 +123,7 @@ async fn flush_workers(
         })
         .collect::<Result<Vec<_>, MasterError>>()?;
     let results = stream::iter(urls)
-        .map(|url| async move {
-            let response = http.post(url.clone()).send().await.map_err(|error| {
-                MasterError::Unavailable(format!("worker publication failed at {url}: {error}"))
-            })?;
-            if response.status() != StatusCode::NO_CONTENT {
-                return Err(MasterError::Unavailable(format!(
-                    "worker publication at {url} returned {}",
-                    response.status()
-                )));
-            }
-            Ok(())
-        })
+        .map(|url| flush_worker(http, url))
         .buffer_unordered(8)
         .collect::<Vec<_>>()
         .await;
@@ -137,6 +133,64 @@ async fn flush_workers(
         result?;
     }
     Ok(())
+}
+
+async fn flush_worker(http: &reqwest::Client, url: reqwest::Url) -> Result<(), MasterError> {
+    for retries in 0..=WORKER_FLUSH_MAX_RETRIES {
+        if retries > 0 {
+            metrics::counter!("master_table_flush_worker_retries_total").increment(1);
+        }
+        let (error, retryable, retry_after) = match http.post(url.clone()).send().await {
+            Ok(response) => {
+                let status = response.status();
+                if status == StatusCode::NO_CONTENT {
+                    return Ok(());
+                }
+                (
+                    format!("worker publication at {url} returned {status}"),
+                    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504),
+                    publication_retry_after(response.headers()),
+                )
+            }
+            Err(error) => (
+                format!("worker publication failed at {url}: {error}"),
+                error.is_connect() || error.is_timeout() || error.is_request(),
+                None,
+            ),
+        };
+        if !retryable || retries == WORKER_FLUSH_MAX_RETRIES {
+            return Err(MasterError::Unavailable(error));
+        }
+        // Publication is idempotent even if the worker published but its response
+        // was lost. Keep successful peers untouched and retain the original
+        // membership snapshot for the final discovery check. The enclosing
+        // table deadline covers requests, backoff and Retry-After together.
+        let delay = (WORKER_FLUSH_RETRY_BACKOFF * (1 << retries))
+            .mul_f64(0.5 + rand::random::<f64>() * 0.5)
+            .max(retry_after.unwrap_or_default());
+        tracing::warn!(
+            worker = %url,
+            retry = retries + 1,
+            delay_ms = delay.as_millis(),
+            %error,
+            "retrying worker table publication"
+        );
+        tokio::time::sleep(delay).await;
+    }
+    unreachable!("the final attempt returns success or its publication error")
+}
+
+fn publication_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
+    value
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .ok()
+        .or_else(|| {
+            httpdate::parse_http_date(value)
+                .ok()
+                .map(|date| date.duration_since(SystemTime::now()).unwrap_or_default())
+        })
 }
 
 #[cfg(test)]

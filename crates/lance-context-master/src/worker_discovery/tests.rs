@@ -229,17 +229,24 @@ async fn a_changed_page_revision_is_not_a_complete_membership() {
 }
 
 #[tokio::test]
-async fn replacement_at_the_same_address_is_not_the_same_writer() {
+async fn replacement_during_worker_retry_is_not_the_same_writer() {
     let uid = Arc::new(Mutex::new("old".to_string()));
+    let calls = Arc::new(AtomicUsize::new(0));
     let (worker, _worker) = serve(Router::new().route(
         "/api/v1/events/table/flush-local",
         post({
             let uid = uid.clone();
+            let calls = calls.clone();
             move || {
                 let uid = uid.clone();
+                let calls = calls.clone();
                 async move {
                     *uid.lock().unwrap() = "new".into();
-                    axum::http::StatusCode::NO_CONTENT
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT
+                    }
                 }
             }
         }),
@@ -271,6 +278,7 @@ async fn replacement_at_the_same_address_is_not_the_same_writer() {
     .await;
     assert!(matches!(result,
         Err(crate::error::MasterError::Unavailable(message)) if message.contains("membership changed")));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

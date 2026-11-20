@@ -63,7 +63,7 @@ jobs:
         run: |
           # Use the official archive directly when the hosted image supplies a mirror list.
           if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
@@ -103,7 +103,7 @@ jobs:
         run: |
           # Use the official archive directly when the hosted image supplies a mirror list.
           if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
@@ -177,7 +177,7 @@ jobs:
         run: |
           # Use the official archive directly when the hosted image supplies a mirror list.
           if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
@@ -221,7 +221,7 @@ jobs:
         run: |
           # Use the official archive directly when the hosted image supplies a mirror list.
           if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
@@ -404,7 +404,7 @@ jobs:
         run: |
           # Use the official archive directly when the hosted image supplies a mirror list.
           if [[ -f /etc/apt/apt-mirrors.txt ]]; then
-            sudo sed -i 's|https\?://azure\.archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+            sudo sed -E -i 's|https?://([[:alnum:]-]+\.)*archive\.ubuntu\.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
           fi
           apt_options=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
           sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
