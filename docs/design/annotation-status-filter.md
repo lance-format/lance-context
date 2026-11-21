@@ -33,3 +33,20 @@ JSON byte limits bound responses. Scanner vectors and read-ahead are limited;
 the workspace estimate is not a hard cap on native index allocations or total
 scan I/O. Large-shard query cost and sustained filtering/ingestion coexistence
 still need measured qualification.
+
+For per-query diagnosis, enable the existing tracing target
+`RUST_LOG=lance_context::annotation_status_scan=debug`. Its `observation` JSON
+reports the captured fragment coverage, result count, and elapsed times before
+and after opening the original scanner. These times are cumulative from the
+start of resolution; they exclude HTTP admission, owner fencing and response
+delivery. No turn IDs, predicate values or dataset URIs are logged.
+
+`native_at_eof` contains Lance's native execution counters and operator times
+when the original stream reaches EOF. It is null when unavailable, including
+bounded early returns; null does not mean zero I/O or a cache hit. Diagnostics
+never drain the stream or issue another query to fill in missing counters.
+Native operator times can overlap and include waits, so they are not additive
+CPU times. Native bytes and requests do not include every store operation during
+planning or equal physical network traffic. Cancelled resolutions emit no final
+event; event counts alone are not request or cancellation accounting. Tracing is
+off by default, and its enabled overhead needs a matched performance comparison.
