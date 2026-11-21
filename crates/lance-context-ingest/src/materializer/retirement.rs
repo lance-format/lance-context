@@ -17,7 +17,16 @@ pub(crate) async fn retire(
 ) -> Result<p::HistoryBoundary> {
     let response = client
         .request_routed(Request::Commit(Box::new(Command::RetireHistory(request))))
-        .await?;
+        .await
+        .map_err(|error| {
+            if transport::uncertain(&error) {
+                // Preserve both the original cause and the existing bounded
+                // retirement reconciliation path. No DELETE is authorized yet.
+                error.context(HistoryUnknown)
+            } else {
+                error
+            }
+        })?;
     match response.reply {
         Reply::Commit(Outcome::Committed(Applied::Publisher(p::Reply::ManifestHistory(
             boundary,

@@ -23,6 +23,7 @@ pub(crate) mod retirement;
 mod session_index;
 pub(crate) mod stage;
 pub(crate) mod status_index;
+mod transport;
 pub(crate) mod turn_id_index;
 pub use compaction::SmallFileCompaction;
 use observation::{Counters as PhaseCounters, Phase};
