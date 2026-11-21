@@ -445,6 +445,7 @@ struct SelectedListPause {
     before_materialization: bool,
     pause_attempts: usize,
     calls: std::sync::atomic::AtomicUsize,
+    retained_selections: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -997,8 +998,10 @@ impl RolloutStore {
     /// Preserve first-seen ordering and last-seen values across base and WAL;
     /// apply filters to the winning row before pagination.
     ///
-    /// Selection still scans every source and retains one position per distinct
-    /// id; this bounds payload decoding to the selected rows, not total key I/O.
+    /// Selection still scans every source. Unfiltered finite pages retain only
+    /// the first offset + limit distinct ids; filtered pages retain all ids
+    /// because a later winning value can change whether an id matches.
+    /// This bounds retained positions and payload decoding, not total key I/O.
     /// Unfiltered, unbounded calls retain the complete-list behavior.
     pub async fn list_with_filters(
         &self,
@@ -1105,6 +1108,15 @@ impl RolloutStore {
 
         let mut positions = HashMap::new();
         let mut selections = Vec::new();
+        // The first-seen order of an unfiltered page cannot change after its
+        // prefix is full. Still inspect every later row: a duplicate can replace
+        // a retained id's winning value, including in the final WAL generation.
+        // Do not allocate from client-supplied limits or overflow their sum.
+        let retained_limit = if filters.is_none() {
+            limit.map(|limit| offset.unwrap_or(0).saturating_add(limit))
+        } else {
+            None
+        };
         for (source_index, dataset) in sources.iter().enumerate() {
             let source_kind = if source_index == 0 { "base" } else { "wal" };
             let mut scanner = dataset.scan();
@@ -1158,7 +1170,7 @@ impl RolloutStore {
                     );
                     if let Some(index) = positions.get(ids.value(row)).copied() {
                         selections[index] = selection;
-                    } else {
+                    } else if retained_limit.is_none_or(|limit| selections.len() < limit) {
                         positions.insert(ids.value(row).to_string(), selections.len());
                         selections.push(selection);
                     }
@@ -1167,6 +1179,12 @@ impl RolloutStore {
         }
         // The winning row may fail the filter even if an older row passed it.
         // Do not filter sources independently or fetch rows by id again.
+        #[cfg(test)]
+        if let Some(pause) = &selected_pause {
+            pause
+                .retained_selections
+                .store(selections.len(), std::sync::atomic::Ordering::SeqCst);
+        }
         drop(positions);
         let selected = selections
             .into_iter()
@@ -5417,6 +5435,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn selected_list_bounds_unfiltered_prefix_but_keeps_late_wal_winners() {
+        let dir = TempDir::new().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut writer = RolloutStore::open(uri).await.unwrap();
+        let batch = writer
+            .records_to_batch(&[
+                assistant_record("a"),
+                assistant_record("b"),
+                assistant_record("c"),
+                assistant_record("d"),
+            ])
+            .unwrap();
+        writer
+            .base
+            .dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(batch.clone())].into_iter(), batch.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut tail = (0..64)
+            .map(|i| assistant_record(&format!("tail-{i}")))
+            .collect::<Vec<_>>();
+        let mut replacement = assistant_record("b");
+        replacement.content = Some("latest WAL value after the page prefix".into());
+        tail.push(replacement.clone());
+        writer.add(&tail).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let reader = Arc::new(RolloutStore::open(uri).await.unwrap());
+        let complete = reader.list_all_non_blob_records().await.unwrap();
+        assert_eq!(complete.len(), 68);
+        assert_records_eq(&complete[1], &replacement);
+        for filters in [None, Some(RolloutFilters::default())] {
+            let filtered = filters.is_some();
+            let pause = Arc::new(SelectedListPause {
+                before_materialization: true,
+                ..Default::default()
+            });
+            *reader.selected_list_pause.lock().unwrap() = Some(pause.clone());
+            let reading = {
+                let reader = reader.clone();
+                tokio::spawn(async move {
+                    reader
+                        .list_with_filters(Some(2), Some(1), filters.as_ref())
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(30), pause.reached.notified())
+                .await
+                .unwrap();
+            let retained = pause
+                .retained_selections
+                .load(std::sync::atomic::Ordering::SeqCst);
+            // Resume before asserting, so a failed assertion cannot strand a
+            // reader with a live WAL-read registration.
+            pause.resume.notify_one();
+            let rows = tokio::time::timeout(std::time::Duration::from_secs(30), reading)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(retained, if filtered { 68 } else { 3 });
+            assert_eq!(rows.len(), 2);
+            for (actual, expected) in rows.iter().zip(&complete[1..3]) {
+                assert_records_eq(actual, expected);
+            }
+        }
+        *reader.selected_list_pause.lock().unwrap() = None;
+        assert!(reader
+            .list(Some(2), Some(usize::MAX))
+            .await
+            .unwrap()
+            .is_empty());
+        writer.close().await.unwrap();
     }
 
     #[tokio::test]
