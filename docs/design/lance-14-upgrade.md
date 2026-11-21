@@ -46,7 +46,12 @@ new row-address segments under the same logical index.
 Existing version-0 managed indexes are extended within the existing fragment
 and row bounds by scanning only their key and real stable row IDs and training
 native BTree pages in that same domain. Existing segments need no full-table
-rebuild. New logical indexes still use the Lance 14 builder and address domain.
+rebuild. New managed logical indexes also train native version-0 pages from real
+stable IDs, so data compaction preserves their existing pages. Creating an index
+does not first build and discard an address-domain index. Existing version-1
+indexes keep their address domain when extending or consolidating; their
+compaction still prepares the native remap. This policy applies to the managed
+session, turn-ID, and status indexes, not arbitrary native Lance indexes.
 The persisted descriptor decoder rejects mixed domains. This compatibility
 path also uses the native page merger for version-0 segments, filtering them
 with the stable IDs in their current fragment coverage. This excludes stale
