@@ -550,6 +550,25 @@ pub async fn enqueue_task(
             req.target
         )));
     }
+    if let Some(tag) = req.snapshot_tag {
+        if req.kind != TaskKind::IndexId
+            || !req.depends_on.is_empty()
+            || state.registered_target(&req.target).is_none()
+        {
+            return Err(MasterError::InvalidRequest(
+                "snapshot_tag requires a registered-table index_id task without dependencies"
+                    .into(),
+            ));
+        }
+        lance::dataset::refs::check_valid_tag(&tag)
+            .map_err(|error| MasterError::InvalidRequest(error.to_string()))?;
+        let task = state
+            .task_store
+            .enqueue_index_snapshot(&req.target, &tag)
+            .await
+            .map_err(MasterError::from_lance)?;
+        return Ok((StatusCode::ACCEPTED, Json(task)));
+    }
     let task = scheduler::enqueue_with_deps(&state, req.kind, &req.target, req.depends_on)
         .await
         .map_err(MasterError::from_lance)?;
