@@ -743,9 +743,9 @@ async fn publish_snapshot(
 ///
 /// Opening the dataset reads its manifest, which already carries the current
 /// version — so comparing it against the last observed version is free. If they
-/// match, no write has landed since, and every derived metric (`row_count`,
-/// `fragment_count`, `pending_wal_generations`) is necessarily unchanged. The
-/// previous row is then reused verbatim.
+/// match, the base row and fragment counts can be reused. WAL flushes do not
+/// change that version: pending generations must still be recounted from fresh
+/// shard manifests. The same compact observation supplies demand publication.
 ///
 /// What that skips is the whole cost of `observe`: listing every MemWAL shard
 /// and reading its manifest, opening each flushed generation to count pending
@@ -810,6 +810,47 @@ async fn pending_or_timeout<T>(
         Err(_) => Err(lance::Error::io(format!(
             "pending-generation count timed out for store '{name}'"
         ))),
+    }
+}
+
+/// Demand also reads the base merge-watermark index. An optional demand-index
+/// failure must not hide a successful manifest pending count from the sweeper.
+/// Keep its existing 15-second read bound; fallback uses the original count path.
+async fn observe_pending_with_demand(
+    name: &str,
+    watermarks: impl std::future::Future<
+        Output = lance::Result<Vec<lance_context_core::ShardWatermark>>,
+    >,
+    pending: impl std::future::Future<Output = lance::Result<(usize, usize)>>,
+) -> lance::Result<(
+    usize,
+    usize,
+    i64,
+    Option<crate::demand_publish::ScanWatermarks>,
+)> {
+    let reading = std::time::Instant::now();
+    let observed = tokio::time::timeout(Duration::from_secs(15), watermarks).await;
+    metrics::histogram!("master_scan_wal_observation_seconds")
+        .record(reading.elapsed().as_secs_f64());
+    match observed {
+        Ok(Ok(marks)) => {
+            let observation = crate::demand_publish::ScanWatermarks {
+                marks,
+                observed_at_ms: Utc::now().timestamp_millis(),
+            };
+            let (pending, largest) = observation.counts();
+            Ok((
+                pending,
+                largest,
+                observation.observed_at_ms,
+                Some(observation),
+            ))
+        }
+        _ => {
+            metrics::counter!("master_scan_watermark_count_fallback_total").increment(1);
+            let (pending, largest) = pending_or_timeout(name, pending).await?;
+            Ok((pending, largest, Utc::now().timestamp_millis(), None))
+        }
     }
 }
 
@@ -882,18 +923,27 @@ async fn observe_generic_with_shards(
     let current_version = store.version() as i64;
     if let Some(prev) = previous {
         if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
-            let (pending, shard_max) =
-                pending_or_timeout(name, store.pending_wal_generation_counts()).await?;
+            let (pending, shard_max, observed_at_ms, observation) = observe_pending_with_demand(
+                name,
+                store.all_shard_watermarks(),
+                store.pending_wal_generation_counts(),
+            )
+            .await?;
             note_pending_drift(name, prev.pending_wal_generations, pending);
             let mut row = prev.clone();
             row.uri = uri.to_string();
             row.pending_wal_generations = pending as i64;
-            row.scanned_at = Utc::now().timestamp_millis();
+            row.scanned_at = observed_at_ms;
             return Ok((
                 row,
                 true,
                 shard_max,
-                crate::demand_publish::ObservedScanStore::Generic(store),
+                match observation {
+                    Some(observation) => {
+                        crate::demand_publish::ObservedScanStore::Captured(observation)
+                    }
+                    None => crate::demand_publish::ObservedScanStore::Generic(store),
+                },
             ));
         }
     }
@@ -976,18 +1026,27 @@ async fn observe_one_with_shards(
     let current_version = store.version() as i64;
     if let Some(prev) = previous {
         if prev.version != StatRow::UNKNOWN_VERSION && prev.version == current_version {
-            let (pending, shard_max) =
-                pending_or_timeout(name, store.pending_wal_generation_counts()).await?;
+            let (pending, shard_max, observed_at_ms, observation) = observe_pending_with_demand(
+                name,
+                store.all_shard_watermarks(),
+                store.pending_wal_generation_counts(),
+            )
+            .await?;
             note_pending_drift(name, prev.pending_wal_generations, pending);
             let mut row = prev.clone();
             row.uri = uri.to_string();
             row.pending_wal_generations = pending as i64;
-            row.scanned_at = Utc::now().timestamp_millis();
+            row.scanned_at = observed_at_ms;
             return Ok((
                 row,
                 true,
                 shard_max,
-                crate::demand_publish::ObservedScanStore::Rollout(store),
+                match observation {
+                    Some(observation) => {
+                        crate::demand_publish::ObservedScanStore::Captured(observation)
+                    }
+                    None => crate::demand_publish::ObservedScanStore::Rollout(store),
+                },
             ));
         }
     }
@@ -2028,9 +2087,8 @@ mod incremental_scan_tests {
     /// This is the property the whole incremental path rests on: at tens of
     /// thousands of experiments, almost all cold, a scan that fully observes
     /// every one cannot finish inside its interval. Opening the dataset is
-    /// unavoidable (it is how the version is read), but everything after it --
-    /// listing MemWAL shards, opening each flushed generation, counting rows --
-    /// must be skipped when nothing has changed.
+    /// unavoidable (it is how the version is read). Shard metadata is recounted,
+    /// while opening flushed-generation datasets and counting rows is skipped.
     #[tokio::test]
     async fn unchanged_experiment_is_not_reobserved() {
         let dir = TempDir::new().unwrap();
@@ -2064,6 +2122,130 @@ mod incremental_scan_tests {
             second.scanned_at >= first.scanned_at,
             "a skipped row still refreshes scanned_at so staleness stays visible"
         );
+    }
+
+    #[tokio::test]
+    async fn demand_index_failure_does_not_hide_manifest_pending_count() {
+        let error = || lance::Error::io("optional index unavailable");
+        let (pending, largest, _, captured) =
+            observe_pending_with_demand("t", async { Err(error()) }, async { Ok((7, 4)) })
+                .await
+                .unwrap();
+        assert_eq!((pending, largest), (7, 4));
+        assert!(captured.is_none());
+        assert!(
+            observe_pending_with_demand("t", async { Err(error()) }, async { Err(error()) },)
+                .await
+                .is_err(),
+            "two failed reads must not become zero pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_rollout_reuses_exact_manifest_observation_without_reopening() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shared.lance");
+        let uri = path.to_string_lossy().to_string();
+        let store = RolloutStore::open_with_options(&uri, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        store.add(&[rec("first")]).await.unwrap();
+        store.flush().await.unwrap();
+        let (previous, _) = observe_one("shared", &uri, None, RolloutStoreOptions::default())
+            .await
+            .unwrap();
+        let (row, skipped, largest, captured) = observe_one_with_shards(
+            "shared",
+            &uri,
+            Some(&previous),
+            RolloutStoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(skipped);
+        assert!(matches!(
+            &captured,
+            crate::demand_publish::ObservedScanStore::Captured(_)
+        ));
+        assert_eq!(row.pending_wal_generations, 1);
+        assert_eq!(largest, 1);
+        store.add(&[rec("later")]).await.unwrap();
+        store.flush().await.unwrap();
+        assert_eq!(store.pending_wal_generations().await.unwrap(), 2);
+        // Neither the base nor the shard manifests exist at the old location.
+        // Publication still has the original observation, with its original age.
+        std::fs::rename(&path, dir.path().join("unavailable.lance")).unwrap();
+        let observation = captured.watermarks().await.unwrap();
+        assert_eq!(observation.observed_at_ms, row.scanned_at);
+        assert_eq!(observation.counts(), (1, 1));
+        assert!(observe_one_with_shards(
+            "shared",
+            &uri,
+            Some(&row),
+            RolloutStoreOptions::default()
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn incremental_generic_reuses_cold_zero_and_preserves_observation_time() {
+        use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cold.generic.lance");
+        let uri = path.to_string_lossy().to_string();
+        let schema = SchemaSpec::new(vec![(
+            ID_COLUMN.into(),
+            ColumnSpec::required(ColumnType::String { large: false }),
+        )]);
+        let store = GenericStore::open(
+            &uri,
+            schema,
+            GenericStoreOptions {
+                seal_on_add: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let (previous, _) =
+            observe_generic("generic:cold", &uri, None, GenericStoreOptions::default())
+                .await
+                .unwrap();
+        let (row, skipped, largest, captured) = observe_generic_with_shards(
+            "generic:cold",
+            &uri,
+            Some(&previous),
+            GenericStoreOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(skipped);
+        assert!(matches!(
+            &captured,
+            crate::demand_publish::ObservedScanStore::Captured(_)
+        ));
+        assert_eq!((row.pending_wal_generations, largest), (0, 0));
+        store
+            .add(&[serde_json::json!({"id":"later"})
+                .as_object()
+                .unwrap()
+                .clone()])
+            .await
+            .unwrap();
+        assert_eq!(store.pending_wal_generations().await.unwrap(), 1);
+        std::fs::rename(&path, dir.path().join("unavailable.generic.lance")).unwrap();
+        let observation = captured.watermarks().await.unwrap();
+        assert_eq!(observation.observed_at_ms, row.scanned_at);
+        assert_eq!(observation.counts(), (0, 0));
+        assert!(observe_generic_with_shards(
+            "generic:cold",
+            &uri,
+            Some(&row),
+            GenericStoreOptions::default()
+        )
+        .await
+        .is_err());
     }
 
     /// A generic store's pending MemWAL generations are observed and written

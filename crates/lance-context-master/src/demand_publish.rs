@@ -11,7 +11,7 @@
 //! and are reconciled by later writer/scan events.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lance_context_core::{GenericStore, RolloutStore};
 use lance_context_merge::demand::{DemandEvent, EventSource, ShardMerged, SCHEMA_VERSION};
@@ -32,21 +32,46 @@ async fn scan_slot(slots: Arc<Semaphore>) -> Option<tokio::sync::OwnedSemaphoreP
     slots.acquire_owned().await.ok()
 }
 
-/// Reuse the store opened by the bounded scan observation. Waiting stores stay
-/// inside that stream; only four admitted stores move into detached publishers.
-/// Preserve its storage options and avoid a second base-manifest open. Shard
-/// watermarks are still read after admission, including for cold tables.
+/// Changed base versions retain the opened store for a fresh watermark read.
+/// The incremental path already read every shard for its exact pending count;
+/// keep that compact observation instead of reading the same manifests again.
 pub(crate) enum ObservedScanStore {
     Rollout(RolloutStore),
     Generic(GenericStore),
+    Captured(ScanWatermarks),
+}
+
+pub(crate) struct ScanWatermarks {
+    pub(crate) marks: Vec<lance_context_core::ShardWatermark>,
+    pub(crate) observed_at_ms: i64,
+}
+
+impl ScanWatermarks {
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        // Seal-minus-merged is only an advisory prefix, not an exact count:
+        // gaps and non-prefix drains must not inflate the stats observation.
+        (
+            self.marks.iter().map(|m| m.pending_generations).sum(),
+            self.marks
+                .iter()
+                .map(|m| m.pending_generations)
+                .max()
+                .unwrap_or(0),
+        )
+    }
 }
 
 impl ObservedScanStore {
-    async fn watermarks(self) -> lance::Result<Vec<lance_context_core::ShardWatermark>> {
-        match self {
-            Self::Rollout(store) => store.all_shard_watermarks().await,
-            Self::Generic(store) => store.all_shard_watermarks().await,
-        }
+    pub(crate) async fn watermarks(self) -> lance::Result<ScanWatermarks> {
+        let marks = match self {
+            Self::Rollout(store) => store.all_shard_watermarks().await?,
+            Self::Generic(store) => store.all_shard_watermarks().await?,
+            Self::Captured(observation) => return Ok(observation),
+        };
+        Ok(ScanWatermarks {
+            marks,
+            observed_at_ms: chrono::Utc::now().timestamp_millis(),
+        })
     }
 }
 
@@ -55,6 +80,7 @@ pub(crate) async fn spawn_scan_demand(
     target: String,
     store: ObservedScanStore,
 ) {
+    let waiting = Instant::now();
     let permit = tokio::select! {
         permit = scan_slot(SCAN_PUBLISH_SLOTS.clone()) => permit,
         _ = state.admission.wait_closed() => {
@@ -62,6 +88,8 @@ pub(crate) async fn spawn_scan_demand(
             return;
         }
     };
+    metrics::histogram!("master_scan_demand_stage_seconds", "stage" => "wait")
+        .record(waiting.elapsed().as_secs_f64());
     let Some(permit) = permit else {
         metrics::counter!("master_scan_demand_events_total", "result" => "dropped").increment(1);
         return;
@@ -75,10 +103,15 @@ pub(crate) async fn spawn_scan_demand(
     tokio::spawn(async move {
         let _permit = permit;
         let result = tokio::time::timeout(SCAN_PUBLISH_TIMEOUT, async {
-            let marks = store.watermarks().await.map_err(|e| e.to_string())?;
+            let reading = Instant::now();
+            let observation = store.watermarks().await.map_err(|e| e.to_string())?;
+            metrics::histogram!("master_scan_demand_stage_seconds", "stage" => "watermarks")
+                .record(reading.elapsed().as_secs_f64());
             let coordinator = state.task_store.merge_coordinator();
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let events: Vec<_> = marks
+            // Waiting for a publication slot must not refresh an old observation.
+            let now_ms = observation.observed_at_ms;
+            let events: Vec<_> = observation
+                .marks
                 .into_iter()
                 .map(|mark| DemandEvent {
                     v: SCHEMA_VERSION,
@@ -93,9 +126,13 @@ pub(crate) async fn spawn_scan_demand(
                     sealed_times: Default::default(),
                 })
                 .collect();
-            coordinator
+            let publishing = Instant::now();
+            let result = coordinator
                 .publish_active_demand_events(&target, &events)
-                .await
+                .await;
+            metrics::histogram!("master_scan_demand_stage_seconds", "stage" => "publish")
+                .record(publishing.elapsed().as_secs_f64());
+            result
         })
         .await;
         let label = match result {
@@ -323,6 +360,30 @@ mod tests {
     use lance_context_core::GenericStoreOptions;
     use std::task::Poll;
 
+    #[test]
+    fn captured_counts_use_actual_entries_not_advisory_prefix_distance() {
+        let observation = ScanWatermarks {
+            observed_at_ms: 123,
+            marks: vec![
+                lance_context_core::ShardWatermark {
+                    shard_id: lance_context_core::generate_id().parse().unwrap(),
+                    writer_epoch: 2,
+                    sealed_through: 100,
+                    merged_through: Some(3),
+                    pending_generations: 2,
+                },
+                lance_context_core::ShardWatermark {
+                    shard_id: lance_context_core::generate_id().parse().unwrap(),
+                    writer_epoch: 0,
+                    sealed_through: 200,
+                    merged_through: Some(200),
+                    pending_generations: 0,
+                },
+            ],
+        };
+        assert_eq!(observation.counts(), (2, 2));
+    }
+
     #[tokio::test]
     async fn observed_store_reuses_base_manifest_and_reads_new_shard_watermarks() {
         use lance_context_api::{ColumnSpec, ColumnType, SchemaSpec, ID_COLUMN};
@@ -374,7 +435,8 @@ mod tests {
         let marks = ObservedScanStore::Generic(observed)
             .watermarks()
             .await
-            .unwrap();
+            .unwrap()
+            .marks;
         assert_eq!(
             marks.iter().map(|m| m.pending_generations).sum::<usize>(),
             2
@@ -591,6 +653,87 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated loopback ETCD_TEST_ENDPOINTS and ETCD_TEST_EXCLUSIVE=1"]
+    async fn captured_zero_waiting_for_publish_preserves_newer_writer_demand() {
+        use crate::config::MasterConfig;
+        use clap::Parser;
+        assert_eq!(std::env::var("ETCD_TEST_EXCLUSIVE").unwrap(), "1");
+        let endpoint = std::env::var("ETCD_TEST_ENDPOINTS").unwrap();
+        assert!(endpoint.starts_with("http://127.0.0.1:") && !endpoint.contains(','));
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = MasterConfig::parse_from(["test"]);
+        config.data_dir = dir.path().to_string_lossy().into_owned();
+        config.etcd.etcd_endpoints = vec![endpoint];
+        config.etcd.etcd_prefix =
+            format!("/captured-scan-test/{}", lance_context_core::generate_id());
+        config.merge_wal_interval_secs = 0;
+        config.stats_scan_interval_secs = 0;
+        let state = MasterState::new(config).await.unwrap();
+        let mark = lance_context_core::ShardWatermark {
+            shard_id: lance_context_core::generate_id().parse().unwrap(),
+            writer_epoch: 1,
+            sealed_through: 2,
+            merged_through: Some(2),
+            pending_generations: 0,
+        };
+        let shard = mark.shard_id;
+        let captured = ObservedScanStore::Captured(ScanWatermarks {
+            observed_at_ms: 99,
+            marks: vec![mark],
+        });
+        let busy = SCAN_PUBLISH_SLOTS
+            .clone()
+            .acquire_many_owned(4)
+            .await
+            .unwrap();
+        let mut publish = Box::pin(spawn_scan_demand(state.clone(), "t".into(), captured));
+        assert!(matches!(futures::poll!(publish.as_mut()), Poll::Pending));
+        let newer = DemandEvent {
+            v: SCHEMA_VERSION,
+            shard: shard.to_string(),
+            sealed_through: 3,
+            sealed_bytes_through: 100,
+            merged_through: Some(2),
+            flushed_at_ms: 1234,
+            writer_epoch: 2,
+            source: EventSource::Writer,
+            merged_epoch: None,
+            sealed_times: Default::default(),
+        };
+        state
+            .task_store
+            .merge_coordinator()
+            .publish_demand_event("t", &newer)
+            .await
+            .unwrap();
+        drop(busy);
+        publish.await;
+        let _joined = tokio::time::timeout(
+            Duration::from_secs(5),
+            SCAN_PUBLISH_SLOTS.clone().acquire_many_owned(4),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let key = format!("{}/demand-events/74/{}", state.config.etcd.prefix(), shard);
+        let response = state
+            .task_store
+            .etcd_client()
+            .clone()
+            .get(key, None)
+            .await
+            .unwrap();
+        let event: DemandEvent = serde_json::from_slice(response.kvs()[0].value()).unwrap();
+        assert_eq!(event.sealed_through, 3);
+        assert_eq!(event.merged_through, Some(2));
+        assert_eq!(event.writer_epoch, 2);
+        assert_eq!(
+            event.flushed_at_ms, 1234,
+            "publication must not restamp cached metadata"
+        );
     }
 
     #[tokio::test]
