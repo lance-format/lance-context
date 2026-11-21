@@ -1043,6 +1043,7 @@ pub fn api_router() -> Router<Arc<MasterState>> {
         .route("/merge-retirements", post(crate::legacy_retirement::route))
         .route("/merge-progress", get(merge_progress))
         .route("/executor/drain", post(drain_executor))
+        .route("/scan-observations", get(crate::scan_observations::handler))
         .route("/experiments", get(list_experiments))
         .route("/experiments/{name}", get(get_experiment))
         .route(

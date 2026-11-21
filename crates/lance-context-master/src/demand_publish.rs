@@ -26,6 +26,15 @@ const SCAN_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
 static SCAN_PUBLISH_SLOTS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
+#[cfg(test)]
+pub(crate) async fn hold_scan_slots_for_test() -> tokio::sync::OwnedSemaphorePermit {
+    SCAN_PUBLISH_SLOTS
+        .clone()
+        .acquire_many_owned(4)
+        .await
+        .unwrap()
+}
+
 /// Waiters remain inside the bounded observation stream. FIFO admission gives
 /// cold and positive tables a turn without additional tasks or metadata slots.
 async fn scan_slot(slots: Arc<Semaphore>) -> Option<tokio::sync::OwnedSemaphorePermit> {

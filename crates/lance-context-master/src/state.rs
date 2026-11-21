@@ -89,6 +89,7 @@ pub struct MasterState {
     /// slightly-old list beats an unbounded hang, and the staleness is visible
     /// to the caller rather than silent.
     pub stats_cache: RwLock<Arc<Vec<StatRow>>>,
+    pub(crate) scan_observations: crate::scan_observations::ScanObservations,
 
     /// Read handles used by the records browser, retained to reuse Lance
     /// session and fragment metadata caches across requests.
@@ -260,6 +261,7 @@ impl MasterState {
             datagen_registry,
             stats: Mutex::new(stats),
             stats_cache: RwLock::new(Arc::new(Vec::new())),
+            scan_observations: Default::default(),
             record_stores: Mutex::new(LruCache::new(
                 NonZeroUsize::new(RECORD_STORE_CACHE_CAPACITY).unwrap(),
             )),

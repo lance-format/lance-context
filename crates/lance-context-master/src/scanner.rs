@@ -446,6 +446,10 @@ async fn scan_once_inner(
     );
     let live: HashSet<String> = entries.iter().map(|e| e.name.clone()).collect();
     let (entries, ambiguous) = unique_scan_entries(entries);
+    let evidence =
+        state
+            .scan_observations
+            .begin(&entries, &ambiguous, Utc::now().timestamp_millis());
     let entries = Arc::new(entries);
     // Publish before version/pending shortcuts. Discovery must also revisit
     // cold stores, including intents left by a process that no longer exists.
@@ -488,6 +492,7 @@ async fn scan_once_inner(
             let rollout_options = rollout_options.clone();
             let generic_options = generic_options.clone();
             let state = state.clone();
+            let evidence = &evidence;
             async move {
                 let prev = previous.get(&entry.name);
                 let observed = match entry.kind {
@@ -512,6 +517,8 @@ async fn scan_once_inner(
                 };
                 match observed {
                     Ok((row, skipped, shard_max, store)) => {
+                        // Export before waiting for a demand publication slot.
+                        evidence.observe(&entry, Some(&row));
                         shard_counts
                             .lock()
                             .unwrap()
@@ -532,6 +539,7 @@ async fn scan_once_inner(
                         (entry.name, Some(result))
                     }
                     Err(e) => {
+                        evidence.observe(&entry, None);
                         tracing::warn!(store = %entry.name, error = %e, "scan: observe failed");
                         (entry.name, None)
                     }
@@ -546,6 +554,7 @@ async fn scan_once_inner(
     // Preserve the previous observation for an ambiguous registry identity,
     // just as for a failed store read; unrelated tables continue to scan.
     observed.extend(ambiguous.iter().cloned().map(|name| (name, None)));
+    evidence.finish();
 
     let count = observed.iter().filter(|(_, row)| row.is_some()).count();
     let failed = observed.len() - count;
@@ -763,9 +772,9 @@ pub(crate) enum ScanKind {
 /// name (prefixed for generic stores); `uri` is the physical dataset.
 #[derive(Clone)]
 pub(crate) struct ScanEntry {
-    name: String,
-    uri: String,
-    kind: ScanKind,
+    pub(crate) name: String,
+    pub(crate) uri: String,
+    pub(crate) kind: ScanKind,
 }
 
 /// Deduplicate before opening any datasets: a legacy registry with fourteen

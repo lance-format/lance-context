@@ -24,6 +24,7 @@ mod periodic_sweep;
 mod resident_recovery;
 pub mod rollout_append;
 pub mod routes;
+mod scan_observations;
 pub mod scanner;
 pub mod scheduler;
 #[cfg(test)]
