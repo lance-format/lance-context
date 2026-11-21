@@ -68,6 +68,28 @@ stopped; the existing durable legacy-execution record must be reconciled before
 another execution is admitted. See the [maintenance runbook](maintenance-runbook.md)
 for queue, backlog, failure-ledger and worker-progress diagnostics.
 
+## Optional retained index snapshot
+
+A registered-table `index_id` request can include `"snapshot_tag":"resume-<unique-id>"`.
+Omitting it preserves the existing indexing behavior and creates no tag. Snapshot
+requests require BTree key indexes and no task dependencies. Stop application
+writers, publish all worker WAL, and finish merging it before requesting a snapshot;
+the task checks for pending published WAL but is not a distributed write barrier.
+
+The master builds the primary-key index, optimizes existing BTree indexes, and
+checks their fragment coverage on the resulting dataset handle. Under the same
+table ownership, it creates the tag at that exact version before marking the task
+`done`. The task response includes `snapshot_tag` and `snapshot_version`; callers
+must use that version rather than reopen latest. Indexing and tag creation are
+separate storage operations, and a failed tag write fails the task.
+
+Active requests with the same target and tag deduplicate. Different tags and
+ordinary index tasks remain distinct, with the usual per-table serialization.
+Retrying an existing tag validates and returns its retained version without moving
+it. The caller owns the tag's lifetime and must delete it after all readers stop,
+including cleanup of tags left by crashed clients. This API does not itself change
+any reader's base/WAL semantics.
+
 ## Current boundaries
 
 This adapter uses worker-owned legacy WAL merge. Startup rejects registered-target

@@ -1669,6 +1669,12 @@ pub struct TaskRecord {
     /// it `Failed` if any dependency `Failed`. Empty for standalone tasks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Requested retained snapshot for a registered-table IndexId task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_tag: Option<String>,
+    /// Exact indexed version retained by snapshot_tag, present only on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_version: Option<u64>,
 }
 
 /// Request body for `POST /api/v1/tasks`.
@@ -1679,6 +1685,10 @@ pub struct EnqueueTaskRequest {
     /// Optional task ids this task must wait for (see [`TaskRecord::depends_on`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Retain the indexed version before completing a registered-table IndexId task.
+    /// Requires no dependencies; the caller must quiesce writers and merge WAL first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_tag: Option<String>,
 }
 
 /// Response for `GET /api/v1/tasks`. Paginated newest-first.
@@ -1805,6 +1815,8 @@ mod tests {
             started_at: None,
             finished_at: None,
             depends_on: Vec::new(),
+            snapshot_tag: None,
+            snapshot_version: None,
         };
         let json = serde_json::to_string(&queued).unwrap();
         // snake_case tags for the enums.
@@ -1832,6 +1844,8 @@ mod tests {
             started_at: Some(2),
             finished_at: Some(3),
             depends_on: Vec::new(),
+            snapshot_tag: None,
+            snapshot_version: None,
         };
         let back: TaskRecord =
             serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();

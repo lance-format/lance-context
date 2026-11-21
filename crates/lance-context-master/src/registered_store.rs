@@ -39,6 +39,12 @@ pub(crate) async fn open(state: &MasterState, uri: &str) -> Result<StorageBase> 
 
 /// Maintain BTree indexes on a freshly opened registered store, then refresh its manifest.
 pub(crate) async fn maintain_indexes(store: &mut StorageBase) -> Result<()> {
+    indexed_dataset(store).await?;
+    store.reload().await
+}
+
+/// Return the exact post-index handle; callers can retain it without opening latest.
+pub(crate) async fn indexed_dataset(store: &StorageBase) -> Result<lance::Dataset> {
     let mut dataset = store.dataset().clone();
     let names = dataset
         .load_indices()
@@ -55,7 +61,7 @@ pub(crate) async fn maintain_indexes(store: &mut StorageBase) -> Result<()> {
     dataset
         .optimize_indices(&OptimizeOptions::merge(usize::MAX).index_names(names))
         .await?;
-    store.reload().await
+    Ok(dataset)
 }
 
 /// Observe only metadata; a cold master must not claim any worker's WAL shard.

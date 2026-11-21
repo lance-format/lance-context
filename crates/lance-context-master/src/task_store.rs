@@ -714,6 +714,21 @@ impl TaskStore {
         self.inner.enqueue(kind, target, depends_on).await
     }
 
+    /// Queue a distinct retained snapshot; retries with the same tag deduplicate.
+    pub async fn enqueue_index_snapshot(
+        &self,
+        target: &str,
+        tag: &str,
+    ) -> lance::Result<TaskRecord> {
+        lance::dataset::refs::check_valid_tag(tag)?;
+        let mut task = new_task(TaskKind::IndexId, target, Vec::new());
+        task.snapshot_tag = Some(tag.to_owned());
+        self.inner
+            .enqueue_task_guarded(task, None, None, AdmissionContext::new(Origin::Explicit))
+            .await?
+            .ok_or_else(|| lance::Error::io("snapshot enqueue unexpectedly superseded"))
+    }
+
     pub(crate) async fn enqueue_with_context(
         &self,
         kind: TaskKind,
@@ -2047,12 +2062,29 @@ impl EtcdTaskStore {
         fence: Option<&PublicationFence>,
         context: AdmissionContext,
     ) -> lance::Result<Option<TaskRecord>> {
-        let task = new_task(kind, target, depends_on);
+        self.enqueue_task_guarded(
+            new_task(kind, target, depends_on),
+            execution,
+            fence,
+            context,
+        )
+        .await
+    }
+
+    async fn enqueue_task_guarded(
+        &self,
+        task: TaskRecord,
+        execution: Option<(String, i64)>,
+        fence: Option<&PublicationFence>,
+        context: AdmissionContext,
+    ) -> lance::Result<Option<TaskRecord>> {
+        let kind = task.kind;
+        let target = task.target.as_str();
         let task_key = self.task_key(&task.id);
         let queue_key = self.queue_key(&task.id);
         let value = encode_task(&task)?;
         let mut client = self.client.clone();
-        if let Some(dedupe_key) = self.dedupe_key(kind, target, &task.depends_on) {
+        if let Some(dedupe_key) = self.task_dedupe_key(&task) {
             for _ in 0..4 {
                 // Recovery scanners mostly rediscover an already-active task.
                 // Resolve those with reads instead of first proposing a write
@@ -3037,7 +3069,7 @@ impl EtcdTaskStore {
                 operations.push(TxnOp::delete(key.as_str(), None));
             }
         }
-        if let Some(key) = self.dedupe_key(task.kind, &task.target, &task.depends_on) {
+        if let Some(key) = self.task_dedupe_key(&task) {
             operations.push(TxnOp::delete(key, None));
         }
         let mut compares = vec![Compare::value(
@@ -3872,6 +3904,18 @@ impl EtcdTaskStore {
         Ok(out)
     }
 
+    fn task_dedupe_key(&self, task: &TaskRecord) -> Option<String> {
+        match &task.snapshot_tag {
+            Some(tag) => Some(format!(
+                "{}/dedupe/index_snapshot/{}/{}",
+                self.prefix,
+                encode_segment(&task.target),
+                encode_segment(tag)
+            )),
+            None => self.dedupe_key(task.kind, &task.target, &task.depends_on),
+        }
+    }
+
     fn dedupe_key(&self, kind: TaskKind, target: &str, depends_on: &[String]) -> Option<String> {
         should_dedupe(kind, depends_on).then(|| {
             format!(
@@ -3896,6 +3940,8 @@ fn new_task(kind: TaskKind, target: &str, depends_on: Vec<String>) -> TaskRecord
         started_at: None,
         finished_at: None,
         depends_on,
+        snapshot_tag: None,
+        snapshot_version: None,
     }
 }
 
@@ -3911,6 +3957,7 @@ fn apply_outcome(task: &mut TaskRecord, outcome: Result<String, String>) {
             task.state = TaskState::Failed;
             task.error = Some(error);
             task.detail = None;
+            task.snapshot_version = None;
         }
     }
 }
@@ -3921,6 +3968,7 @@ fn requeue(task: &mut TaskRecord) {
     task.finished_at = None;
     task.error = None;
     task.detail = None;
+    task.snapshot_version = None;
 }
 
 struct ClaimCandidateRead {
@@ -8495,6 +8543,8 @@ pub(crate) mod tests {
             started_at: Some(finished_at),
             finished_at: Some(finished_at),
             depends_on: Vec::new(),
+            snapshot_tag: None,
+            snapshot_version: None,
         }
     }
 

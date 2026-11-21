@@ -156,6 +156,7 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
 
     let started = std::time::Instant::now();
     let mut refresh_compaction_stats = false;
+    let mut snapshot_version = None;
     let outcome = if claim.preparing_maintenance() && task.kind == TaskKind::IndexId {
         run_prepared_index(state, &mut claim).await
     } else if claim.preparing_maintenance() {
@@ -180,7 +181,18 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
                     crate::maintenance_execution::run(state, &claim, async {
                         match task.kind {
                             TaskKind::Compact => run_compaction(state, &task).await,
-                            TaskKind::IndexId => run_index_id(state, &task.target).await,
+                            TaskKind::IndexId => {
+                                if let Some(tag) = &task.snapshot_tag {
+                                    let version =
+                                        crate::index_snapshot::prepare(state, &task.target, tag)
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                    snapshot_version = Some(version);
+                                    Ok(format!("retained indexed version {version} as {tag}"))
+                                } else {
+                                    run_index_id(state, &task.target).await
+                                }
+                            }
                             TaskKind::Repair => run_repair(state, &claim).await,
                             TaskKind::MergeWal => unreachable!(),
                         }
@@ -213,6 +225,9 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
             // and re-run this task behind it.
             schedule_repair(state, &task).await;
         }
+    }
+    if outcome.is_ok() {
+        claim.task.snapshot_version = snapshot_version;
     }
     let commit_start = std::time::Instant::now();
     let finished = finish_task(state, claim, outcome).await;
@@ -5909,6 +5924,127 @@ mod tests {
         assert_eq!(queued, 1, "only the rollout row is compacted");
         let tasks = state.task_store.list().await.unwrap();
         assert!(tasks.iter().all(|t| t.target == "r"), "{tasks:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn registered_index_snapshot_is_optional_and_persists_its_exact_version() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+        use axum::{extract::State, Json};
+        use lance::Dataset;
+        use lance_context_api::EnqueueTaskRequest;
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.managed_store_kind = Some("events".into());
+        cfg.key_index_type = lance_context_core::KeyIndexType::Btree;
+        let state = MasterState::new(cfg).await.unwrap();
+        let uri = format!("{}/snapshot.lance", dir.path().display());
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)
+            .with_metadata(
+                [("lance-schema:unenforced-primary-key".into(), "true".into())].into(),
+            )]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+                .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            &uri,
+            None,
+        )
+        .await
+        .unwrap();
+        state
+            .managed_registry
+            .as_ref()
+            .unwrap()
+            .upsert("table", &uri)
+            .await
+            .unwrap();
+        let enqueue_request = |body| {
+            crate::routes::enqueue_task(
+                State(state.clone()),
+                Json(serde_json::from_value::<EnqueueTaskRequest>(body).unwrap()),
+            )
+        };
+        // An unchanged request still indexes normally, with no retention tag/result.
+        let (_, Json(normal)) = enqueue_request(serde_json::json!({
+            "kind":"index_id", "target":"events:table"
+        }))
+        .await
+        .unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, normal.id);
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let normal = state.task_store.get(&normal.id).await.unwrap().unwrap();
+        assert_eq!(normal.state, TaskState::Done, "{normal:?}");
+        assert!(normal.snapshot_tag.is_none());
+        assert!(normal.snapshot_version.is_none());
+        assert!(Dataset::open(&uri)
+            .await
+            .unwrap()
+            .tags()
+            .list()
+            .await
+            .unwrap()
+            .is_empty());
+
+        let body = serde_json::json!({
+            "kind":"index_id", "target":"events:table", "snapshot_tag":"resume-one"
+        });
+        let (_, Json(first)) = enqueue_request(body.clone()).await.unwrap();
+        let (_, Json(duplicate)) = enqueue_request(body).await.unwrap();
+        assert_eq!(first.id, duplicate.id);
+        let (_, Json(second)) = enqueue_request(serde_json::json!({
+            "kind":"index_id", "target":"events:table", "snapshot_tag":"resume-two"
+        }))
+        .await
+        .unwrap();
+        assert_ne!(first.id, second.id);
+        let (_, Json(ordinary)) = enqueue_request(serde_json::json!({
+            "kind":"index_id", "target":"events:table"
+        }))
+        .await
+        .unwrap();
+        assert_ne!(first.id, ordinary.id);
+        assert_ne!(second.id, ordinary.id);
+        for _ in 0..3 {
+            let claim = state.task_store.claim_next().await.unwrap().unwrap();
+            // Snapshot tasks use the same table ownership as ordinary maintenance.
+            assert!(state.task_store.claim_next().await.unwrap().is_none());
+            run_task(&state, claim, TaskClaimTiming::default()).await;
+        }
+        for task in [first, second] {
+            let done = state.task_store.get(&task.id).await.unwrap().unwrap();
+            assert_eq!(done.state, TaskState::Done, "{done:?}");
+            let dataset = Dataset::open(&uri).await.unwrap();
+            let retained = dataset
+                .tags()
+                .get_version(done.snapshot_tag.as_ref().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(done.snapshot_version, Some(retained));
+            assert_eq!(
+                dataset
+                    .checkout_version(retained)
+                    .await
+                    .unwrap()
+                    .count_rows(None)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
+        for body in [
+            serde_json::json!({"kind":"compact", "target":"events:table", "snapshot_tag":"bad"}),
+            serde_json::json!({"kind":"index_id", "target":"events:table", "snapshot_tag":"bad", "depends_on":[normal.id]}),
+        ] {
+            assert!(matches!(
+                enqueue_request(body).await,
+                Err(crate::error::MasterError::InvalidRequest(_))
+            ));
+        }
     }
 
     /// Discover a non-rollout table by its registry URI, build its declared key
