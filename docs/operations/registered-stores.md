@@ -48,11 +48,15 @@ Those statistics feed the existing WAL-merge and compaction scheduling policies.
 Registered tables are excluded from rollout-specific cold retirement and native
 merge-demand publication.
 
-`compact` uses the normal compaction budgets and the registry URI. It optimizes
-existing BTree indexes before and after the rewrite, refreshes statistics and
-records unchanged compactions for the scheduler's no-op suppression. It does not
-create new application-specific secondary indexes. `index_id` explicitly builds
-or replaces the configured primary-key index.
+`compact` opens the registry URI as a `StorageBase` using the table's persisted
+schema and declared primary key. Rollout tables use this same path; compaction
+does not need a rollout-specific store interface or evolve business columns.
+Legacy rollout tasks still accept the conventional URI until discovery registers
+the table. After rewriting fragments, the shared scheduler queues a dependent
+`index_id` task when `INDEX_AFTER_COMPACTION` is enabled. Statistics refresh and
+unchanged-compaction suppression are shared. `index_id` builds or replaces the
+configured primary-key index and maintains existing application BTree indexes;
+it does not invent secondary index definitions.
 
 `merge_wal` fans out to each configured worker using:
 
@@ -67,6 +71,28 @@ Each request has a 600-second deadline. A timeout does not prove that the worker
 stopped; the existing durable legacy-execution record must be reconciled before
 another execution is admitted. See the [maintenance runbook](maintenance-runbook.md)
 for queue, backlog, failure-ledger and worker-progress diagnostics.
+
+## Optional retained index snapshot
+
+A registered-table `index_id` request can include `"snapshot_tag":"resume-<unique-id>"`.
+Omitting it preserves the existing indexing behavior and creates no tag. Snapshot
+requests require BTree key indexes and no task dependencies. Stop application
+writers, publish all worker WAL, and finish merging it before requesting a snapshot;
+the task checks for pending published WAL but is not a distributed write barrier.
+
+The master builds the primary-key index, optimizes existing BTree indexes, and
+checks their fragment coverage on the resulting dataset handle. Under the same
+table ownership, it creates the tag at that exact version before marking the task
+`done`. The task response includes `snapshot_tag` and `snapshot_version`; callers
+must use that version rather than reopen latest. Indexing and tag creation are
+separate storage operations, and a failed tag write fails the task.
+
+Active requests with the same target and tag deduplicate. Different tags and
+ordinary index tasks remain distinct, with the usual per-table serialization.
+Retrying an existing tag validates and returns its retained version without moving
+it. The caller owns the tag's lifetime and must delete it after all readers stop,
+including cleanup of tags left by crashed clients. This API does not itself change
+any reader's base/WAL semantics.
 
 ## Current boundaries
 

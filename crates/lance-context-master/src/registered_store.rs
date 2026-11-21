@@ -39,6 +39,12 @@ pub(crate) async fn open(state: &MasterState, uri: &str) -> Result<StorageBase> 
 
 /// Maintain BTree indexes on a freshly opened registered store, then refresh its manifest.
 pub(crate) async fn maintain_indexes(store: &mut StorageBase) -> Result<()> {
+    indexed_dataset(store).await?;
+    store.reload().await
+}
+
+/// Return the exact post-index handle; callers can retain it without opening latest.
+pub(crate) async fn indexed_dataset(store: &StorageBase) -> Result<lance::Dataset> {
     let mut dataset = store.dataset().clone();
     let names = dataset
         .load_indices()
@@ -55,7 +61,7 @@ pub(crate) async fn maintain_indexes(store: &mut StorageBase) -> Result<()> {
     dataset
         .optimize_indices(&OptimizeOptions::merge(usize::MAX).index_names(names))
         .await?;
-    store.reload().await
+    Ok(dataset)
 }
 
 /// Observe only metadata; a cold master must not claim any worker's WAL shard.
@@ -96,73 +102,6 @@ pub(crate) async fn observe(
     })
     .await
     .map_err(|_| lance::Error::io(format!("observe timed out for store '{name}'")))?
-}
-
-/// Compact a registered table without acquiring any worker WAL identity.
-pub(crate) async fn compact(
-    state: &MasterState,
-    target: &str,
-) -> std::result::Result<lance::dataset::optimize::CompactionMetrics, String> {
-    let uri = state
-        .target_uri(target)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("unknown maintenance target '{target}'"))?;
-    let mut store = open(state, &uri).await.map_err(|e| e.to_string())?;
-    let config = state.compaction_config();
-    let options = crate::scheduler::compact_options_key(&config);
-    let before = store.version();
-    maintain_indexes(&mut store)
-        .await
-        .map_err(|e| e.to_string())?;
-    let metrics = store
-        .compact(Some(config))
-        .await
-        .map_err(|e| e.to_string())?;
-    maintain_indexes(&mut store)
-        .await
-        .map_err(|e| e.to_string())?;
-    if metrics.fragments_removed == 0
-        && metrics.fragments_added == 0
-        && before == store.version()
-        && !matches!(
-            tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                state
-                    .task_store
-                    .record_compact_noop(target, &uri, before, &options)
-            )
-            .await,
-            Ok(Ok(()))
-        )
-    {
-        tracing::warn!(target, "could not persist registered-store no-op");
-    }
-    if let Ok(Ok(Some(guard))) = tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        state.task_store.try_coordination_lock("stats-writer"),
-    )
-    .await
-    {
-        let result = async {
-            let (mut row, _, _) = observe(state, target, &uri, None).await?;
-            let mut stats = state.stats.lock().await;
-            row.total_compactions = stats
-                .get(target)
-                .await?
-                .map_or(1, |old| old.total_compactions + 1);
-            row.last_compaction = Utc::now().timestamp_millis();
-            stats.upsert(&row).await
-        }
-        .await;
-        if let Err(error) = result {
-            tracing::warn!(target, %error, "registered-store statistics refresh failed");
-        }
-        if let Err(error) = state.task_store.release_coordination_lock(guard).await {
-            tracing::warn!(target, %error, "registered-store statistics unlock failed");
-        }
-    }
-    Ok(metrics)
 }
 
 #[cfg(test)]
