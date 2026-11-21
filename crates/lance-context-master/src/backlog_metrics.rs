@@ -196,6 +196,24 @@ impl BacklogMetrics {
         );
         gauge(
             &mut out,
+            "snapshot_scan_started_ms",
+            snapshot.scan_started_ms,
+            "Cached shared scan start as Unix milliseconds; not a freshness assertion.",
+        );
+        gauge(
+            &mut out,
+            "snapshot_committed_ms",
+            snapshot.committed_ms,
+            "Cached shared summary commit as Unix milliseconds; not the scrape time.",
+        );
+        gauge(
+            &mut out,
+            "snapshot_oldest_observation_ms",
+            snapshot.oldest_observation_ms,
+            "Oldest cached shared scan observation as Unix milliseconds; not a freshness assertion.",
+        );
+        gauge(
+            &mut out,
             "snapshot_failed_stores",
             snapshot.failed_observations as f64,
             "Registry entries not successfully observed; these are unknown, not zero backlog.",
@@ -256,7 +274,7 @@ impl BacklogMetrics {
     }
 }
 
-fn gauge(out: &mut String, suffix: &str, value: f64, help: &str) {
+fn gauge(out: &mut String, suffix: &str, value: impl std::fmt::Display, help: &str) {
     let name = format!("master_wal_backlog_{suffix}");
     let _ = writeln!(
         out,
@@ -282,6 +300,71 @@ mod tests {
             largest_shard: generations / 2,
             stores_with_shard_over_4096: 0,
         }
+    }
+
+    #[test]
+    fn cached_timestamps_preserve_milliseconds_without_refreshing_freshness() {
+        let now = Instant::now();
+        let metrics = BacklogMetrics::new(Duration::from_secs(300));
+        let mut sample = snapshot(7);
+        sample.scan_started_ms = 1_795_231_430_438;
+        sample.oldest_observation_ms = 1_795_231_431_225;
+        sample.committed_ms = 1_795_231_472_794;
+        let wall = sample.committed_ms + 1_000;
+        metrics.update(Ok(Some((sample.clone(), 10))), now);
+        for (elapsed, wall_ms, available) in [
+            (0, wall, 1),
+            (66, wall + 66_000, 0), // Cached read confirmation expired.
+            (0, wall + 300_000, 0), // Scan observations expired.
+            (0, sample.scan_started_ms - 1, 0), // Future-dated snapshot.
+        ] {
+            let rendered = metrics.render_at(now + Duration::from_secs(elapsed), wall_ms);
+            for (name, value) in [
+                ("scan_started_ms", sample.scan_started_ms),
+                ("committed_ms", sample.committed_ms),
+                ("oldest_observation_ms", sample.oldest_observation_ms),
+            ] {
+                assert!(rendered.contains(&format!("master_wal_backlog_snapshot_{name} {value}\n")));
+            }
+            assert!(rendered.contains(&format!(
+                "master_wal_backlog_snapshot_available {available}\n"
+            )));
+            assert_eq!(
+                rendered.contains("master_wal_backlog_generations "),
+                available == 1
+            );
+        }
+        metrics.update(Err(()), now);
+        let rendered = metrics.render_at(now, wall);
+        assert!(rendered.contains("master_wal_backlog_snapshot_readable 0\n"));
+        assert!(rendered.contains("master_wal_backlog_snapshot_committed_ms 1795231472794\n"));
+        assert!(!rendered.contains("master_wal_backlog_generations "));
+    }
+
+    #[test]
+    fn timestamp_text_is_exact_and_missing_snapshots_do_not_invent_timestamps() {
+        let now = Instant::now();
+        let metrics = BacklogMetrics::new(Duration::from_secs(300));
+        assert!(!metrics
+            .render_at(now, 120_000)
+            .contains("master_wal_backlog_snapshot_scan_started_ms"));
+        let mut sample = snapshot(7);
+        // Avoid integer-to-float rounding in exposition, even outside the range
+        // of present-day timestamps. Prometheus stores its own float samples.
+        sample.scan_started_ms = (1_i64 << 53) + 1;
+        sample.oldest_observation_ms = sample.scan_started_ms + 2;
+        sample.committed_ms = sample.scan_started_ms + 4;
+        sample.failed_observations = 1;
+        let wall = sample.committed_ms + 1;
+        metrics.update(Ok(Some((sample, 10))), now);
+        let rendered = metrics.render_at(now, wall);
+        assert!(rendered.contains("master_wal_backlog_snapshot_scan_started_ms 9007199254740993\n"));
+        assert!(rendered.contains("master_wal_backlog_snapshot_complete 0\n"));
+        assert!(!rendered.contains("master_wal_backlog_generations "));
+        metrics.update(Ok(None), now);
+        assert!(!metrics
+            .render_at(now, wall)
+            .contains("master_wal_backlog_snapshot_scan_started_ms"));
     }
 
     #[test]
