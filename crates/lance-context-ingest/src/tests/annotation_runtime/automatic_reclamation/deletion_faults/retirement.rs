@@ -5,25 +5,39 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_retirement_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true, false)).await?
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true, false, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncommitted_retirement_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(false, false)).await?
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        uncertain_fence(false, false, false),
+    )
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_retirement_rpc_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true, true)).await?
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true, true, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncommitted_retirement_rpc_unknown_bounds_gc_and_preserves_live_updates() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(false, true)).await?
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(false, true, false)).await?
 }
 
-async fn uncertain_fence(execute: bool, rpc_unknown: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_retirement_transport_disconnect_preserves_owner_and_gc_bounds() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(true, false, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncommitted_retirement_transport_disconnect_preserves_owner_and_gc_bounds() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), uncertain_fence(false, false, true)).await?
+}
+
+async fn uncertain_fence(execute: bool, rpc_unknown: bool, disconnect: bool) -> Result<()> {
     let root = root()?;
     let path = root.path().join("turns.lance");
     let mut c =
@@ -32,6 +46,9 @@ async fn uncertain_fence(execute: bool, rpc_unknown: bool) -> Result<()> {
     let storage = fault_store::storage(&path, faults.clone()).await?;
     let (first, completed, abandoned) = acknowledged_orphan_count(&c, &storage, &path, 1).await?;
     let proxy = Proxy::open_retire(&c, root.path(), execute, rpc_unknown).await?;
+    proxy
+        .disconnect_controls
+        .store(disconnect, Ordering::SeqCst);
     c.client = proxy.client.clone();
     let (service, runtime) = owned(&c, &storage, &limits()).await?;
     let (_, _, recovery_cut) = runtime.http_binding();

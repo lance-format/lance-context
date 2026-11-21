@@ -64,6 +64,8 @@ pub(in crate::tests) struct Proxy {
     pub closes: Arc<AtomicUsize>,
     pub unknown_closes: Arc<AtomicBool>,
     pub unknown_retirements: Arc<AtomicBool>,
+    /// Drop the TLS connection instead of replying Unknown to Pin/Retire faults.
+    pub disconnect_controls: Arc<AtomicBool>,
     pub close_permits:
         Arc<std::sync::Mutex<Vec<lance_context_wal::replication::source::ClosurePermit>>>,
     pub committed: Arc<Notify>,
@@ -507,6 +509,7 @@ impl Proxy {
         let closes = Arc::new(AtomicUsize::new(0));
         let unknown_closes = Arc::new(AtomicBool::new(false));
         let unknown_retirements = Arc::new(AtomicBool::new(false));
+        let disconnect_controls = Arc::new(AtomicBool::new(false));
         let close_permits = Arc::new(std::sync::Mutex::new(Vec::new()));
         let committed = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
@@ -572,6 +575,7 @@ impl Proxy {
             let closes = closes.clone();
             let unknown_closes = unknown_closes.clone();
             let unknown_retirements = unknown_retirements.clone();
+            let disconnect_controls = disconnect_controls.clone();
             let close_permits = close_permits.clone();
             let committed = committed.clone();
             let release = release.clone();
@@ -614,6 +618,7 @@ impl Proxy {
                             let closes = closes.clone();
                             let unknown_closes = unknown_closes.clone();
             let unknown_retirements = unknown_retirements.clone();
+            let disconnect_controls = disconnect_controls.clone();
                             let close_permits = close_permits.clone();
                             connections.spawn(async move {
                                 let mut downstream = acceptor.accept(socket).await?;
@@ -666,6 +671,9 @@ impl Proxy {
                                             } else {
                                                 request.unknown_reply()?
                                             };
+                                            if disconnect_controls.load(Ordering::SeqCst) {
+                                                return Ok(());
+                                            }
                                             reply.write(&mut downstream).await?;
                                             continue;
                                         }
@@ -727,6 +735,9 @@ impl Proxy {
                                     }
                                     if hold && matches!(point, Point::Retire { .. }) && unknown_retirements.load(Ordering::SeqCst) {
                                         dropped.fetch_add(1, Ordering::SeqCst);
+                                        if disconnect_controls.load(Ordering::SeqCst) {
+                                            return Ok(());
+                                        }
                                         let reply = if matches!(point, Point::Retire { rpc_unknown: true, .. }) {
                                             request.reply(Reply::Unknown)?
                                         } else {
@@ -738,6 +749,9 @@ impl Proxy {
                                     if hold && matches!(point, Point::Append { execute: false } | Point::Close { execute: false } | Point::Reserve { execute: false } | Point::Retire { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
                                         committed.notify_one(); release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Retire { .. }) && disconnect_controls.load(Ordering::SeqCst) {
+                                            return Ok(());
+                                        }
                                         let reply = if matches!(point, Point::Retire { rpc_unknown: true, .. }) {
                                             request.reply(Reply::Unknown)?
                                         } else {
@@ -798,6 +812,9 @@ impl Proxy {
                                         committed.notify_one();
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
+                                        if matches!(point, Point::Pin { .. } | Point::Retire { .. }) && disconnect_controls.load(Ordering::SeqCst) {
+                                            return Ok(());
+                                        }
                                         if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Retire { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
                                             let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. } | Point::Retire { rpc_unknown: true, .. } | Point::Confirm { rpc_unknown: true, .. }) || (matches!(point, Point::Plan { .. }) && rpc_unknown_plans.load(Ordering::SeqCst)) {
                                                 request.reply(Reply::Unknown)?
@@ -884,6 +901,7 @@ impl Proxy {
             closes,
             unknown_closes,
             unknown_retirements,
+            disconnect_controls,
             close_permits,
             committed,
             release,

@@ -10,16 +10,16 @@ impl Publisher {
                 .client
                 .request_routed(Request::Commit(Box::new(Command::Pin(permit.clone()))))
                 .await;
-            let (error, uncertain) = match response.map(|r| r.reply) {
+            let error = match response.map(|r| r.reply) {
                 Ok(Reply::Commit(Outcome::Committed(Applied::Source(source::Reply::Pinned {
                     ..
                 })))) => return Ok(()),
-                Ok(Reply::Unknown) | Ok(Reply::Commit(Outcome::Unknown)) => (
-                    anyhow::anyhow!("source pin outcome unknown; reconcile the original operation"),
-                    true,
-                ),
+                Ok(Reply::Unknown) | Ok(Reply::Commit(Outcome::Unknown)) => {
+                    anyhow::anyhow!("source pin outcome unknown; reconcile the original operation")
+                }
                 Ok(reply) => bail!("source pin rejected: {reply:?}"),
-                Err(error) => (error, false),
+                Err(error) if transport::uncertain(&error) => error,
+                Err(error) => return Err(error),
             };
             let observed: Result<bool> = async {
                 // A source pin is not publisher authority. A fenced owner may
@@ -43,7 +43,6 @@ impl Publisher {
                     );
                     return Ok(true);
                 }
-                ensure!(uncertain, "original source pin remains unconfirmed");
                 let query::Value::Pin(Some(current)) = query(
                     &self.ingress,
                     self.authority.group,
@@ -71,8 +70,8 @@ impl Publisher {
             match observed {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
-                    // Either Unknown reply plus fresh authority and the identical
-                    // selected permit authorize this idempotent control request.
+                    // An uncertain reply or transport plus fresh authority and
+                    // the identical permit authorize this idempotent control request.
                     // Keep the caller's frozen generation while bounded apply
                     // and point reads remain live. No business write or file
                     // preparation is repeated; cancellation retains the plan.

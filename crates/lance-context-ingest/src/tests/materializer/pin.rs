@@ -15,15 +15,17 @@ enum Case {
 }
 
 async fn exercise(case: Case) -> Result<()> {
-    for rpc_unknown in [false, true] {
-        exercise_reply(case, rpc_unknown)
+    for (rpc_unknown, disconnect) in [(false, false), (true, false), (false, true)] {
+        exercise_reply(case, rpc_unknown, disconnect)
             .await
-            .with_context(|| format!("source pin RPC Unknown: {rpc_unknown}"))?;
+            .with_context(|| {
+                format!("source pin RPC Unknown: {rpc_unknown}, disconnect: {disconnect}")
+            })?;
     }
     Ok(())
 }
 
-async fn exercise_reply(case: Case, rpc_unknown: bool) -> Result<()> {
+async fn exercise_reply(case: Case, rpc_unknown: bool, disconnect: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("pins.lance");
     let mut cluster = network::Cluster::open_signed(root.path(), layout()).await?;
@@ -38,6 +40,9 @@ async fn exercise_reply(case: Case, rpc_unknown: bool) -> Result<()> {
     } else {
         Proxy::open_pin(&cluster, root.path(), execute, observe).await?
     };
+    proxy
+        .disconnect_controls
+        .store(disconnect, Ordering::SeqCst);
     let direct = std::mem::replace(&mut cluster.client, proxy.client.clone());
     let ingress = connect(&cluster, binding()).await?;
     let storage = Storage::resolve(
