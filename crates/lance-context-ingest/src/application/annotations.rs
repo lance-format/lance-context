@@ -7,6 +7,21 @@ use crate::{
 use axum::serve::ListenerExt;
 use tokio::{sync::oneshot, task::JoinSet};
 
+#[cfg(test)]
+mod cache_tests;
+
+fn owner_session(options: &config::Annotations) -> Arc<lance::session::Session> {
+    // Both destinations share this session. Cache weights remain separate from
+    // live staging and upload/apply/publication workspace reservations.
+    Arc::new(lance::session::Session::new(
+        options
+            .index_cache_bytes
+            .unwrap_or(lance::dataset::DEFAULT_INDEX_CACHE_SIZE),
+        128 << 20,
+        Arc::default(),
+    ))
+}
+
 fn configure_http_stream(stream: &mut tokio::net::TcpStream) {
     // Send small acknowledgments and point responses without waiting for more
     // application data. Client sockets already disable Nagle's algorithm.
@@ -256,11 +271,7 @@ pub async fn serve_owner(
         let storage = Storage::resolve(
             table.uri.clone(),
             table.storage_options.clone(),
-            Arc::new(lance::session::Session::new(
-                lance::dataset::DEFAULT_INDEX_CACHE_SIZE,
-                128 << 20,
-                Arc::default(),
-            )),
+            owner_session(a),
         ).await?;
         #[cfg(feature = "lance-io-metrics")]
         let read_providers = annotations::read_io::Providers::capture(&storage, a.body.as_ref().map(|body| body.uri.as_str()))?;
