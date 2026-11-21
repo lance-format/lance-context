@@ -201,6 +201,35 @@ impl ShardFailure {
                 )
     }
 
+    /// Eligibility only: the caller must still prove successful fenced native
+    /// work and a fresh, complete drain of current and historical WAL shards.
+    /// A retirement identity error can outlive the generations that caused it
+    /// when a native executor drains them under `master:catchup` instead of the
+    /// original worker endpoint. Do not generalize this to other data errors.
+    pub fn is_worker_failure_reconcilable_after_native_drain(&self) -> bool {
+        if self.is_worker_capability_transport_failure() {
+            return true;
+        }
+        if self.class != FailureClass::DataOrConfiguration
+            || !(self.endpoint.starts_with("http://") || self.endpoint.starts_with("https://"))
+        {
+            return false;
+        }
+        let Some(location) = self.last_error.strip_prefix(
+            "Internal(\"LanceError(IO): Invalid WAL retirement generation identity, crates/lance-context-core/src/wal_retirement.rs:",
+        ).and_then(|s| s.strip_suffix("\")")) else {
+            return false;
+        };
+        let Some((line, column)) = location.split_once(':') else {
+            return false;
+        };
+        [line, column].iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|c| c.is_ascii_digit())
+                && part.parse::<u32>().is_ok_and(|number| number > 0)
+        })
+    }
+
     fn retry_policy(class: &FailureClass, attempts: u32) -> (bool, u64) {
         let needs_attention = attempts >= 15
             || matches!(
@@ -311,7 +340,9 @@ impl Coordinator {
             || execution.phase != Phase::Running
             || observed.failure.target != execution.target
             || observed.revision <= 0
-            || !observed.failure.is_worker_capability_transport_failure()
+            || !observed
+                .failure
+                .is_worker_failure_reconcilable_after_native_drain()
         {
             return Err("invalid native failure recovery evidence".into());
         }
@@ -560,6 +591,47 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_drain_reconciliation_does_not_soften_arbitrary_data_errors() {
+        let endpoint = "http://worker:3000";
+        let error = "Internal(\"LanceError(IO): Invalid WAL retirement generation identity, crates/lance-context-core/src/wal_retirement.rs:71:28\")";
+        let eligible = ShardFailure::advance("table", endpoint, None, error, 1);
+        assert_eq!(eligible.class, FailureClass::DataOrConfiguration);
+        assert!(eligible.needs_attention);
+        assert!(eligible.is_worker_failure_reconcilable_after_native_drain());
+        // Classification/retry policy is unchanged until recovery is proven.
+        assert_eq!(eligible.next_retry_ms, 3_600_001);
+        for error in [
+            error.replace(
+                "Invalid WAL retirement generation identity",
+                "Conflicting WAL retirement generation identity",
+            ),
+            error.replace("generation identity", "intent header"),
+            error.replace("wal_retirement.rs", "other.rs"),
+            error.replace(":71:28", ":0:28"),
+            error.replace(":71:28", ":71:28:9"),
+            error.replace(":71:28", ":+71:28"),
+            format!("HTTP 403: {error}"),
+            format!("ownership unresolved: {error}"),
+            format!("{error}; manifest result unknown"),
+            "schema mismatch".into(),
+        ] {
+            assert!(
+                !ShardFailure::advance("table", endpoint, None, &error, 1)
+                    .is_worker_failure_reconcilable_after_native_drain(),
+                "{error}"
+            );
+        }
+        for endpoint in ["master:catchup", "master:compact", "worker"] {
+            assert!(!ShardFailure::advance("table", endpoint, None, error, 1)
+                .is_worker_failure_reconcilable_after_native_drain());
+        }
+        let mut unresolved = eligible;
+        unresolved.class = FailureClass::OwnershipUnresolved;
+        assert!(!unresolved.is_worker_failure_reconcilable_after_native_drain());
+    }
+
     #[test]
     fn native_takeover_only_recognizes_exact_capability_read_transport_errors() {
         let endpoint = "http://worker:3000";

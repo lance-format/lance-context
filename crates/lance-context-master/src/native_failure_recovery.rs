@@ -1,4 +1,4 @@
-//! Reconcile an old worker capability-read failure after a native takeover.
+//! Reconcile narrowly eligible worker failures after a native takeover.
 //!
 //! The recovery leader keeps retrying every retained failure revision. Native
 //! catch-up finishes `master:catchup`, so it otherwise cannot resolve debt under
@@ -24,7 +24,9 @@ pub(crate) async fn snapshot(
             .into_iter()
             .filter(|row| {
                 endpoints.contains(&row.failure.endpoint)
-                    && row.failure.is_worker_capability_transport_failure()
+                    && row
+                        .failure
+                        .is_worker_failure_reconcilable_after_native_drain()
             })
             .collect(),
         _ => {
@@ -75,7 +77,7 @@ pub(crate) async fn reconcile(
             Ok(true) => {
                 tracing::info!(target = %running.target, endpoint = %row.failure.endpoint,
                     failure_revision = row.revision, execution = %running.id,
-                    "native recovery retired prior worker capability failure");
+                    "native recovery retired prior worker failure");
                 "retired"
             }
             Ok(false) => "changed",
