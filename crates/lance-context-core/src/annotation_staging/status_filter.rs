@@ -225,9 +225,10 @@ impl StatusRead {
             |status| col("status").eq(lit(status.clone())),
         ));
         scan.limit(Some(self.limit as i64 + 1), None)?;
+        // Overlap bounded fragment reads while keeping decode readahead at one.
         scan.batch_size(self.scan_rows)
             .batch_readahead(1)
-            .fragment_readahead(1);
+            .fragment_readahead(4);
         if let Some(observation) = observation {
             observation.attach(&mut scan);
         }
