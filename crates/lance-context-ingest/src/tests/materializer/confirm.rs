@@ -4,30 +4,55 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materializer_unknown_confirm_finishes_original_publication() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), exercise(false, true)).await?
+    tokio::time::timeout(Duration::from_secs(30), exercise(false, true, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materializer_unknown_confirm_cannot_bypass_owner_fencing() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), exercise(true, true)).await?
+    tokio::time::timeout(Duration::from_secs(30), exercise(true, true, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materializer_uncommitted_confirm_resumes_exact_selected_publication() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), exercise(false, false)).await?
+    tokio::time::timeout(Duration::from_secs(30), exercise(false, false, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn materializer_uncommitted_confirm_does_not_resubmit_after_fencing() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), exercise(true, false)).await?
+    tokio::time::timeout(Duration::from_secs(30), exercise(true, false, false)).await?
 }
 
-async fn exercise(fenced: bool, execute: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materializer_rpc_unknown_confirm_finishes_original_publication() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), exercise(false, true, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materializer_rpc_unknown_confirm_cannot_bypass_owner_fencing() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), exercise(true, true, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materializer_uncommitted_rpc_unknown_confirm_resumes_exact_publication() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), exercise(false, false, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn materializer_uncommitted_rpc_unknown_confirm_does_not_resubmit_after_fencing() -> Result<()>
+{
+    tokio::time::timeout(Duration::from_secs(30), exercise(true, false, true)).await?
+}
+
+async fn exercise(fenced: bool, execute: bool, rpc_unknown: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("confirm.lance");
     let mut cluster = network::Cluster::open_signed(root.path(), layout()).await?;
     bootstrap(&cluster, &path, &binding()).await?;
-    let proxy = Proxy::open_confirm(&cluster, root.path(), execute).await?;
+    let proxy = if rpc_unknown {
+        Proxy::open_rpc_unknown_confirm(&cluster, root.path(), execute).await?
+    } else {
+        Proxy::open_confirm(&cluster, root.path(), execute).await?
+    };
     let direct = std::mem::replace(&mut cluster.client, proxy.client.clone());
     let ingress = connect(&cluster, binding()).await?;
     let storage = Storage::resolve(

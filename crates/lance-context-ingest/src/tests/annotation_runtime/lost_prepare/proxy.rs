@@ -121,6 +121,7 @@ enum Point {
     },
     Confirm {
         execute: bool,
+        rpc_unknown: bool,
     },
 }
 impl Frame {
@@ -418,7 +419,31 @@ impl Proxy {
     }
 
     pub async fn open_confirm(c: &network::Cluster, root: &FsPath, execute: bool) -> Result<Self> {
-        Self::open_at(c, root, Point::Confirm { execute }).await
+        Self::open_at(
+            c,
+            root,
+            Point::Confirm {
+                execute,
+                rpc_unknown: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn open_rpc_unknown_confirm(
+        c: &network::Cluster,
+        root: &FsPath,
+        execute: bool,
+    ) -> Result<Self> {
+        Self::open_at(
+            c,
+            root,
+            Point::Confirm {
+                execute,
+                rpc_unknown: true,
+            },
+        )
+        .await
     }
 
     async fn open_at(c: &network::Cluster, root: &FsPath, point: Point) -> Result<Self> {
@@ -652,14 +677,24 @@ impl Proxy {
                                         confirm_requests.lock().unwrap().push(confirm);
                                         if unknown_confirms.load(Ordering::SeqCst) {
                                             dropped.fetch_add(1, Ordering::SeqCst);
-                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            let reply = if matches!(point, Point::Confirm { rpc_unknown: true, .. }) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
                                             continue;
                                         }
-                                        if matches!(point, Point::Confirm { execute: false }) && armed.swap(false, Ordering::SeqCst) {
+                                        if matches!(point, Point::Confirm { execute: false, .. }) && armed.swap(false, Ordering::SeqCst) {
                                             committed.notify_one();
                                             release.notified().await;
                                             dropped.fetch_add(1, Ordering::SeqCst);
-                                            request.unknown_reply()?.write(&mut downstream).await?;
+                                            let reply = if matches!(point, Point::Confirm { rpc_unknown: true, .. }) {
+                                                request.reply(Reply::Unknown)?
+                                            } else {
+                                                request.unknown_reply()?
+                                            };
+                                            reply.write(&mut downstream).await?;
                                             continue;
                                         }
                                     }
@@ -764,7 +799,7 @@ impl Proxy {
                                         release.notified().await;
                                         dropped.fetch_add(1, Ordering::SeqCst);
                                         if matches!(point, Point::Plan { .. } | Point::Advance { .. } | Point::Reserve { .. } | Point::Retire { .. } | Point::Confirm { .. } | Point::Append { .. } | Point::Pin { .. } | Point::Prepare { structured: true, .. }) {
-                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. } | Point::Retire { rpc_unknown: true, .. }) || (matches!(point, Point::Plan { .. }) && rpc_unknown_plans.load(Ordering::SeqCst)) {
+                                            let reply = if matches!(point, Point::Pin { rpc_unknown: true, .. } | Point::Retire { rpc_unknown: true, .. } | Point::Confirm { rpc_unknown: true, .. }) || (matches!(point, Point::Plan { .. }) && rpc_unknown_plans.load(Ordering::SeqCst)) {
                                                 request.reply(Reply::Unknown)?
                                             } else {
                                                 request.unknown_reply()?

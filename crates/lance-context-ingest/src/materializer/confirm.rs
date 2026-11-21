@@ -24,7 +24,7 @@ impl Publisher {
                     ensure!(matches(&request, &published), "foreign publication outcome");
                     return Ok(published);
                 }
-                Ok(Reply::Commit(Outcome::Unknown)) => (
+                Ok(Reply::Unknown | Reply::Commit(Outcome::Unknown)) => (
                     anyhow::anyhow!(
                         "durable command outcome unknown; reconcile the original operation"
                     ),
@@ -54,7 +54,7 @@ impl Publisher {
             match observed {
                 Ok(Some(published)) => return Ok(published),
                 Ok(None) => {
-                    // Only structured Unknown plus the identical selected plan
+                    // Only an explicit Unknown plus the identical selected plan
                     // permits reissuing this idempotent control command. Keep
                     // the caller's frozen generation/files and memory permits.
                     // Apply/read stay live under their existing bounds, and
