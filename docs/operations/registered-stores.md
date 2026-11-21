@@ -48,11 +48,15 @@ Those statistics feed the existing WAL-merge and compaction scheduling policies.
 Registered tables are excluded from rollout-specific cold retirement and native
 merge-demand publication.
 
-`compact` uses the normal compaction budgets and the registry URI. It optimizes
-existing BTree indexes before and after the rewrite, refreshes statistics and
-records unchanged compactions for the scheduler's no-op suppression. It does not
-create new application-specific secondary indexes. `index_id` explicitly builds
-or replaces the configured primary-key index.
+`compact` opens the registry URI as a `StorageBase` using the table's persisted
+schema and declared primary key. Rollout tables use this same path; compaction
+does not need a rollout-specific store interface or evolve business columns.
+Legacy rollout tasks still accept the conventional URI until discovery registers
+the table. After rewriting fragments, the shared scheduler queues a dependent
+`index_id` task when `INDEX_AFTER_COMPACTION` is enabled. Statistics refresh and
+unchanged-compaction suppression are shared. `index_id` builds or replaces the
+configured primary-key index and maintains existing application BTree indexes;
+it does not invent secondary index definitions.
 
 `merge_wal` fans out to each configured worker using:
 

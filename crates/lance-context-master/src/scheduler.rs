@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use lance_context_api::{TaskKind, TaskRecord};
-use lance_context_core::{CompactionConfig, RolloutStore};
+use lance_context_core::{CompactionConfig, ListSource, RolloutStore};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
@@ -241,17 +241,7 @@ async fn run_task(state: &Arc<MasterState>, mut claim: TaskClaim, timing: TaskCl
         // permits so slow refreshes cannot create unbounded background work.
         let started = std::time::Instant::now();
         let (_, name) = parse_target(&task.target);
-        match RolloutStore::open_existing_with_options(
-            &state.rollout_uri(name),
-            state.rollout_store_options(),
-        )
-        .await
-        {
-            Ok(store) => update_stats_after_compaction(state, name, &store).await,
-            Err(error) => {
-                tracing::warn!(store = %name, error = %error, "post-compaction stats open failed");
-            }
-        }
+        update_stats_after_compaction(state, name, &state.rollout_uri(name)).await;
         metrics::histogram!("master_compaction_phase_duration_seconds", "phase" => "stats_refresh")
             .record(started.elapsed().as_secs_f64());
     }
@@ -780,11 +770,10 @@ async fn run_prepared_compaction(
     outcome.map(|detail| (detail, true))
 }
 
-/// Compact one experiment. The task-store claim owns the per-experiment write
-/// lock for the full execution.
+/// Compact a rollout or registered table through the same maintenance path.
+/// The task-store claim owns the per-target write lock for the full execution.
 ///
-/// A compaction that rewrote fragments invalidates the `id` ZoneMap index
-/// (per-fragment min/max), so it enqueues an [`TaskKind::IndexId`] that
+/// A compaction that rewrote fragments enqueues an [`TaskKind::IndexId`] that
 /// depends on this task. The dependency keeps the two from contending for the
 /// per-target lock and lets the index wait its turn behind the queue. Skipped
 /// when nothing was rewritten and when `index_after_compaction` is off.
@@ -796,11 +785,7 @@ async fn run_compaction(state: &Arc<MasterState>, task: &TaskRecord) -> Result<S
         // through the rollout code path with the wrong URI and schema.
         return Err(format!("compaction is not scheduled for {kind:?} stores"));
     }
-    let metrics = if state.registered_target(&task.target).is_some() {
-        crate::registered_store::compact(state, &task.target).await?
-    } else {
-        compact_inner(state, name).await?
-    };
+    let metrics = compact_inner(state, name).await?;
     finish_compaction(state, task, metrics).await
 }
 
@@ -809,10 +794,7 @@ async fn finish_compaction(
     task: &TaskRecord,
     metrics: lance::dataset::optimize::CompactionMetrics,
 ) -> Result<String, String> {
-    if state.registered_target(&task.target).is_none()
-        && state.config.index_after_compaction
-        && metrics.fragments_added > 0
-    {
+    if state.config.index_after_compaction && metrics.fragments_added > 0 {
         // Best-effort: the compaction itself is done; the next compaction of
         // this target re-enqueues the index anyway.
         if let Err(error) = enqueue_with_deps(
@@ -867,17 +849,18 @@ async fn run_index_id(state: &Arc<MasterState>, target: &str) -> Result<String, 
 }
 
 async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, String> {
-    let uri = state.rollout_uri(name);
-    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+    let uri = maintenance_uri(state, name).await?;
+    let mut store = crate::registered_store::open(state, &uri)
         .await
         .map_err(|e| e.to_string())?;
     store
-        .create_id_key_index()
+        .create_configured_key_index()
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!(
-        "built {} index on id",
-        state.config.key_index_type.as_str()
+        "built {} index on {}",
+        state.config.key_index_type.as_str(),
+        store.key_column()
     ))
 }
 
@@ -940,14 +923,26 @@ async fn run_prepared_index(
     result
 }
 
+/// Resolve registration independently of the table's schema or maintenance API.
+async fn maintenance_uri(state: &MasterState, target: &str) -> Result<String, String> {
+    match state.target_uri(target).await.map_err(|e| e.to_string())? {
+        Some(uri) => Ok(uri),
+        // Retain the historical URI convention for explicit legacy rollout
+        // tasks whose store has not yet been discovered into the registry.
+        None if state.registered_target(target).is_none() => Ok(state.rollout_uri(target)),
+        None => Err(format!("unknown maintenance target '{target}'")),
+    }
+}
+
 async fn compact_inner(
     state: &Arc<MasterState>,
     name: &str,
 ) -> Result<lance::dataset::optimize::CompactionMetrics, String> {
-    let uri = state.rollout_uri(name);
     let config = state.compaction_config();
-
-    let mut store = RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+    let uri = maintenance_uri(state, name).await?;
+    // Compaction depends only on the persisted table schema and primary key.
+    // Rollout is one registered table schema, not a separate storage capability.
+    let mut store = crate::registered_store::open(state, &uri)
         .await
         .map_err(|e| e.to_string())?;
     let options = compact_options_key(&config);
@@ -964,7 +959,7 @@ async fn compact_inner(
                 Duration::from_secs(3),
                 state
                     .task_store
-                    .record_compact_noop(name, &uri, before, &options)
+                    .record_compact_noop(name, store.uri(), before, &options)
             )
             .await,
             Ok(Ok(()))
@@ -975,7 +970,7 @@ async fn compact_inner(
             );
         }
     }
-    update_stats_after_compaction(state, name, &store).await;
+    update_stats_after_compaction(state, name, store.uri()).await;
     Ok(metrics)
 }
 
@@ -996,6 +991,40 @@ pub(crate) fn compact_options_key(config: &CompactionConfig) -> String {
     .to_string()
 }
 
+/// Refresh maintenance statistics without applying a business schema to the table.
+/// Preserve the existing row-count contract: application-managed tables count
+/// base rows; rollout statistics also count rows in published WAL generations.
+async fn observe_maintenance(state: &MasterState, name: &str, uri: &str) -> lance::Result<StatRow> {
+    if state.registered_target(name).is_some() {
+        return crate::registered_store::observe(state, name, uri, None)
+            .await
+            .map(|(row, _, _)| row);
+    }
+    let store = crate::registered_store::open(state, uri).await?;
+    let store = &store;
+    store
+        .read_consistent(ListSource::All, |dataset, snapshots| async move {
+            let base_rows = dataset.count_rows(None).await? as u64;
+            let pending_rows = store.pending_wal_rows(&snapshots).await?;
+            Ok(StatRow {
+                name: name.to_owned(),
+                uri: uri.to_owned(),
+                row_count: (base_rows + pending_rows) as i64,
+                fragment_count: dataset.count_fragments() as i64,
+                last_updated: dataset.manifest.timestamp().timestamp_millis(),
+                pending_wal_generations: snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.sstables.len() as i64)
+                    .sum(),
+                last_compaction: StatRow::NO_COMPACTION,
+                total_compactions: 0,
+                scanned_at: Utc::now().timestamp_millis(),
+                version: dataset.manifest.version as i64,
+            })
+        })
+        .await
+}
+
 /// Refresh the stats row for `name` after a successful compaction: re-observe
 /// fragment/row counts and bump `last_compaction`/`total_compactions`.
 ///
@@ -1003,7 +1032,7 @@ pub(crate) fn compact_options_key(config: &CompactionConfig) -> String {
 /// round refreshes the row anyway, so this never waits long for the
 /// `stats-writer` lock: a holder mid-maintenance would otherwise pin this
 /// task's concurrency slot on every master for as long as it runs.
-async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, store: &RolloutStore) {
+async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, uri: &str) {
     let guard = match tokio::time::timeout(
         STATS_REFRESH_LOCK_WAIT,
         // This refresh is optional: leave a busy writer to the next scan.
@@ -1033,8 +1062,8 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
             return;
         }
     };
-    let obs = match store.observe().await {
-        Ok(obs) => obs,
+    let mut row = match observe_maintenance(state, name, uri).await {
+        Ok(row) => row,
         Err(e) => {
             tracing::warn!(store = %name, error = %e, "post-compaction observe failed");
             let _ = state.task_store.release_coordination_lock(guard).await;
@@ -1046,18 +1075,8 @@ async fn update_stats_after_compaction(state: &Arc<MasterState>, name: &str, sto
         Ok(Some(row)) => row.total_compactions,
         _ => 0,
     };
-    let row = StatRow {
-        name: name.to_string(),
-        uri: state.rollout_uri(name),
-        row_count: obs.row_count,
-        fragment_count: obs.fragment_count,
-        last_updated: obs.last_updated,
-        pending_wal_generations: obs.pending_wal_generations,
-        last_compaction: Utc::now().timestamp_millis(),
-        total_compactions: prev_total + 1,
-        scanned_at: Utc::now().timestamp_millis(),
-        version: obs.version as i64,
-    };
+    row.last_compaction = Utc::now().timestamp_millis();
+    row.total_compactions = prev_total + 1;
     if let Err(e) = stats.upsert(&row).await {
         tracing::warn!(store = %name, error = %e, "post-compaction stats upsert failed");
     }
@@ -2501,7 +2520,7 @@ mod tests {
             None
         };
         let start = std::time::Instant::now();
-        update_stats_after_compaction(&state, "exp", &store).await;
+        update_stats_after_compaction(&state, "exp", store.uri()).await;
         let elapsed = start.elapsed();
         let count = if let Some(before) = before {
             Some(grants().await - before)
@@ -2592,7 +2611,7 @@ mod tests {
                 .await
                 .unwrap();
             // A later uncontended refresh still updates the row normally.
-            update_stats_after_compaction(&state, "exp", &store).await;
+            update_stats_after_compaction(&state, "exp", store.uri()).await;
             let stats = state.stats.lock().await.get("exp").await.unwrap().unwrap();
             assert_eq!(stats.total_compactions, 1);
             assert_eq!(stats.row_count, 4);
@@ -2765,6 +2784,112 @@ mod tests {
             before,
             "an unchanged scan must not rewrite the record"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn maintenance_uses_registry_uri_and_persisted_schema() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::dataset::{Dataset, WriteParams};
+        let dir = TempDir::new().unwrap();
+        let state = MasterState::new(config(&dir)).await.unwrap();
+        let uri = format!("{}/registered-location.lance", dir.path().display());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "sequence",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(
+            [("lance-schema:unenforced-primary-key".into(), "true".into())].into(),
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3, 4]))],
+        )
+        .unwrap();
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema.clone()),
+            &uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        state.registry.upsert("table", &uri).await.unwrap();
+        let metrics = compact_inner(&state, "table").await.unwrap();
+        assert!(metrics.fragments_removed > 0);
+        let detail = index_id_inner(&state, "table").await.unwrap();
+        assert_eq!(detail, "built btree index on sequence");
+        let dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(Schema::from(dataset.schema()), *schema);
+        assert_eq!(
+            dataset
+                .count_rows(Some("sequence = 3".into()))
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!std::path::Path::new(&state.rollout_uri("table")).exists());
+        let stats = state
+            .stats
+            .lock()
+            .await
+            .get("table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.uri, uri);
+        assert_eq!(stats.row_count, 4);
+        assert_eq!(stats.total_compactions, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn rollout_maintenance_preserves_pending_wal_and_legacy_uri() {
+        use lance_context_core::KeyIndexType;
+        for key_index in [KeyIndexType::Btree, KeyIndexType::Zonemap] {
+            let dir = TempDir::new().unwrap();
+            let mut cfg = config(&dir);
+            cfg.key_index_type = key_index;
+            let state = MasterState::new(cfg).await.unwrap();
+            let uri = state.rollout_uri("exp");
+            let mut writer = RolloutStore::open_with_options(&uri, state.rollout_store_options())
+                .await
+                .unwrap();
+            writer.add(&[rollout_record("base")]).await.unwrap();
+            writer.cleanup_own_shard().await.unwrap();
+            writer.add(&[rollout_record("pending")]).await.unwrap();
+            writer.flush().await.unwrap();
+            assert_eq!(writer.pending_wal_generations().await.unwrap(), 1);
+            // Explicit legacy tasks still work before discovery registers the URI.
+            assert!(state.registry.get("exp").await.unwrap().is_none());
+            let metrics = compact_inner(&state, "exp").await.unwrap();
+            assert_eq!(metrics.fragments_added, 0);
+            assert_eq!(
+                index_id_inner(&state, "exp").await.unwrap(),
+                format!("built {} index on id", key_index.as_str())
+            );
+            let reader =
+                RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
+                    .await
+                    .unwrap();
+            for id in ["base", "pending"] {
+                assert!(reader.get_by_id(id).await.unwrap().is_some());
+            }
+            let observed = reader.observe().await.unwrap();
+            let stats = state.stats.lock().await.get("exp").await.unwrap().unwrap();
+            assert_eq!(stats.row_count, 2);
+            assert_eq!(stats.pending_wal_generations, 1);
+            assert_eq!(stats.fragment_count, 1);
+            assert_eq!(stats.row_count, observed.row_count);
+            assert_eq!(
+                stats.pending_wal_generations,
+                observed.pending_wal_generations
+            );
+        }
     }
 
     #[tokio::test]
@@ -6060,6 +6185,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.managed_store_kind = Some("events".into());
+        cfg.index_after_compaction = true;
         cfg.key_index_type = lance_context_core::KeyIndexType::Btree;
         let state = MasterState::new(cfg).await.unwrap();
         let uri = format!("{}/application-chosen-location.lance", dir.path().display());
@@ -6119,8 +6245,10 @@ mod tests {
         let index = enqueue(&state, TaskKind::IndexId, "events:table")
             .await
             .unwrap();
-        let worker = spawn_scheduler(&state);
-        let indexed = await_terminal(&state, &index.id).await;
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, index.id);
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let indexed = state.task_store.get(&index.id).await.unwrap().unwrap();
         assert_eq!(indexed.state, TaskState::Done, "{indexed:?}");
         let before = Dataset::open(&uri).await.unwrap();
         let indexes = before.load_indices().await.unwrap();
@@ -6150,12 +6278,27 @@ mod tests {
         let compact = enqueue(&state, TaskKind::Compact, "events:table")
             .await
             .unwrap();
-        let compacted = await_terminal(&state, &compact.id).await;
-        worker.abort();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, compact.id);
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let compacted = state.task_store.get(&compact.id).await.unwrap().unwrap();
         assert_eq!(compacted.state, TaskState::Done, "{compacted:?}");
         let after = Dataset::open(&uri).await.unwrap();
         assert!(after.get_fragments().len() < 8);
         assert_eq!(after.count_rows(None).await.unwrap(), 8);
+        let stats = state
+            .stats
+            .lock()
+            .await
+            .get("events:table")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stats.uri, uri);
+        assert_eq!(stats.row_count, 8);
+        assert_eq!(stats.fragment_count, after.get_fragments().len() as i64);
+        assert_eq!(stats.version, after.version().version as i64);
+        assert_eq!(stats.total_compactions, 1);
         for sequence in 0..8 {
             assert_eq!(
                 after
@@ -6165,6 +6308,32 @@ mod tests {
                 1
             );
         }
+        // Compaction commits independently; index maintenance is a queued task.
+        let followup = state
+            .task_store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|task| task.kind == TaskKind::IndexId && task.id != index.id)
+            .expect("registered compaction must enqueue an independent index task");
+        assert_eq!(followup.state, TaskState::Queued);
+        assert_eq!(followup.depends_on, vec![compact.id.clone()]);
+        let compacted_indexes = after.load_indices().await.unwrap();
+        let unchanged = compacted_indexes
+            .iter()
+            .find(|candidate| candidate.name == indexes[0].name)
+            .unwrap();
+        assert_eq!(
+            unchanged.uuid, indexes[0].uuid,
+            "compaction must not rebuild the index inline"
+        );
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.id, followup.id);
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let indexed = state.task_store.get(&followup.id).await.unwrap().unwrap();
+        assert_eq!(indexed.state, TaskState::Done, "{indexed:?}");
+        let after = Dataset::open(&uri).await.unwrap();
         let indexes = after.load_indices().await.unwrap();
         let indexes: Vec<_> = indexes
             .iter()
