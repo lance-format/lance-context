@@ -5,25 +5,49 @@ use std::sync::atomic::Ordering;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_unknown_confirm_keeps_owner_live_and_preserves_concurrent_updates() -> Result<()>
 {
-    tokio::time::timeout(Duration::from_secs(60), exercise(true, false, false)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(true, false, false, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uncommitted_unknown_confirm_keeps_owner_live_and_drains() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), exercise(false, false, false)).await?
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        exercise(false, false, false, false),
+    )
+    .await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn persistent_unknown_confirm_preserves_reads_and_eventually_drains() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, false)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, false, false)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_unknown_confirm_recovers_original_files_and_acked_suffix() -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, true)).await?
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, true, false)).await?
 }
 
-async fn exercise(execute: bool, persistent: bool, restart: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn committed_rpc_unknown_confirm_preserves_concurrent_updates() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(true, false, false, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uncommitted_rpc_unknown_confirm_keeps_owner_live_and_drains() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, false, false, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_rpc_unknown_confirm_preserves_reads_and_backpressure() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, false, true)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_rpc_unknown_confirm_recovers_original_files_and_acked_suffix() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), exercise(false, true, true, true)).await?
+}
+
+async fn exercise(execute: bool, persistent: bool, restart: bool, rpc_unknown: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let storage = Storage::resolve(
         root.path().join("turns.lance").to_str().unwrap().into(),
@@ -42,7 +66,11 @@ async fn exercise(execute: bool, persistent: bool, restart: bool) -> Result<()> 
     annotation_publication::seed_contract(&c, &storage, Service::contract(&binding(), &limits)?)
         .await?;
     let base = annotation_publication::read(&c, &storage, None).await?;
-    let proxy = lost_prepare::proxy::Proxy::open_confirm(&c, root.path(), execute).await?;
+    let proxy = if rpc_unknown {
+        lost_prepare::proxy::Proxy::open_rpc_unknown_confirm(&c, root.path(), execute).await?
+    } else {
+        lost_prepare::proxy::Proxy::open_confirm(&c, root.path(), execute).await?
+    };
     let direct = std::mem::replace(&mut c.client, proxy.client.clone());
     let (service, runtime) = owner(&c, &storage, &limits).await?;
     let (stop, mut task) = run_owner(runtime);
