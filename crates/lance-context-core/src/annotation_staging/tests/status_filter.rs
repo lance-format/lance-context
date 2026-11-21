@@ -24,6 +24,41 @@ async fn query(staging: &AnnotationStaging, status: Option<&str>) -> Result<Stat
 }
 
 #[tokio::test]
+async fn status_scan_observation_preserves_results_and_does_not_drain_truncated_scans() -> Result<()>
+{
+    let root = tempfile::tempdir()?;
+    let base = fixture_with_row_ids(&root.path().join("turns.lance"), true).await?;
+    let staging = AnnotationStaging::new(base, scope(), 0, Limits::default())?;
+    for (status, limit, rows, truncated) in [
+        ("pending", 16, 3, false),
+        ("absent", 16, 0, false),
+        ("pending", 1, 1, true),
+    ] {
+        let read = staging
+            .capture_status(Some(status.into()), limit, 64 << 10)
+            .await?;
+        let expected = read.resolve().await?;
+        let (actual, observation) = read.resolve_observed().await;
+        let actual = actual?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.ids.len(), rows);
+        assert_eq!(actual.truncated, truncated);
+        assert_eq!(observation["returned_ids"], rows);
+        assert_eq!(observation["truncated"], truncated);
+        assert_eq!(observation["native_at_eof"].is_null(), truncated);
+        let before = observation["before_open_elapsed_us"].as_u64().unwrap();
+        let after = observation["after_open_elapsed_us"].as_u64().unwrap();
+        assert!(before <= after);
+        assert!(after <= observation["elapsed_us"].as_u64().unwrap());
+        // The diagnostic contains only aggregate counts, never turn IDs or
+        // predicate values, and it does not alter the captured read view.
+        assert!(!observation.to_string().contains("pending"));
+        assert!(!observation.to_string().contains("o'hara"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn status_filter_pins_snapshot_and_reports_lag_through_publication_and_index_invalidation(
 ) -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -79,6 +114,9 @@ async fn status_filter_pins_snapshot_and_reports_lag_through_publication_and_ind
         .capture_status(Some("pending".into()), 16, 64 << 10)
         .await?;
     let old = held.resolve().await?;
+    let (observed, diagnostic) = held.resolve_observed().await;
+    assert_eq!(observed?, old);
+    assert!(diagnostic["native_at_eof"].is_object());
     assert_eq!(old.ids.len(), 3);
     assert!(!old.truncated);
     assert_eq!(
@@ -130,6 +168,13 @@ async fn status_filter_pins_snapshot_and_reports_lag_through_publication_and_ind
         (1, 1, Some(2))
     );
     assert!(query(&staging, None).await?.ids.is_empty());
+    let empty = staging.capture_status(None, 16, 64 << 10).await?;
+    let (observed, diagnostic) = empty.resolve_observed().await;
+    assert!(observed?.ids.is_empty());
+    assert_eq!(diagnostic["indexed_fragments"], 1);
+    assert_eq!(diagnostic["unindexed_fragments"], 1);
+    assert!(diagnostic["native_at_eof"].is_object());
+    drop(empty);
     assert_eq!(current(&staging, "U").await?.status, None);
     drop(flush(&staging).await?);
     assert_eq!(query(&staging, None).await?.ids, vec!["U"]);

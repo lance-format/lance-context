@@ -3,6 +3,9 @@ use super::*;
 use lance::index::DatasetIndexExt;
 use std::collections::BTreeSet;
 
+mod observation;
+use observation::ScanObservation;
+
 pub const MAX_STATUS_MATCHES: usize = 1024;
 const SCAN_ROWS: usize = 1024;
 const MIN_SCAN_ROWS: usize = 32;
@@ -159,6 +162,27 @@ impl StatusRead {
     /// Native filtering covers indexed fragments and the unindexed Lance tail.
     /// Only IDs are projected; this never reads a WAL tail or turn body.
     pub async fn resolve(&self) -> Result<StatusMatches> {
+        if !tracing::enabled!(target: "lance_context::annotation_status_scan", tracing::Level::DEBUG)
+        {
+            return self.resolve_inner(None).await;
+        }
+        let observation = ScanObservation::new();
+        let result = self.resolve_inner(Some(&observation)).await;
+        observation.emit(&result);
+        result
+    }
+
+    #[cfg(test)]
+    pub(in crate::annotation_staging) async fn resolve_observed(
+        &self,
+    ) -> (Result<StatusMatches>, serde_json::Value) {
+        let observation = ScanObservation::new();
+        let result = self.resolve_inner(Some(&observation)).await;
+        let snapshot = observation.snapshot(&result);
+        (result, snapshot)
+    }
+
+    async fn resolve_inner(&self, observation: Option<&ScanObservation>) -> Result<StatusMatches> {
         let mut result = self.matches.clone();
         let field = self.base.schema().field("status").unwrap().id;
         let mut indexed = BTreeSet::new();
@@ -204,7 +228,13 @@ impl StatusRead {
         scan.batch_size(self.scan_rows)
             .batch_readahead(1)
             .fragment_readahead(1);
+        if let Some(observation) = observation {
+            observation.attach(&mut scan);
+        }
         let mut stream = scan.try_into_stream().await?;
+        if let Some(observation) = observation {
+            observation.opened();
+        }
         while let Some(batch) = stream.try_next().await? {
             let ids = batch
                 .column(0)
