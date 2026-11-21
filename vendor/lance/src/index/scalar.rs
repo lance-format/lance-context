@@ -176,6 +176,7 @@ pub(crate) async fn scan_training_data(
 
     let batches = scan
         .try_into_dfstream(LanceExecutionOptions {
+            batch_size: crate::dataset::scanner::get_default_batch_size(),
             use_spilling: true,
             ..Default::default()
         })
