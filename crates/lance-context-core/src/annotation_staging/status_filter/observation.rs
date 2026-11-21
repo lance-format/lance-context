@@ -2,7 +2,10 @@
 use super::StatusMatches;
 use lance::dataset::scanner::{ExecutionSummaryCounts, Scanner};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Instant,
 };
 
@@ -10,6 +13,7 @@ pub(super) struct ScanObservation {
     started: Instant,
     milestones: Mutex<(Option<u64>, Option<u64>)>,
     native: Arc<Mutex<Option<ExecutionSummaryCounts>>>,
+    id_take_batches: AtomicUsize,
 }
 
 impl ScanObservation {
@@ -18,6 +22,7 @@ impl ScanObservation {
             started: Instant::now(),
             milestones: Mutex::new((None, None)),
             native: Arc::default(),
+            id_take_batches: AtomicUsize::new(0),
         }
     }
 
@@ -37,6 +42,10 @@ impl ScanObservation {
         self.milestones.lock().unwrap().1 = Some(self.elapsed_us());
     }
 
+    pub(super) fn taking_ids(&self) {
+        self.id_take_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(super) fn snapshot(&self, result: &lance::Result<StatusMatches>) -> serde_json::Value {
         let elapsed_us = self.elapsed_us();
         let (before_open_us, after_open_us) = *self.milestones.lock().unwrap();
@@ -52,6 +61,7 @@ impl ScanObservation {
             })
         });
         let matches = result.as_ref().ok();
+        let id_take_batches = self.id_take_batches.load(Ordering::Relaxed);
         serde_json::json!({
             "outcome": if result.is_ok() { "success" } else { "error" },
             "elapsed_us": elapsed_us,
@@ -66,7 +76,11 @@ impl ScanObservation {
             "truncated": matches.map(|m| m.truncated),
             // Lance reports its summary at EOF. A bounded early return need
             // not reach EOF: null means unavailable, never zero work.
-            "native_at_eof": native,
+            // The address-filter callback does not include subsequent native
+            // takes. Never expose its counters as the whole query's work.
+            "native_at_eof": if id_take_batches == 0 { native.clone() } else { None },
+            "address_filter_native_at_eof": if id_take_batches > 0 { native } else { None },
+            "id_take_batches": id_take_batches,
         })
     }
 

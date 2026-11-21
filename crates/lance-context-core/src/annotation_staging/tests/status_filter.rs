@@ -1,6 +1,136 @@
 use super::*;
 use lance_table::transaction::{Operation, Transaction};
 
+#[tokio::test]
+async fn mixed_status_tail_bounds_takes_and_keeps_captured_values() -> Result<()> {
+    for stable in [false, true] {
+        let root = tempfile::tempdir()?;
+        let uri = root.path().join("turns.lance");
+        let id = |row: usize| format!("{}-{row:03}", "\u{0001}".repeat(80));
+        let batch = |start: usize| -> Result<RecordBatch> {
+            let mut labels = ListBuilder::new(StringBuilder::new());
+            for _ in 0..64 {
+                labels.append(true);
+            }
+            let labels = labels.finish();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("body", DataType::LargeBinary, false),
+                Field::new("labels", labels.data_type().clone(), false),
+                Field::new("status", DataType::Utf8, true),
+                Field::new("score", DataType::Float32, true),
+            ]));
+            Ok(RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from_iter_values((start..start + 64).map(id))),
+                    Arc::new(LargeBinaryArray::from_iter_values((0..64).map(|_| b"body"))),
+                    Arc::new(labels),
+                    Arc::new(StringArray::from(vec!["pending"; 64])),
+                    Arc::new(Float32Array::from(vec![None; 64])),
+                ],
+            )?)
+        };
+        let first = batch(0)?;
+        let mut base = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(first.clone())], first.schema()),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                enable_stable_row_ids: stable,
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        base.create_index(
+            &["status"],
+            IndexType::BTree,
+            Some("test_status".into()),
+            &ScalarIndexParams::default(),
+            false,
+        )
+        .await?;
+        let tail = batch(64)?;
+        let base = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(tail.clone())], tail.schema()),
+            uri.to_str().unwrap(),
+            Some(WriteParams {
+                mode: lance::dataset::WriteMode::Append,
+                enable_stable_row_ids: stable,
+                max_rows_per_file: 16,
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let staging = AnnotationStaging::new(Arc::new(base), scope(), 0, Limits::default())?;
+        let held = staging
+            .capture_status(Some("pending".into()), 128, 128 << 10)
+            .await?;
+        let before = held.resolve().await?;
+        assert_eq!(
+            before.ids.iter().cloned().collect::<BTreeSet<_>>(),
+            (0..128).map(id).collect()
+        );
+        assert!(!before.truncated);
+        assert!(before.indexed_fragments > 0 && before.unindexed_fragments > 0);
+
+        let mut bounded = staging
+            .capture_status(Some("pending".into()), 70, 64 << 10)
+            .await?;
+        while bounded.reduce_scan_batch() {}
+        let (matches, observed) = bounded.resolve_observed().await;
+        let matches = matches?;
+        assert_eq!(matches.ids.len(), 70);
+        assert!(matches.truncated);
+        assert_eq!(matches.ids.iter().collect::<BTreeSet<_>>().len(), 70);
+        assert!(matches.ids.iter().all(|key| before.ids.contains(key)));
+        assert!(observed["id_take_batches"].as_u64().unwrap() >= 3);
+        assert!(observed["native_at_eof"].is_null());
+        let bytes = staging
+            .capture_status(Some("pending".into()), 128, 1024)
+            .await?
+            .resolve()
+            .await?;
+        assert!(bytes.truncated && !bytes.ids.is_empty() && bytes.ids.len() < 128);
+        assert!(serde_json::to_vec(&bytes).unwrap().len() <= 1024);
+        let missing = staging
+            .capture_status(Some("missing".into()), 128, 64 << 10)
+            .await?;
+        let (matches, observed) = missing.resolve_observed().await;
+        assert!(matches?.ids.is_empty());
+        assert_eq!(observed["id_take_batches"], 0);
+        assert!(observed["native_at_eof"].is_object());
+
+        staging
+            .apply(
+                0,
+                1,
+                &id(64),
+                &TurnAnnotationPatch {
+                    status: Clear,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        drop(flush(&staging).await?);
+        let after = staging
+            .capture_status(Some("pending".into()), 128, 128 << 10)
+            .await?
+            .resolve()
+            .await?;
+        assert_eq!(after.ids.len(), 127);
+        assert!(!after.ids.contains(&id(64)));
+        assert_eq!(query(&staging, None).await?.ids, vec![id(64)]);
+        assert_eq!(held.resolve().await?, before);
+        assert!(staging
+            .protected_bases()
+            .await?
+            .datasets()
+            .any(|base| base.version_id() == before.base_version));
+    }
+    Ok(())
+}
+
 async fn flush(staging: &AnnotationStaging) -> Result<Arc<Dataset>> {
     let frozen = staging.freeze(uuid::Uuid::new_v4()).await?.unwrap();
     publish(staging, &frozen).await
