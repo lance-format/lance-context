@@ -1,5 +1,7 @@
 //! Status filtering of one pinned materialized annotation snapshot.
 use super::*;
+use arrow_array::UInt64Array;
+use lance::dataset::{ProjectionRequest, TakeBuilder};
 use lance::index::DatasetIndexExt;
 use std::collections::BTreeSet;
 
@@ -218,8 +220,18 @@ impl StatusRead {
         if charged > self.response_bytes {
             return Err(invalid("status filter metadata exceeds response bound"));
         }
+        // An exact index can cover only part of this snapshot. Native filtering
+        // then reads projected IDs together with the unindexed status tail,
+        // even with AllLate. Filter addresses first, and take only matched IDs
+        // from the same protected snapshot. Keep the existing single scan when
+        // coverage is uniform.
+        let take_ids = result.indexed_fragments > 0 && result.unindexed_fragments > 0;
         let mut scan = self.base.scan();
-        scan.project(&["id"])?;
+        if take_ids {
+            scan.project::<&str>(&[])?.with_row_address();
+        } else {
+            scan.project(&["id"])?;
+        }
         scan.filter_expr(self.status.as_ref().map_or_else(
             || col("status").is_null(),
             |status| col("status").eq(lit(status.clone())),
@@ -235,32 +247,76 @@ impl StatusRead {
         if let Some(observation) = observation {
             observation.opened();
         }
+        let mut take_projection = None;
         while let Some(batch) = stream.try_next().await? {
-            let ids = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| invalid("invalid annotation id"))?;
-            for id in ids.iter() {
-                let id = id
-                    .filter(|s| !s.is_empty() && s.len() <= self.value_bytes)
-                    .ok_or_else(|| invalid("invalid status filter turn key"))?;
-                // JSON escaping can expand each byte to six bytes. Charge the
-                // quotes/comma before cloning a result, including one lookahead.
-                let next = id
-                    .len()
-                    .checked_mul(6)
-                    .and_then(|n| n.checked_add(3))
-                    .and_then(|n| charged.checked_add(n))
-                    .ok_or_else(|| invalid("status filter result size overflow"))?;
-                if result.ids.len() == self.limit || next > self.response_bytes {
-                    result.truncated = true;
-                    return Ok(result);
+            if take_ids {
+                let addresses = batch
+                    .column_by_name("_rowaddr")
+                    .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+                    .filter(|array| array.null_count() == 0)
+                    .ok_or_else(|| invalid("invalid status filter row address"))?;
+                // Native batches can exceed the requested size. Bound each
+                // ID take by the batch charged to this read's workspace.
+                for addresses in addresses.values().chunks(self.scan_rows) {
+                    if take_projection.is_none() {
+                        take_projection = Some(Arc::new(
+                            ProjectionRequest::from_columns(["id"], self.base.schema())
+                                .into_projection_plan(self.base.dataset.clone())?,
+                        ));
+                    }
+                    if let Some(observation) = observation {
+                        observation.taking_ids();
+                    }
+                    let ids = TakeBuilder::try_new_from_addresses(
+                        self.base.dataset.clone(),
+                        addresses.to_vec(),
+                        take_projection.as_ref().unwrap().clone(),
+                    )?
+                    .execute()
+                    .await?;
+                    if ids.num_rows() != addresses.len() {
+                        return Err(invalid("status filter lost a captured row address"));
+                    }
+                    if self.append_ids(&mut result, &mut charged, &ids)? {
+                        return Ok(result);
+                    }
                 }
-                charged = next;
-                result.ids.push(id.to_owned());
+            } else if self.append_ids(&mut result, &mut charged, &batch)? {
+                return Ok(result);
             }
         }
         Ok(result)
+    }
+
+    fn append_ids(
+        &self,
+        result: &mut StatusMatches,
+        charged: &mut usize,
+        batch: &RecordBatch,
+    ) -> Result<bool> {
+        let ids = batch
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| invalid("invalid annotation id"))?;
+        for id in ids.iter() {
+            let id = id
+                .filter(|s| !s.is_empty() && s.len() <= self.value_bytes)
+                .ok_or_else(|| invalid("invalid status filter turn key"))?;
+            // JSON escaping can expand each byte to six bytes. Charge the
+            // quotes/comma before cloning a result, including one lookahead.
+            let next = id
+                .len()
+                .checked_mul(6)
+                .and_then(|n| n.checked_add(3))
+                .and_then(|n| charged.checked_add(n))
+                .ok_or_else(|| invalid("status filter result size overflow"))?;
+            if result.ids.len() == self.limit || next > self.response_bytes {
+                result.truncated = true;
+                return Ok(true);
+            }
+            *charged = next;
+            result.ids.push(id.to_owned());
+        }
+        Ok(false)
     }
 }
