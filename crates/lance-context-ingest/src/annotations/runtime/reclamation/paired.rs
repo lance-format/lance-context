@@ -47,6 +47,32 @@ pub(super) async fn protect_body(
     let reference = BodySnapshot::read(narrow)
         .await?
         .context("protected narrow snapshot has no body reference")?;
+    protect_reference(
+        candidates,
+        &reference,
+        storage,
+        store,
+        incarnation,
+        budget,
+        already_reserved,
+        retain_data,
+        protected,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn protect_reference(
+    candidates: &mut BTreeMap<Path, u64>,
+    reference: &BodySnapshot,
+    storage: &Storage,
+    store: &ObjectStore,
+    incarnation: Uuid,
+    budget: &Arc<MergeMemoryBudget>,
+    already_reserved: usize,
+    retain_data: bool,
+    protected: &mut Protection,
+) -> Result<()> {
     ensure!(
         reference.uri == storage.uri && reference.table_instance == incarnation.to_string(),
         "protected body reference differs from authorized destination"
@@ -78,7 +104,7 @@ pub(super) async fn protect_body(
         "body retained manifest exceeds collection workspace"
     );
     let _manifest = budget.reserve(charge).await;
-    let body = mixed::load_body(storage, &reference, &incarnation.to_string()).await?;
+    let body = mixed::load_body(storage, reference, &incarnation.to_string()).await?;
     ensure!(
         body.manifest_location().path == location.path,
         "body manifest location changed"
