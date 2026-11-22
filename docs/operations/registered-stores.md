@@ -54,9 +54,58 @@ does not need a rollout-specific store interface or evolve business columns.
 Legacy rollout tasks still accept the conventional URI until discovery registers
 the table. After rewriting fragments, the shared scheduler queues a dependent
 `index_id` task when `INDEX_AFTER_COMPACTION` is enabled. Statistics refresh and
-unchanged-compaction suppression are shared. `index_id` builds or replaces the
-configured primary-key index and maintains existing application BTree indexes;
+unchanged-compaction suppression are shared. `index_id` creates a missing
+configured primary-key index and extends incomplete indexes, including existing application BTree indexes;
 it does not invent secondary index definitions.
+
+### Independent periodic indexing
+
+Set `INDEX_INTERVAL_SECS=60` (or `--index-interval-secs 60`) on the masters to
+check base-table index coverage once a minute. The default is `0` (disabled).
+This sweep uses the existing stats scanner's inventory of nonempty tables, so
+keep `STATS_SCAN_INTERVAL_SECS` enabled too. It does not depend on `MIN_FRAGMENTS`,
+quiet hours, or the compaction interval. It can run with compaction disabled.
+
+Set `INDEX_PREPARE_TARGETS=*` to reuse the existing prepared executor for
+rollout and registered tables (or select exact targets). Ordinary and prepared
+execution share the same coverage plan. Missing key indexes use the existing
+uncommitted key builder; incomplete indexes use Lance's incremental optimize
+plan/build/merge stages. Preparation writes immutable files without holding the
+table writer. Publication acquires the existing maintenance ownership, with
+`INDEX_COMMIT_WAIT_SECS` bounding time without progress from the current writer.
+Source rewrites or same-index changes invalidate preparation and require retry;
+concurrent appends remain valid and are indexed by a later pass.
+
+Upgrade all index executors sharing the queue before enabling periodic discovery:
+older prepared executors only maintain the primary key. This setting does not
+enable native merge or compaction preparation for registered stores. Retained
+snapshot requests always keep their existing full-coverage validation and tag
+creation under table ownership, even with `INDEX_PREPARE_TARGETS=*`.
+
+Only tables missing their configured key index or with uncovered fragments in
+that index or an existing BTree index get an `index_id` task. Checks read current
+manifest/index metadata, including fragment-reuse mappings, not row payloads.
+Coverage unions all deltas of each named index. Fully covered tables do not
+produce tasks or index commits; executing tasks recheck coverage before writing.
+Index updates merge deltas so later data compaction can still combine fragments.
+The separate retained-snapshot API below continues to validate and pin its result.
+
+The sweep elects one owner among identically configured masters, bounds metadata
+checks with `SCAN_CONCURRENCY`, and queues at most 256 new tasks per round. It
+uses normal task deduplication, failure cooldown, per-table maintenance ownership,
+and the `TASK_CONCURRENCY` pool. A slow round delays the next one rather than
+building a backlog of timer ticks. This is eventual maintenance, not a guarantee
+that every table is fully indexed within 60 seconds.
+
+This checks rollout tables and the configured registered-store kind. Generic
+stores remain excluded. WAL-only data must first reach base through the separate
+WAL-merge policy; the index sweep neither merges WAL nor compacts data files.
+`INDEX_AFTER_COMPACTION` remains independent and can stay enabled.
+
+Observe `master_periodic_sweep_{started,enqueued,errors}_total{kind="index_id"}`,
+`master_index_sweep_checks_total{result="needed|skipped|error"}`, and the existing
+`index_id` task duration/failure metrics. Per-table lookup failures are logged
+and counted without stopping checks for other tables.
 
 `merge_wal` fans out to each configured worker using:
 

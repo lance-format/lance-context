@@ -2700,12 +2700,19 @@ impl EtcdTaskStore {
                     .map(serde_json::from_slice)
                     .transpose()
                     .map_err(|e| lance::Error::io(format!("invalid merge execution: {e}")))?;
-                let shape = eligibility::claim_shape(
+                let mut shape = eligibility::claim_shape(
                     task.kind,
                     &task.target,
                     &policy,
                     snapshot[2].is_some(),
                 );
+                // Retained snapshots must validate full coverage and tag the
+                // exact indexed version under table ownership. Keep them on
+                // that path even when ordinary index preparation selects '*'.
+                if task.snapshot_tag.is_some() {
+                    shape.preparing = false;
+                    shape.write_claim = true;
+                }
                 let preparing = shape.preparing;
                 let write_claim = shape.write_claim;
                 let preparation_key = preparing.then_some(preparation_key);
@@ -6865,6 +6872,7 @@ pub(crate) mod tests {
             compaction_batch_size: 8,
             compaction_max_source_fragments: 32,
             index_after_compaction: false,
+            index_interval_secs: 0,
             key_index_type: Default::default(),
             index_before_merge: false,
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,

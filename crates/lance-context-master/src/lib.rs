@@ -15,6 +15,7 @@ pub mod error;
 pub mod executors;
 mod index_coverage;
 mod index_snapshot;
+mod index_sweep;
 pub mod legacy_retirement;
 pub mod local_merge;
 mod maintenance_execution;

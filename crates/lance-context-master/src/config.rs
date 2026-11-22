@@ -137,6 +137,14 @@ pub struct MasterConfig {
     #[arg(long, env = "INDEX_AFTER_COMPACTION", default_value_t = true, action = clap::ArgAction::Set)]
     pub index_after_compaction: bool,
 
+    /// Interval between independent base-table index coverage checks. Creates
+    /// missing key indexes and extends existing BTree indexes over new fragments,
+    /// without merging WAL or compacting data. Uses the stats scanner's table
+    /// inventory. `0` disables this sweep; manual/post-compaction tasks still run.
+    /// Reuses ordinary or prepared execution selected by `INDEX_PREPARE_TARGETS`.
+    #[arg(long, env = "INDEX_INTERVAL_SECS", default_value_t = 0)]
+    pub index_interval_secs: u64,
+
     /// Deprecated compatibility flag. Owned merge executors now ensure the id
     /// index under the same execution fence as the merge; the master does not
     /// mutate the base table before admitting a worker.
@@ -319,7 +327,6 @@ impl MasterConfig {
             .iter()
             .chain(&self.merge_rollout.drain_targets)
             .chain(&self.maintenance.compaction_prepare_targets)
-            .chain(&self.maintenance.index_prepare_targets)
             .chain(&self.local_merge.master_local_merge_targets)
             .any(|target| target == "*" || target.starts_with(&prefix))
             || self.merge_rollout.fence_legacy
@@ -361,7 +368,6 @@ mod tests {
             vec!["--merge-owned-targets", "events:table"],
             vec!["--merge-drain-targets", "events:table"],
             vec!["--compaction-prepare-targets", "*"],
-            vec!["--index-prepare-targets", "events:table"],
             vec!["--fence-legacy"],
             vec!["--fence-legacy-maintenance"],
             vec!["--master-local-merge-targets", "events:table"],
@@ -552,8 +558,10 @@ pub struct MaintenanceConfig {
     /// source fragments invalidate preparation instead of being overwritten.
     #[arg(long, env = "COMPACTION_PREPARE_TARGETS", value_delimiter = ',')]
     pub compaction_prepare_targets: Vec<String>,
-    /// Build rollout key-index files outside the table write lock. Exact
-    /// targets or '*'; empty retains legacy indexing. Commit remains fenced.
+    /// Build missing key indexes and extend incomplete key/BTree indexes outside
+    /// the table write lock. Exact rollout/registered targets or '*'; empty keeps
+    /// ordinary execution. Publication uses the existing ownership protocol.
+    /// Retained snapshot requests still run entirely under table ownership.
     #[arg(long, env = "INDEX_PREPARE_TARGETS", value_delimiter = ',')]
     pub index_prepare_targets: Vec<String>,
     /// Exact owned rollout targets whose dedicated publishers all use the
