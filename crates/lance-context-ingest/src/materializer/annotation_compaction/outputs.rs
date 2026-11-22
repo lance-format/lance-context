@@ -70,6 +70,15 @@ impl WrappingObjectStore for Wrapper {
             outputs: self.0.clone(),
         })
     }
+
+    fn wrap_paginated(
+        &self,
+        _prefix: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Only writes need interception. Preserve the backend's native LIST.
+        Some(original)
+    }
 }
 
 #[derive(Debug)]

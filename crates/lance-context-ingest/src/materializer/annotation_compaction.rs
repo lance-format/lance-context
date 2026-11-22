@@ -115,7 +115,8 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
     let Some(options) = &publisher.options.compaction else {
         return Ok(None);
     };
-    let output_bytes = publisher.ingress.client.max_descriptor_bytes();
+    let output_bytes = usize::try_from(publisher.ingress.client.max_descriptor_bytes())
+        .context("compaction output path budget exceeds address space")?;
     let workspace = options
         .workspace(publisher.ingress.scope.contract.max_record_bytes as usize)?
         .checked_add(output_bytes)
