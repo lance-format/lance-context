@@ -85,7 +85,7 @@ impl Runtime {
                 &publisher.storage,
                 &publisher.budget,
                 publisher.index_preparation.as_ref().map(|job| &job.source),
-                publisher.compaction_preparation.is_some(),
+                publisher.compaction_preparation.as_ref(),
             )
             .await
     }
@@ -386,7 +386,7 @@ impl Publisher {
                             &self.storage,
                             &self.budget,
                             self.index_preparation.as_ref().map(|job| &job.source),
-                            self.compaction_preparation.is_some(),
+                            self.compaction_preparation.as_ref(),
                         ),
                     )
                     .await?;

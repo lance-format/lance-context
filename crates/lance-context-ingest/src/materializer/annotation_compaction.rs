@@ -3,8 +3,11 @@ use super::*;
 use lance::dataset::optimize::RewriteResult;
 use lance::index::DatasetIndexExt;
 
+mod outputs;
+
 pub(crate) struct Preparation {
-    source: Dataset,
+    pub(crate) source: Dataset,
+    outputs: Arc<outputs::Outputs>,
     job: tokio::task::JoinHandle<Result<(RewriteResult, MergeReservation)>>,
 }
 
@@ -15,6 +18,10 @@ pub(crate) struct Ready {
 }
 
 impl Preparation {
+    pub(crate) fn protect_files(&self, candidates: &mut BTreeMap<object_store::path::Path, u64>) {
+        self.outputs.protect(candidates);
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         self.job.is_finished()
     }
@@ -108,8 +115,11 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
     let Some(options) = &publisher.options.compaction else {
         return Ok(None);
     };
-    let workspace =
-        options.workspace(publisher.ingress.scope.contract.max_record_bytes as usize)?;
+    let output_bytes = publisher.ingress.client.max_descriptor_bytes();
+    let workspace = options
+        .workspace(publisher.ingress.scope.contract.max_record_bytes as usize)?
+        .checked_add(output_bytes)
+        .context("compaction output workspace overflow")?;
     let publication = publisher.options.workspace(
         &publisher.ingress.scope.contract,
         publisher.options.max_source_bytes,
@@ -122,7 +132,11 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
         return Ok(None);
     }
     let source = compaction::read_compaction_base(publisher, version).await?;
-    if !source.manifest().uses_stable_row_ids() {
+    if !source.manifest().uses_stable_row_ids()
+        || source.object_store(None).await?.has_direct_local_paths()
+    {
+        // Direct local writers bypass ObjectStore. Keep their existing serial
+        // path; concurrent object-store writes must all register their outputs.
         return Ok(None);
     }
     let Some(task) = compaction::prepare_task(publisher, &source).await? else {
@@ -134,7 +148,30 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
     let Some(reservation) = publisher.budget.try_reserve(workspace) else {
         return Ok(None);
     };
-    let dataset = source.clone();
+    let outputs = outputs::Outputs::new(publisher.storage.base.clone(), output_bytes);
+    // Pin only this bounded task's inputs, not every old data file in the table.
+    for file in task
+        .task
+        .fragments
+        .iter()
+        .flat_map(|f| f.referenced_lance_files())
+    {
+        ensure!(
+            file.base_id.is_none(),
+            "background compaction has an external source"
+        );
+        outputs.register(
+            &publisher
+                .storage
+                .base
+                .clone()
+                .join("data")
+                .join(file.path.as_str()),
+        )?;
+    }
+    let wrapper: Arc<dyn lance_io::object_store::WrappingObjectStore> =
+        Arc::new(outputs::Wrapper(outputs.clone()));
+    let dataset = source.with_object_store_wrappers([wrapper]);
     let phases = publisher.phases.clone();
     let job = tokio::spawn(async move {
         let result = phases
@@ -147,5 +184,9 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
         // waits for another publication. No manifest is selected by this job.
         Ok((result, reservation))
     });
-    Ok(Some(Preparation { source, job }))
+    Ok(Some(Preparation {
+        source,
+        outputs,
+        job,
+    }))
 }

@@ -49,7 +49,11 @@ async fn exercise(change_source: bool, replace_owner: bool) -> Result<()> {
             interval: Duration::from_millis(5),
         })?;
     let original_ids = ids(&selected_body(&c, &narrow, &body).await?).await?;
-    let held = a.capture_turn_for_test("A").await?;
+    let held = if change_source {
+        None
+    } else {
+        Some(a.capture_turn_for_test("A").await?)
+    };
     let (entered, resume) = faults.pause_data_write();
     while runtime.compaction_preparation_finished_for_test().is_none() {
         // Body maintenance may run first. Only narrow writes use this fault.
@@ -57,6 +61,8 @@ async fn exercise(change_source: bool, replace_owner: bool) -> Result<()> {
     }
     let path = tokio::time::timeout(Duration::from_secs(20), entered).await??;
     let output = std::path::Path::new("/").join(path.as_ref());
+    let source_files = narrow_files(&c, &narrow).await?;
+    let mut obsolete_files = Vec::new();
     assert!(output.exists(), "the original native output must exist");
     assert_eq!(
         runtime.compaction_preparation_finished_for_test(),
@@ -74,8 +80,11 @@ async fn exercise(change_source: bool, replace_owner: bool) -> Result<()> {
     // publications prove that the native stall cannot merely be hidden there.
     for sequence in 1..=8 {
         let id = format!("new-{sequence}");
-        let batch = if change_source && sequence == 1 {
-            mixed::wire::patches(&patch(&["A"], Some("reviewed"), Some(0.9))?, &limits())?
+        let batch = if change_source {
+            mixed::wire::patches(
+                &patch(&["A"], Some("reviewed"), Some((sequence + 1) as f32 / 10.0))?,
+                &limits(),
+            )?
         } else {
             create(&[&id], &["s"], &[sequence as u8 + 10])?
         };
@@ -87,6 +96,17 @@ async fn exercise(change_source: bool, replace_owner: bool) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(a.source_observation().records, 0);
+        if change_source && sequence == 1 {
+            obsolete_files = narrow_files(&c, &narrow)
+                .await?
+                .difference(&source_files)
+                .cloned()
+                .collect();
+            assert!(
+                !obsolete_files.is_empty(),
+                "field update created no new narrow files"
+            );
+        }
         assert!(
             output.exists(),
             "GC deleted an unselected compaction output"
@@ -96,6 +116,24 @@ async fn exercise(change_source: bool, replace_owner: bool) -> Result<()> {
             Some(false)
         );
         last = Some(result);
+    }
+    // Keep the original native write paused while actual superseded update
+    // files are collected. No captured reader pins the compaction source in
+    // this case, so the job alone must keep its old inputs alive.
+    if change_source {
+        while obsolete_files.iter().any(|path| path.exists()) {
+            assert!(runtime.collect_once_for_test().await?);
+            assert_eq!(
+                runtime.compaction_preparation_finished_for_test(),
+                Some(false)
+            );
+            assert!(output.exists(), "GC deleted an in-flight native output");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            source_files.iter().all(|path| path.exists()),
+            "GC deleted the paused rewrite's source"
+        );
     }
     let before = annotation_publication::read(&c, &narrow, None).await?;
     let checkpoint = before
@@ -225,25 +263,46 @@ async fn exercise(change_source: bool, replace_owner: bool) -> Result<()> {
     for (id, stable) in &original_ids {
         assert_eq!(body_ids[id], *stable);
     }
-    assert_eq!(
-        held.annotations()
-            .resolve()
-            .await?
-            .unwrap()
-            .status
-            .as_deref(),
-        Some("pending")
-    );
-    let lance_context_core::annotation_staging::TurnBodySource::Materialized(old) =
-        held.body_source()
-    else {
-        anyhow::bail!("captured body has no materialized source");
-    };
-    let reference = BodySnapshot::read(old).await?.unwrap();
-    let cold_body = storage(root.path(), "body.lance").await?;
-    let captured =
-        mixed::load_body(&cold_body, &reference, &binding().incarnation.to_string()).await?;
-    assert_eq!(ids(&captured).await?, original_ids);
+    if let Some(held) = held {
+        assert_eq!(
+            held.annotations()
+                .resolve()
+                .await?
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("pending")
+        );
+        let lance_context_core::annotation_staging::TurnBodySource::Materialized(old) =
+            held.body_source()
+        else {
+            anyhow::bail!("captured body has no materialized source");
+        };
+        let reference = BodySnapshot::read(old).await?.unwrap();
+        let cold_body = storage(root.path(), "body.lance").await?;
+        let captured =
+            mixed::load_body(&cold_body, &reference, &binding().incarnation.to_string()).await?;
+        assert_eq!(ids(&captured).await?, original_ids);
+    }
     drop((a, runtime));
     c.shutdown().await
+}
+
+async fn narrow_files(
+    c: &network::Cluster,
+    storage: &Storage,
+) -> Result<std::collections::BTreeSet<std::path::PathBuf>> {
+    let dataset = annotation_publication::read(c, storage, None).await?;
+    Ok(dataset
+        .manifest()
+        .fragments
+        .iter()
+        .flat_map(|f| f.files.iter())
+        .map(|f| {
+            std::path::Path::new("/")
+                .join(storage.base.as_ref())
+                .join("data")
+                .join(&f.path)
+        })
+        .collect())
 }
