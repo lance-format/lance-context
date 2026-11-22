@@ -66,6 +66,15 @@ This sweep uses the existing stats scanner's inventory of nonempty tables, so
 keep `STATS_SCAN_INTERVAL_SECS` enabled too. It does not depend on `MIN_FRAGMENTS`,
 quiet hours, or the compaction interval. It can run with compaction disabled.
 
+Before enabling this sweep, clear `INDEX_PREPARE_TARGETS` on **all masters sharing
+the task queue**, including executors whose own periodic interval is disabled.
+Prepared index execution currently builds only the primary-key index and cannot
+fulfill secondary-index work discovered by this sweep. Startup rejects a positive
+`INDEX_INTERVAL_SECS` together with any `INDEX_PREPARE_TARGETS` selection (exact
+targets or `*`). Mixing ordinary periodic discovery and prepared-only index
+executors across replicas is unsupported. With the interval disabled, existing
+prepared-index behavior is unchanged; `COMPACTION_PREPARE_TARGETS` is independent.
+
 Only tables missing their configured key index or with uncovered fragments in
 that index or an existing BTree index get an `index_id` task. Checks read current
 manifest/index metadata, including fragment-reuse mappings, not row payloads.

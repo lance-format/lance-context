@@ -150,6 +150,7 @@ impl MasterState {
         mut config: MasterConfig,
         before_init_release: impl std::future::Future<Output = ()>,
     ) -> lance::Result<Arc<Self>> {
+        config.validate_index_sweep()?;
         config.validate_registered_store()?;
         let managed_workers =
             crate::worker_discovery::KubernetesWorkers::in_cluster(&config.worker_discovery)

@@ -6122,6 +6122,65 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn periodic_index_rejects_prepared_execution_with_uncovered_secondary() {
+        use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
+        use lance_index::{scalar::ScalarIndexParams, IndexType};
+
+        let dir = TempDir::new().unwrap();
+        let uri = format!("{}/exp.lance", dir.path().display());
+        let mut store = RolloutStore::open(&uri).await.unwrap();
+        store.add(&[rollout_record("old")]).await.unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        let mut dataset = lance::Dataset::open(&uri).await.unwrap();
+        dataset
+            .create_index_builder(
+                &["rollout_id"],
+                IndexType::BTree,
+                &ScalarIndexParams::default(),
+            )
+            .name("rollout_id_idx".into())
+            .await
+            .unwrap();
+        store.add(&[rollout_record("new")]).await.unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        store.create_id_key_index().await.unwrap();
+
+        let dataset = lance::Dataset::open(&uri).await.unwrap();
+        assert!(dataset
+            .unindexed_fragments("id_idx")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!dataset
+            .unindexed_fragments("rollout_id_idx")
+            .await
+            .unwrap()
+            .is_empty());
+        let version = dataset.version().version;
+        let indices = dataset.load_indices().await.unwrap();
+        for selection in ["exp", "*"] {
+            let mut cfg = config(&dir);
+            cfg.index_interval_secs = 60;
+            cfg.maintenance.index_prepare_targets = vec![selection.into()];
+            match MasterState::new(cfg).await {
+                Err(lance::Error::InvalidInput { source, .. }) => assert!(
+                    source.to_string().contains(
+                        "INDEX_INTERVAL_SECS cannot be enabled with INDEX_PREPARE_TARGETS"
+                    ),
+                    "{source}",
+                ),
+                Err(error) => panic!("expected unsupported-index-configuration error, got {error}"),
+                Ok(_) => panic!("periodic indexing accepted a key-only prepared executor"),
+            }
+        }
+        let unchanged = lance::Dataset::open(&uri).await.unwrap();
+        assert_eq!(unchanged.version().version, version);
+        assert_eq!(unchanged.load_indices().await.unwrap(), indices);
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn periodic_index_sweep_runs_without_merge_or_compaction() {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
