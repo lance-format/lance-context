@@ -53,7 +53,13 @@ impl Runtime {
 
     #[cfg(test)]
     pub(crate) async fn publish_once_for_test(&mut self) -> Result<()> {
-        self.publisher.publish_next().await
+        let mut reclamation = self.publisher.reclamation.take();
+        let result = self
+            .publisher
+            .publish_with_pending_delete(reclamation.as_mut())
+            .await;
+        self.publisher.reclamation = reclamation;
+        result
     }
 
     #[cfg(test)]
@@ -373,7 +379,6 @@ impl Publisher {
 
     async fn run(&mut self) -> Result<()> {
         let phases = self.service.shared.phases.clone();
-        let service = self.service.clone();
         let mut reclamation = self.reclamation.take();
         loop {
             if let Some(collector) = &mut reclamation {
@@ -399,25 +404,7 @@ impl Publisher {
                     continue;
                 }
             }
-            let result = if let Some(collector) =
-                reclamation.as_mut().filter(|c| c.has_pending_delete())
-            {
-                // Only an already fenced immutable DELETE overlaps publication.
-                // Keep driving its original future even if preparation awaits
-                // workspace held by the charged deletion page. No detached tasks.
-                let publication = self.publish_next();
-                tokio::pin!(publication);
-                loop {
-                    tokio::select! {
-                        result = &mut publication => break result,
-                        _ = tokio::time::sleep(Duration::from_millis(5)), if collector.has_pending_delete() => {
-                            collector.poll_pending_delete(&service).await?;
-                        }
-                    }
-                }
-            } else {
-                self.publish_next().await
-            };
+            let result = self.publish_with_pending_delete(reclamation.as_mut()).await;
             if let Err(error) = result {
                 if error.is::<materializer::retirement::HistoryUnknown>() {
                     // Retirement runs before freezing or preparing a new
@@ -437,6 +424,29 @@ impl Publisher {
                 return Err(error);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn publish_with_pending_delete(
+        &mut self,
+        collector: Option<&mut reclamation::Collector>,
+    ) -> Result<()> {
+        let Some(collector) = collector.filter(|c| c.has_pending_delete()) else {
+            return self.publish_next().await;
+        };
+        // Only an already fenced immutable DELETE overlaps publication.
+        // Drive its original future while publication waits for the page's
+        // workspace, including when a test steps the publisher manually.
+        let service = self.service.clone();
+        let publication = self.publish_next();
+        tokio::pin!(publication);
+        loop {
+            tokio::select! {
+                result = &mut publication => return result,
+                _ = tokio::time::sleep(Duration::from_millis(5)), if collector.has_pending_delete() => {
+                    collector.poll_pending_delete(&service).await?;
+                }
+            }
         }
     }
 
