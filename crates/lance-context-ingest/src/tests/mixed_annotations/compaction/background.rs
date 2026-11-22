@@ -178,7 +178,17 @@ async fn exercise(change_source: bool, replace_owner: bool) -> Result<()> {
             assert!(runtime.collect_once_for_test().await?);
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        check(&a, "A", "s", 1, "reviewed", Some(0.9)).await?;
+        // This fixture drives the runtime manually. A full turn read obtains
+        // a new quorum barrier, so keep its applier running through that cut
+        // just as Runtime::run does; publication need not run for this read.
+        let reading = a.clone();
+        let read =
+            tokio::spawn(async move { check(&reading, "A", "s", 1, "reviewed", Some(0.9)).await });
+        while !read.is_finished() {
+            runtime.apply_once_for_test().await?;
+            tokio::task::yield_now().await;
+        }
+        read.await??;
         // An invalidated job must not leave maintenance permanently deferred.
         while annotation_publication::read(&c, &narrow, None)
             .await?
