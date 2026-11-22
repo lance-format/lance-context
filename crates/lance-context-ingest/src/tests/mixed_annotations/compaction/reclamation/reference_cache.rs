@@ -21,9 +21,9 @@ async fn retained_body_reference_cache_keeps_exact_identity_without_pinning_data
     let state = annotation_publication::state(&c).await?;
     let manifests = state.manifests.as_ref().unwrap();
     let record = &manifests.versions[&manifests.head];
-    let expected = BodySnapshot::read(&annotation_publication::read(&c, &narrow, None).await?)
-        .await?
-        .unwrap();
+    let selected = annotation_publication::read(&c, &narrow, None).await?;
+    let expected = BodySnapshot::read(&selected).await?.unwrap();
+    drop(selected);
     let shared = LanceCache::with_capacity(64 << 10);
     let cache = shared.with_key_prefix("collector-a");
     let disabled = LanceCache::with_capacity(0);

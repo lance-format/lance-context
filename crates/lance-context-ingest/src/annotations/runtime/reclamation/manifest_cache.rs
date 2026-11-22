@@ -1,6 +1,6 @@
 //! Reuse immutable protection metadata within the existing session cache budget.
 use super::*;
-use lance::cache::{CacheKey, Context, DeepSizeOf, LanceCache};
+use lance::cache::{CacheKey, Context as CacheContext, DeepSizeOf, LanceCache};
 use lance_context_core::annotation_staging::BodySnapshot;
 use lance_io::object_store::ObjectStore;
 use lance_table::format::Manifest;
@@ -11,7 +11,7 @@ struct ManifestKey<'a>(&'a p::ManifestRecord);
 pub(crate) struct BodyReference(pub BodySnapshot);
 
 impl DeepSizeOf for BodyReference {
-    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+    fn deep_size_of_children(&self, context: &mut CacheContext) -> usize {
         self.0.table_instance.deep_size_of_children(context)
             + self.0.uri.deep_size_of_children(context)
             + self.0.transaction.deep_size_of_children(context)
