@@ -44,6 +44,10 @@ async fn queued_point_reads(control_requests: usize) -> Result<()> {
     )?;
     let (stop, task) = annotation_runtime::run_owner(runtime);
     let server = Server::start(owner.router(), None).await?;
+    // Forwarding reservations round up to MiB. Provision the larger test's
+    // separate byte budget so it reaches the HTTP limit, while retaining the
+    // single snapshot reader below it. Small-budget admission is tested apart.
+    let ingress_memory_bytes = control_requests.max(8) << 20;
     let (ga, a) = frontend_with_options(
         &c,
         &limits,
@@ -52,6 +56,7 @@ async fn queued_point_reads(control_requests: usize) -> Result<()> {
             control_requests,
             ..options()
         },
+        ingress_memory_bytes,
     )
     .await?;
     let (gb, b) = frontend_with_options(
@@ -62,6 +67,7 @@ async fn queued_point_reads(control_requests: usize) -> Result<()> {
             control_requests,
             ..options()
         },
+        ingress_memory_bytes,
     )
     .await?;
     let client = reqwest::Client::builder()

@@ -98,20 +98,21 @@ fn options() -> http::Options {
     }
 }
 async fn frontend(c: &network::Cluster, limits: &Limits, uri: &str) -> Result<(Forwarder, Server)> {
-    frontend_with_options(c, limits, uri, options()).await
+    frontend_with_options(c, limits, uri, options(), 8 << 20).await
 }
 async fn frontend_with_options(
     c: &network::Cluster,
     limits: &Limits,
     uri: &str,
     http_options: http::Options,
+    memory_bytes: usize,
 ) -> Result<(Forwarder, Server)> {
     let ingress = annotations::connect_ingress(
         c.client.clone(),
         annotation_publication::one_shard(),
         binding(),
         limits,
-        MergeMemoryBudget::new(8 << 20),
+        MergeMemoryBudget::new(memory_bytes),
     )
     .await?;
     let gateway = Forwarder::new(

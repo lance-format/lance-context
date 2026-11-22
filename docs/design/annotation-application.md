@@ -166,6 +166,9 @@ status filters and producer open/close requests share it, so size an ingress for
 the combined concurrency of its routes. Increasing it does not increase the
 byte budget or the owner's reader limit; requests beyond the configured limit
 still receive `request_capacity` before submission.
+Forwarding memory reservations round up to MiB, so even small control requests
+need one MiB of budget capacity each while in flight; account for concurrent
+uploads when choosing both limits.
 When comparing worker counts, compare the actual owner and ingress files,
 including their budgets and reader settings. Also check the selected Lance
 snapshot's index coverage and uncovered tail; enabling a policy does not mean
