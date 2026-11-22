@@ -5,7 +5,8 @@ use crate::tests::annotation_runtime::automatic_reclamation::deletion_faults::fa
 async fn background_compaction_preserves_rounded_body_writer_headroom() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(60), async {
         let root = tempfile::tempdir()?;
-        let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+        let c =
+            network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
         let narrow = fault_store::storage(
             &root.path().join("annotations.lance"),
             Arc::new(fault_store::Faults::default()),
