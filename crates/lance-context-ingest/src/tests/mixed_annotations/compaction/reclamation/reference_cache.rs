@@ -85,13 +85,16 @@ async fn retained_body_reference_cache_keeps_exact_identity_without_pinning_data
         &read(&cache, &ingress, &narrow, record).await?,
         &first
     ));
+    let deadline = lance_context_wal::replication::runtime::client::Options::default().timeout
+        + Duration::from_secs(5);
     for missing in [disabled, shared.with_key_prefix("collector-c")] {
-        assert!(tokio::time::timeout(
-            Duration::from_secs(5),
-            read(&missing, &ingress, &narrow, record),
-        )
-        .await?
-        .is_err());
+        // Let the real client's configured timeout report failure; an outer
+        // five-second timeout would cancel its thirty-second request first.
+        assert!(
+            tokio::time::timeout(deadline, read(&missing, &ingress, &narrow, record))
+                .await?
+                .is_err()
+        );
     }
     Ok(())
 }
