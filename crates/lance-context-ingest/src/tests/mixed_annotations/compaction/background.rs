@@ -2,6 +2,55 @@ use super::*;
 use crate::tests::annotation_runtime::automatic_reclamation::deletion_faults::fault_store;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn background_compaction_preserves_rounded_body_writer_headroom() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let root = tempfile::tempdir()?;
+        let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+        let narrow = fault_store::storage(
+            &root.path().join("annotations.lance"),
+            Arc::new(fault_store::Faults::default()),
+        )
+        .await?;
+        let body = storage(root.path(), "body.lance").await?;
+        fragmented(&c, &narrow, &body).await?;
+        // The background rewrite and mixed body writer each need four whole
+        // MiB permits, even though their nominal byte sum fits seven MiB.
+        let (a, mut runtime) = compact_owner_budget(&c, &narrow, &body, 7 << 20).await?;
+        while annotation_publication::read(&c, &narrow, None)
+            .await?
+            .fragments()
+            .len()
+            > 1
+        {
+            runtime.publish_once_for_test().await?;
+            assert_eq!(
+                runtime.compaction_preparation_finished_for_test(),
+                None,
+                "background rewrite leaves too few rounded permits for a body publication"
+            );
+        }
+        let p = producer(&a, 2).await?;
+        let input = request(
+            &a,
+            &p,
+            1,
+            encoded(create(&["after-compaction"], &["s"], &[9])?)?,
+        )
+        .await?;
+        let result = submit(&mut runtime, &a, input).await?;
+        while a.observation().await.0.materialized < result.index {
+            runtime.publish_once_for_test().await?;
+        }
+        let (stop, task) = annotation_runtime::run_owner(runtime);
+        check(&a, "after-compaction", "s", 9, "pending", None).await?;
+        stop.send(()).unwrap();
+        task.await??;
+        c.shutdown().await
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn background_compaction_keeps_draining_and_rebases_over_new_turns() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(90), exercise(false, false)).await?
 }
