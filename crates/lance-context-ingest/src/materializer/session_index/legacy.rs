@@ -1,5 +1,5 @@
-//! Extend an existing Lance 13 BTree with real stable IDs, without rebuilding
-//! its existing segments or mixing them with Lance 14 physical addresses.
+//! Build native BTree pages containing real stable IDs, including extension of
+//! existing Lance 13 indexes. Never mix them with physical-address segments.
 use super::*;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
@@ -18,6 +18,37 @@ mod merge;
 #[cfg(test)]
 mod tests;
 pub(super) use merge::merge;
+
+pub(super) async fn build_new(dataset: &Dataset, key: Key, ids: Vec<u32>) -> Result<IndexMetadata> {
+    let field = dataset
+        .schema()
+        .field(key.column())
+        .context("managed index column missing")?;
+    ensure!(
+        field.data_type() == DataType::Utf8,
+        "managed stable-ID BTree requires a string key"
+    );
+    // This definition references no existing pages. The low-level native
+    // writer below trains exactly once, from actual stable IDs. Even an
+    // untrained CreateIndexBuilder writes empty pages, so do not allocate a
+    // second, unused native index merely to obtain its BTree definition.
+    let template = IndexMetadata {
+        uuid: Uuid::new_v4(),
+        name: key.name().to_owned(),
+        fields: vec![field.id],
+        covering_fields: Vec::new(),
+        dataset_version: dataset.version_id(),
+        fragment_bitmap: Some(ids.iter().copied().collect()),
+        index_details: Some(Arc::new(prost_types::Any::from_msg(
+            &lance_index::pbold::BTreeIndexDetails::default(),
+        )?)),
+        index_version: 0,
+        created_at: None,
+        base_id: None,
+        files: None,
+    };
+    build(dataset, key, ids, &template).await
+}
 
 pub(super) async fn build(
     dataset: &Dataset,
@@ -120,7 +151,10 @@ pub(super) async fn build(
             Box::pin(RecordBatchStreamAdapter::new(schema, stream)),
             &store,
             DEFAULT_BTREE_BATCH_SIZE,
-            Some(ids),
+            // Each segment already has its own UUID directory. Fragment
+            // coverage lives in its manifest metadata; no partition-prefixed
+            // page names are needed for this canonical native segment.
+            None,
             None,
         )
         .await?,
