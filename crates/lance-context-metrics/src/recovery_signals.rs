@@ -27,6 +27,79 @@ const MAX_TARGET: usize = 1032;
 // Observation threshold, not a deadline: never cancel or retry a request here.
 const SLOW_READ: Duration = Duration::from_secs(5);
 
+/// Closed diagnostic vocabulary: never accepts error text or request parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFailureStage {
+    GenericStoreOpen,
+    GenericLookup,
+    GenericRefresh,
+    GenericRetryLookup,
+}
+
+impl ReadFailureStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GenericStoreOpen => "generic_store_open",
+            Self::GenericLookup => "generic_lookup",
+            Self::GenericRefresh => "generic_refresh",
+            Self::GenericRetryLookup => "generic_retry_lookup",
+        }
+    }
+}
+
+/// The typed error family, not a diagnosis of a storage provider's root cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFailureKind {
+    Internal,
+    Overloaded,
+    LanceIo,
+    LanceTimeout,
+    LanceArrow,
+    LanceOther,
+}
+
+impl ReadFailureKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Internal => "internal",
+            Self::Overloaded => "overloaded",
+            Self::LanceIo => "lance_io",
+            Self::LanceTimeout => "lance_timeout",
+            Self::LanceArrow => "lance_arrow",
+            Self::LanceOther => "lance_other",
+        }
+    }
+}
+
+/// In-process response extension. It never changes the HTTP body or headers.
+/// Sequence is process-local; correlate it with the observer's worker identity
+/// and this source's coverage_started_at_unix_millis, not across workers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadFailureDiagnostic {
+    sequence: u64,
+    stage: ReadFailureStage,
+    kind: ReadFailureKind,
+}
+
+impl ReadFailureDiagnostic {
+    pub fn new(stage: ReadFailureStage, kind: ReadFailureKind) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            sequence: NEXT.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+            stage,
+            kind,
+        }
+    }
+
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    fn value(self) -> serde_json::Value {
+        json!({"sequence": self.sequence, "stage": self.stage.label(), "kind": self.kind.label()})
+    }
+}
+
 #[derive(Clone)]
 struct ReadRequest {
     method: Method,
@@ -42,6 +115,7 @@ struct Entry {
     read_slow: Option<(Instant, u64, u16, u64)>,
     read_error_request: Option<ReadRequest>,
     read_slow_request: Option<ReadRequest>,
+    read_error_diagnostic: Option<ReadFailureDiagnostic>,
 }
 
 impl Entry {
@@ -53,6 +127,7 @@ impl Entry {
         if other.read_error.map(|v| v.0) > self.read_error.map(|v| v.0) {
             self.read_error = other.read_error;
             self.read_error_request = other.read_error_request.clone();
+            self.read_error_diagnostic = other.read_error_diagnostic;
         }
         if other.read_slow.map(|v| v.0) > self.read_slow.map(|v| v.0) {
             self.read_slow = other.read_slow;
@@ -155,6 +230,21 @@ impl Signals {
         elapsed: Option<Duration>,
         request: Option<(&Method, &str)>,
     ) {
+        self.record_with_diagnostic(target, read, status, now, wall, elapsed, request, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_with_diagnostic(
+        &self,
+        target: String,
+        read: bool,
+        status: StatusCode,
+        now: Instant,
+        wall: u64,
+        elapsed: Option<Duration>,
+        request: Option<(&Method, &str)>,
+        diagnostic: Option<ReadFailureDiagnostic>,
+    ) {
         let slow = elapsed.filter(|elapsed| read && *elapsed >= SLOW_READ);
         if !self.enabled
             || !(status.is_success()
@@ -180,6 +270,7 @@ impl Signals {
             read_slow: None,
             read_error_request: None,
             read_slow_request: None,
+            read_error_diagnostic: None,
         });
         entry.touched = now;
         entry.active_at = wall;
@@ -190,6 +281,8 @@ impl Signals {
         if read && status.is_server_error() {
             entry.read_error = Some((now, wall, status.as_u16()));
             entry.read_error_request = request.clone();
+            // A newer unannotated failure must not inherit an older diagnosis.
+            entry.read_error_diagnostic = diagnostic;
         }
         if let Some(elapsed) = slow {
             entry.read_slow = Some((
@@ -257,6 +350,7 @@ impl Signals {
                 "read_error_status": error.map(|(_, _, status)| status),
                 "read_error_method": error_request.map(|r| r.method.as_str()),
                 "read_error_route": error_request.map(|r| r.route.as_ref()),
+                "read_error_diagnostic": error.and(entry.read_error_diagnostic).map(ReadFailureDiagnostic::value),
                 "read_slow_at_unix_millis": slow.map(|(_, at, _, _)| at),
                 "read_slow_status": slow.map(|(_, _, status, _)| status),
                 "read_slow_header_millis": slow.map(|(_, _, _, millis)| millis),
@@ -414,10 +508,11 @@ pub(super) fn record(
     elapsed: Duration,
     method: &Method,
     matched_route: &str,
+    diagnostic: Option<ReadFailureDiagnostic>,
 ) {
     if let Some((name, true)) = target {
         if status.is_server_error() || elapsed >= SLOW_READ {
-            global().record_with_latency(
+            global().record_with_diagnostic(
                 name,
                 true,
                 status,
@@ -425,6 +520,7 @@ pub(super) fn record(
                 wall_millis(),
                 Some(elapsed),
                 Some((method, matched_route)),
+                diagnostic,
             );
         }
     }
@@ -465,6 +561,118 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use serde_json::Value;
+
+    #[tokio::test]
+    async fn diagnostic_tracks_the_same_failure_and_expires_with_it() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        let diagnostic =
+            ReadFailureDiagnostic::new(ReadFailureStage::GenericRefresh, ReadFailureKind::LanceIo);
+        signals.record_with_diagnostic(
+            "generic:test".into(),
+            true,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            now,
+            10,
+            Some(Duration::from_secs(8)),
+            Some((&Method::GET, "/api/v1/generic/{name}/rows/{id}")),
+            Some(diagnostic),
+        );
+        let snapshot = value(&signals, now).await;
+        let row = &snapshot["tables"][0];
+        assert_eq!(row["read_error_at_unix_millis"], 10);
+        assert_eq!(row["read_error_status"], 500);
+        assert_eq!(row["read_error_route"], "/api/v1/generic/{name}/rows/{id}");
+        assert_eq!(row["read_error_diagnostic"], diagnostic.value());
+        // Keep activity alive, but never extend the old failure's lifetime.
+        signals.record(
+            "generic:test".into(),
+            false,
+            StatusCode::OK,
+            now + WINDOW,
+            20,
+        );
+        let expired = value(&signals, now + WINDOW).await;
+        assert_eq!(expired["tables"][0]["read_error_diagnostic"], Value::Null);
+        assert_eq!(expired["tables"][0]["read_error_status"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn unannotated_error_replaces_reserve_diagnostic_without_misattribution() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        {
+            let _held = signals.shards[Signals::shard("t")].lock().unwrap();
+            signals.record_with_diagnostic(
+                "t".into(),
+                true,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                now,
+                10,
+                None,
+                None,
+                Some(ReadFailureDiagnostic::new(
+                    ReadFailureStage::GenericLookup,
+                    ReadFailureKind::Internal,
+                )),
+            );
+        }
+        signals.record(
+            "t".into(),
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            now + Duration::from_secs(1),
+            11,
+        );
+        let snapshot = value(&signals, now + Duration::from_secs(1)).await;
+        assert_eq!(snapshot["tables"][0]["read_error_status"], 503);
+        assert_eq!(snapshot["tables"][0]["read_error_at_unix_millis"], 11);
+        assert_eq!(snapshot["tables"][0]["read_error_diagnostic"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn successful_or_write_responses_cannot_install_read_diagnostics() {
+        let signals = Signals::new(true);
+        let now = Instant::now();
+        let diagnostic = ReadFailureDiagnostic::new(
+            ReadFailureStage::GenericStoreOpen,
+            ReadFailureKind::Internal,
+        );
+        for (read, status) in [
+            (true, StatusCode::OK),
+            (false, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            signals.record_with_diagnostic(
+                "t".into(),
+                read,
+                status,
+                now,
+                10,
+                None,
+                None,
+                Some(diagnostic),
+            );
+        }
+        assert_eq!(
+            value(&signals, now).await["tables"][0]["read_error_diagnostic"],
+            Value::Null
+        );
+        let disabled = Signals::new(false);
+        disabled.record_with_diagnostic(
+            "t".into(),
+            true,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            now,
+            10,
+            None,
+            None,
+            Some(diagnostic),
+        );
+        assert!(disabled
+            .shards
+            .iter()
+            .all(|shard| shard.lock().unwrap().is_empty()));
+    }
 
     async fn value(signals: &Signals, now: Instant) -> Value {
         let response = signals.snapshot("test-nonce", now);

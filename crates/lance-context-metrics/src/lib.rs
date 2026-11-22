@@ -27,6 +27,8 @@ pub mod etcd;
 mod recovery_signals;
 mod runtime_resources;
 
+pub use recovery_signals::{ReadFailureDiagnostic, ReadFailureKind, ReadFailureStage};
+
 /// Explicit histogram buckets (upper bounds, seconds) for request-scale latency
 /// metrics — anything matching the `_duration_seconds` suffix.
 ///
@@ -368,7 +370,17 @@ pub async fn http_metrics_layer(req: Request<axum::body::Body>, next: Next) -> R
     let recovery_target = recovery_signals::target(req.uri().path(), &path, &method);
     let response = next.run(req).await;
     let elapsed = start.elapsed();
-    recovery_signals::record(recovery_target, response.status(), elapsed, &method, &path);
+    recovery_signals::record(
+        recovery_target,
+        response.status(),
+        elapsed,
+        &method,
+        &path,
+        response
+            .extensions()
+            .get::<ReadFailureDiagnostic>()
+            .copied(),
+    );
 
     let status = response.status().as_u16().to_string();
     let elapsed = elapsed.as_secs_f64();
