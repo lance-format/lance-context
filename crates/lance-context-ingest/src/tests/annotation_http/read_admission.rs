@@ -84,12 +84,16 @@ async fn owned_point_reads_wait_for_bounded_admission_and_capture_after_publicat
     let observed = phase();
     let queued = observed.started - observed.completed - observed.cancelled;
     // The existing HTTP gate bounds waiters; there is no extra unbounded queue.
-    let overflow = post(&client, &server, "read")
+    let overflow = post(&client, &a, "read")
         .json(&PointRequest { turn: "T".into() })
         .send()
         .await?;
     let overflow_status = overflow.status();
     let overflow: serde_json::Value = overflow.json().await?;
+    assert_eq!(owner.observation().local_control_request_refusals, 1);
+    assert_eq!(owner.observation().local_data_request_refusals, 0);
+    assert_eq!(ga.observation().local_control_request_refusals, 0);
+    assert_eq!(gb.observation().local_control_request_refusals, 0);
 
     // Waiting reads must not hold the state lock or a stale base. Publish an
     // update while they wait, then require both ingress reads to see it.
