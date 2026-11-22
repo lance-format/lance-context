@@ -106,7 +106,17 @@ async fn queued_point_reads(control_requests: usize) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await?;
+    .await
+    .with_context(|| {
+        format!(
+            "read admission: phase={:?}, owner={:?}, ingress_a={:?}, ingress_b={:?}, finished={}",
+            phase(),
+            serde_json::to_value(owner.observation()).unwrap(),
+            serde_json::to_value(ga.observation()).unwrap(),
+            serde_json::to_value(gb.observation()).unwrap(),
+            reads.iter().filter(|read| read.is_finished()).count(),
+        )
+    })?;
     let observed = phase();
     let queued = observed.started - observed.completed - observed.cancelled;
     assert_eq!(owner.observation().control_inflight, control_requests);
