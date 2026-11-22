@@ -126,6 +126,13 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
         publisher.options.max_source_bytes,
         publisher.options.max_records,
     )?;
+    let publication = if publisher.ingress.scope.contract.policy == WritePolicy::TurnIngestion {
+        // Mixed first-create publication reserves half the budget for its body
+        // writer, even when the admitted source window is smaller.
+        publication.max(publisher.budget.limit() / 2)
+    } else {
+        publication
+    };
     if workspace
         .checked_add(publication)
         .is_none_or(|required| required > publisher.budget.limit())
@@ -146,9 +153,15 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
     if task.task.fragments.iter().any(|f| !f.overlays.is_empty()) {
         return Ok(None);
     }
+    // Probe both real reservations together: each is rounded independently to
+    // whole MiB permits, so adding their nominal byte counts is insufficient.
+    let Some(publication_headroom) = publisher.budget.try_reserve(publication) else {
+        return Ok(None);
+    };
     let Some(reservation) = publisher.budget.try_reserve(workspace) else {
         return Ok(None);
     };
+    drop(publication_headroom);
     let outputs = outputs::Outputs::new(publisher.storage.base.clone(), output_bytes);
     // Pin only this bounded task's inputs, not every old data file in the table.
     for file in task
