@@ -29,7 +29,9 @@ async fn exercise(body_pause: bool, restart: bool) -> Result<()> {
     };
     fragmented(&c, &narrow, &body).await?;
     let before_body_ids = ids(&selected_body(&c, &narrow, &body).await?).await?;
-    let (a, runtime) = compact_owner(&c, &narrow, &body).await?;
+    // Both native rewrite and publication fit separately, but not together.
+    // This exercises the bounded serial fallback and its original recovery.
+    let (a, runtime) = compact_owner_budget(&c, &narrow, &body, 4 << 20).await?;
     let (_, _, recovery_cut) = runtime.http_binding();
     let p = producer(&a, 2).await?;
     let (entered, resume) = faults.pause_data_write();

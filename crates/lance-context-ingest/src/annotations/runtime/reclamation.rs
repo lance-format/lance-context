@@ -172,6 +172,7 @@ impl Collector {
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
         index_source: Option<&Dataset>,
+        data_preparation: bool,
     ) -> Result<bool> {
         // A sealed page cannot gain paths. Its protection/fence completed before
         // any native preparation resumes; future publications use protected live
@@ -192,6 +193,12 @@ impl Collector {
             service.check_owner(catalog.authority()).await?;
             self.delete_page(service).await?;
             Ok(())
+        } else if data_preparation {
+            // A background rewrite may create data files whose names are not
+            // yet known to the publisher. Finish old sealed deletions above,
+            // but do not classify another page until this one job is selected
+            // or discarded. Its source and unselected output stay readable.
+            return Ok(!self.retirement_blocked);
         } else {
             self.collect_page(service, catalog, storage, budget, index_source)
                 .await

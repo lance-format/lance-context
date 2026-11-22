@@ -40,6 +40,8 @@ struct Publisher {
     compaction_checked_version: Option<u64>,
     maintenance_deferred_for_pressure: bool,
     index_preparation: Option<materializer::annotation_index::Preparation>,
+    compaction_preparation: Option<materializer::annotation_compaction::Preparation>,
+    compaction_retry_serial: bool,
     reclamation: Option<reclamation::Collector>,
 }
 
@@ -60,6 +62,32 @@ impl Runtime {
             .index_preparation
             .as_ref()
             .map(materializer::annotation_index::Preparation::is_finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compaction_preparation_finished_for_test(&self) -> Option<bool> {
+        self.publisher
+            .compaction_preparation
+            .as_ref()
+            .map(materializer::annotation_compaction::Preparation::is_finished)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn collect_once_for_test(&mut self) -> Result<bool> {
+        let publisher = &mut self.publisher;
+        publisher
+            .reclamation
+            .as_mut()
+            .context("test owner has no collector")?
+            .step(
+                &publisher.service,
+                &publisher.catalog,
+                &publisher.storage,
+                &publisher.budget,
+                publisher.index_preparation.as_ref().map(|job| &job.source),
+                publisher.compaction_preparation.is_some(),
+            )
+            .await
     }
 
     /// Enable data/manifest/transaction collection for an exclusively owned, unbranched
@@ -242,6 +270,8 @@ impl Runtime {
             compaction_checked_version: None,
             maintenance_deferred_for_pressure: false,
             index_preparation: None,
+            compaction_preparation: None,
+            compaction_retry_serial: false,
             reclamation: None,
         };
         let mut view = publisher.catalog.state().await?;
@@ -356,6 +386,7 @@ impl Publisher {
                             &self.storage,
                             &self.budget,
                             self.index_preparation.as_ref().map(|job| &job.source),
+                            self.compaction_preparation.is_some(),
                         ),
                     )
                     .await?;

@@ -3,6 +3,8 @@ use futures::TryStreamExt;
 use std::collections::BTreeMap;
 
 #[cfg(feature = "http")]
+mod background;
+#[cfg(feature = "http")]
 mod maintenance_pressure;
 #[cfg(feature = "service")]
 mod narrow_metadata;
@@ -25,6 +27,15 @@ pub(in crate::tests) async fn compact_owner(
     narrow: &Storage,
     body: &Storage,
 ) -> Result<(Service, service::runtime::Runtime)> {
+    compact_owner_budget(c, narrow, body, 8 << 20).await
+}
+
+async fn compact_owner_budget(
+    c: &network::Cluster,
+    narrow: &Storage,
+    body: &Storage,
+    publication_bytes: usize,
+) -> Result<(Service, service::runtime::Runtime)> {
     let state = annotation_publication::state(c).await?;
     service::runtime::Runtime::connect_mixed(
         c.client.clone(),
@@ -36,7 +47,7 @@ pub(in crate::tests) async fn compact_owner(
             limits: limits(),
             upload_budget: MergeMemoryBudget::new(8 << 20),
             apply_budget: MergeMemoryBudget::new(8 << 20),
-            publication_budget: MergeMemoryBudget::new(8 << 20),
+            publication_budget: MergeMemoryBudget::new(publication_bytes),
             publication: Options {
                 max_source_bytes: 1 << 20,
                 min_source_bytes: 1 << 20,
