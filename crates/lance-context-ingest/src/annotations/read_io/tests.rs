@@ -26,6 +26,45 @@ fn fixture(inner: Arc<dyn ObjectStore>) -> (Scope, ReadStore) {
 }
 
 #[tokio::test]
+async fn timing_does_not_poll_a_body_until_the_caller_requests_it() -> Result<()> {
+    use std::sync::atomic::AtomicUsize;
+    let (scope, store) = fixture(Arc::new(InMemory::new()));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let observed = polls.clone();
+    let bytes = Bytes::from_static(b"same allocation");
+    let expected = bytes.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut gated = Box::pin(stream::once(async move {
+        rx.await.map_err(|_| object_store::Error::Generic {
+            store: "test",
+            source: std::io::Error::other("sender dropped").into(),
+        })
+    }));
+    let inner = stream::poll_fn(move |cx| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        gated.as_mut().poll_next(cx)
+    });
+    let mut body = Body::new(
+        inner.boxed(),
+        store.begin(&Path::from("narrow/data/gated.lance")),
+    );
+    assert_eq!(polls.load(Ordering::Relaxed), 0);
+    assert!(futures::poll!(body.next()).is_pending());
+    assert_eq!(polls.load(Ordering::Relaxed), 1);
+    assert_eq!(scope.observation()[0].body_pending.samples, 0);
+    tx.send(bytes).unwrap();
+    let chunk = body.next().await.unwrap()?;
+    assert_eq!(chunk.as_ptr(), expected.as_ptr());
+    assert!(body.next().await.is_none());
+    // EOF records once even if the caller retains the exhausted stream.
+    let before_drop = serde_json::to_value(scope.observation())?;
+    assert_eq!(scope.observation()[0].body_pending.samples, 1);
+    drop(body);
+    assert_eq!(serde_json::to_value(scope.observation())?, before_drop);
+    Ok(())
+}
+
+#[tokio::test]
 async fn read_io_preserves_ranges_conditions_and_shared_buffers() -> Result<()> {
     let inner = Arc::new(InMemory::new());
     let bytes = Bytes::from_static(b"abcdefghijklmnop");
@@ -88,18 +127,18 @@ async fn read_io_observes_partial_failed_and_unpolled_bodies_without_read_ahead(
     let (scope, store) = fixture(Arc::new(InMemory::new()));
     let bytes = Bytes::from_static(b"shared");
     let path = Path::from("body/data/test.lance");
-    let mut body = Box::pin(Body {
-        inner: stream::iter([Ok(bytes.clone())])
+    let mut body = Box::pin(Body::new(
+        stream::iter([Ok(bytes.clone())])
             .chain(stream::pending())
             .boxed(),
-        read: store.begin(&path),
-    });
+        store.begin(&path),
+    ));
     assert_eq!(scope.observation()[0].bytes, 0);
     let chunk = body.next().await.unwrap()?;
     assert_eq!(chunk.as_ptr(), bytes.as_ptr());
     drop(body);
-    let body = Body {
-        inner: stream::iter([
+    let body = Body::new(
+        stream::iter([
             Ok(bytes.clone()),
             Err(object_store::Error::Generic {
                 store: "test",
@@ -107,13 +146,10 @@ async fn read_io_observes_partial_failed_and_unpolled_bodies_without_read_ahead(
             }),
         ])
         .boxed(),
-        read: store.begin(&path),
-    };
+        store.begin(&path),
+    );
     assert!(body.try_collect::<Vec<_>>().await.is_err());
-    drop(Body {
-        inner: stream::pending().boxed(),
-        read: store.begin(&path),
-    });
+    drop(Body::new(stream::pending().boxed(), store.begin(&path)));
     let rows = scope.observation();
     let row = &rows[0];
     assert_eq!(row.class, "body_data");
@@ -127,6 +163,10 @@ async fn read_io_observes_partial_failed_and_unpolled_bodies_without_read_ahead(
         ),
         (3, 0, 1, 2, 12)
     );
+    assert_eq!(row.response.samples, 3);
+    assert_eq!(row.body_unpolled.samples, 3);
+    assert_eq!(row.body_pending.samples, 3);
+    assert_eq!(row.body_poll.samples, 3);
     Ok(())
 }
 
@@ -144,6 +184,8 @@ async fn read_io_keeps_local_file_payload_and_path_boundaries() -> Result<()> {
     assert_eq!(result.bytes().await?, Bytes::from_static(b"file"));
     let row = &scope.observation()[0];
     assert_eq!((row.completed, row.bytes, row.file_payloads), (1, 0, 1));
+    assert_eq!(row.response.samples, 1);
+    assert_eq!(row.body_pending.samples, 0);
     for (path, expected) in [
         ("narrow-other/data/test.lance", 4),
         ("body/_indices/id/index.lance", 2),
