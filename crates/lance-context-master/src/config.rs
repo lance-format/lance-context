@@ -137,6 +137,13 @@ pub struct MasterConfig {
     #[arg(long, env = "INDEX_AFTER_COMPACTION", default_value_t = true, action = clap::ArgAction::Set)]
     pub index_after_compaction: bool,
 
+    /// Interval between independent base-table index coverage checks. Creates
+    /// missing key indexes and extends existing BTree indexes over new fragments,
+    /// without merging WAL or compacting data. Uses the stats scanner's table
+    /// inventory. `0` disables this sweep; manual/post-compaction tasks still run.
+    #[arg(long, env = "INDEX_INTERVAL_SECS", default_value_t = 0)]
+    pub index_interval_secs: u64,
+
     /// Deprecated compatibility flag. Owned merge executors now ensure the id
     /// index under the same execution fence as the merge; the master does not
     /// mutate the base table before admitting a worker.

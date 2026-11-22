@@ -15,6 +15,7 @@ use crate::{
 enum Sweep {
     Merge,
     Compact,
+    Index,
 }
 
 impl Sweep {
@@ -22,6 +23,7 @@ impl Sweep {
         match self {
             Self::Merge => "merge_wal",
             Self::Compact => "compact",
+            Self::Index => "index_id",
         }
     }
 
@@ -29,6 +31,7 @@ impl Sweep {
         match self {
             Self::Merge => state.config.merge_wal_interval_secs,
             Self::Compact => state.config.compaction_interval_secs,
+            Self::Index => state.config.index_interval_secs,
         }
     }
 
@@ -56,6 +59,10 @@ impl Sweep {
                     "options": scheduler::compact_options_key(&config),
                 })
             }
+            Self::Index => serde_json::json!({
+                "key_index_type": state.config.key_index_type.as_str(),
+                "managed_store_kind": state.config.managed_store_kind,
+            }),
         };
         // Exact, stable JSON avoids hash collisions and excludes Pod identity,
         // mounts, and execution capacity. The task store encodes key segments.
@@ -72,7 +79,7 @@ impl Sweep {
 }
 
 pub(crate) fn spawn(state: &Arc<MasterState>) -> Vec<JoinHandle<()>> {
-    [Sweep::Merge, Sweep::Compact]
+    [Sweep::Merge, Sweep::Compact, Sweep::Index]
         .into_iter()
         .filter(|kind| kind.interval(state) > 0)
         .map(|kind| {
@@ -139,6 +146,7 @@ async fn serve(state: &Arc<MasterState>, kind: Sweep, owner: CoordinationGuard) 
                 Sweep::Compact => {
                     scheduler::sweep_candidates_with_publisher(state, Some(&publisher)).await
                 }
+                Sweep::Index => crate::index_sweep::sweep(state, Some(&publisher)).await,
             };
             match result {
                 Ok(queued) => {

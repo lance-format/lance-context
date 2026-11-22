@@ -1,12 +1,12 @@
 //! Maintenance of registered tables using their persisted schema and indexes.
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use arrow_schema::Schema;
 use chrono::Utc;
-use lance::index::DatasetIndexExt;
+use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance::Result;
-use lance_context_core::{StorageBase, StorageBaseOptions};
+use lance_context_core::{KeyIndexType, StorageBase, StorageBaseOptions};
 use lance_index::optimize::OptimizeOptions;
 
 use crate::{state::MasterState, stats_store::StatRow};
@@ -37,10 +37,82 @@ pub(crate) async fn open(state: &MasterState, uri: &str) -> Result<StorageBase> 
     StorageBase::from_dataset(dataset, options).await
 }
 
-/// Maintain BTree indexes on a freshly opened registered store, then refresh its manifest.
-pub(crate) async fn maintain_indexes(store: &mut StorageBase) -> Result<()> {
-    indexed_dataset(store).await?;
-    store.reload().await
+#[derive(Default)]
+pub(crate) struct IndexWork {
+    create_key: bool,
+    extend: Vec<String>,
+}
+
+impl IndexWork {
+    pub(crate) fn needed(&self) -> bool {
+        self.create_key || !self.extend.is_empty()
+    }
+}
+
+/// Inspect index metadata, including Lance's fragment-reuse mapping and the union
+/// of same-name deltas. This never scans table rows or observes worker WAL.
+pub(crate) async fn index_work(store: &StorageBase, key_type: KeyIndexType) -> Result<IndexWork> {
+    let dataset = store.dataset();
+    let key_id = dataset
+        .schema()
+        .field(store.key_column())
+        .ok_or_else(|| lance::Error::invalid_input("missing declared key column"))?
+        .id;
+    let key_details = match key_type {
+        KeyIndexType::Btree => "BTreeIndexDetails",
+        KeyIndexType::Zonemap => "ZoneMapIndexDetails",
+    };
+    let mut work = IndexWork {
+        create_key: true,
+        ..Default::default()
+    };
+    let mut names = BTreeSet::new();
+    for index in dataset.load_indices().await?.iter() {
+        let Some(details) = &index.index_details else {
+            continue;
+        };
+        let is_key = index
+            .fields
+            .iter()
+            .copied()
+            .filter(|id| !index.covering_fields.contains(id))
+            .eq([key_id])
+            && details.type_url.ends_with(key_details);
+        work.create_key &= !is_key;
+        if is_key || details.type_url.ends_with("BTreeIndexDetails") {
+            names.insert(index.name.clone());
+        }
+    }
+    for name in names {
+        if !dataset.unindexed_fragments(&name).await?.is_empty() {
+            work.extend.push(name);
+        }
+    }
+    Ok(work)
+}
+
+/// Create a missing configured key index and extend only incomplete indexes.
+/// Callers hold the existing maintenance fence; a queued task rechecks current
+/// coverage so another index task completing first cannot force a rebuild.
+pub(crate) async fn maintain_indexes(
+    store: &mut StorageBase,
+    key_type: KeyIndexType,
+) -> Result<()> {
+    let mut work = index_work(store, key_type).await?;
+    if work.create_key {
+        store.create_configured_key_index().await?;
+        work = index_work(store, key_type).await?;
+    }
+    if !work.extend.is_empty() {
+        let mut dataset = store.dataset().clone();
+        // Merge existing deltas too: leaving a delta per update prevents data
+        // compaction from coalescing fragments with different index coverage.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(usize::MAX).index_names(work.extend))
+            .await?;
+        store.reload().await?;
+    }
+    Ok(())
 }
 
 /// Return the exact post-index handle; callers can retain it without opening latest.
@@ -111,6 +183,192 @@ mod tests {
     use arrow_schema::{DataType, Field};
     use clap::Parser;
     use lance::dataset::{Dataset, WriteParams};
+
+    #[tokio::test]
+    async fn index_maintenance_extends_all_btrees_and_skips_covered_tables() {
+        use lance::dataset::WriteMode;
+        use lance_index::{scalar::ScalarIndexParams, IndexType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("event_id", DataType::Int32, false),
+            Field::new("item_id", DataType::Int32, false),
+            Field::new("parent_item_id", DataType::Int32, false),
+        ]));
+        let rows = |value| {
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int32Array::from(vec![value])),
+                        Arc::new(Int32Array::from(vec![value / 2])),
+                        Arc::new(Int32Array::from(vec![0])),
+                    ],
+                )
+                .unwrap())],
+                schema.clone(),
+            )
+        };
+        let mut dataset = Dataset::write(rows(1), uri, None).await.unwrap();
+        for column in ["item_id", "parent_item_id"] {
+            dataset
+                .create_index_builder(&[column], IndexType::BTree, &ScalarIndexParams::default())
+                .await
+                .unwrap();
+        }
+        let mut store =
+            StorageBase::from_dataset(dataset, StorageBaseOptions::new(schema.clone(), "event_id"))
+                .await
+                .unwrap();
+        assert!(
+            index_work(&store, KeyIndexType::Btree)
+                .await
+                .unwrap()
+                .create_key
+        );
+        maintain_indexes(&mut store, KeyIndexType::Btree)
+            .await
+            .unwrap();
+        let version = store.version();
+        let fragments = store
+            .dataset()
+            .get_fragments()
+            .iter()
+            .map(|f| f.id())
+            .collect::<Vec<_>>();
+        let indices = store.dataset().load_indices().await.unwrap();
+        let btree_count = |indices: &[lance_table::format::IndexMetadata]| {
+            indices
+                .iter()
+                .filter(|index| {
+                    index
+                        .index_details
+                        .as_ref()
+                        .is_some_and(|details| details.type_url.ends_with("BTreeIndexDetails"))
+                })
+                .count()
+        };
+        assert_eq!(btree_count(&indices), 3);
+        assert!(!index_work(&store, KeyIndexType::Btree)
+            .await
+            .unwrap()
+            .needed());
+        maintain_indexes(&mut store, KeyIndexType::Btree)
+            .await
+            .unwrap();
+        assert_eq!(store.version(), version, "covered table must not commit");
+        assert_eq!(store.dataset().load_indices().await.unwrap(), indices);
+
+        Dataset::write(
+            rows(2),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        store.reload().await.unwrap();
+        let work = index_work(&store, KeyIndexType::Btree).await.unwrap();
+        assert!(!work.create_key);
+        assert_eq!(
+            work.extend.len(),
+            3,
+            "primary and both secondary indexes need new coverage"
+        );
+        maintain_indexes(&mut store, KeyIndexType::Btree)
+            .await
+            .unwrap();
+        assert!(!index_work(&store, KeyIndexType::Btree)
+            .await
+            .unwrap()
+            .needed());
+        assert_eq!(store.dataset().count_rows(None).await.unwrap(), 2);
+        assert_eq!(
+            store.dataset().get_fragments().len(),
+            2,
+            "indexing must not compact data"
+        );
+        assert_eq!(store.dataset().get_fragments()[0].id(), fragments[0]);
+
+        // Coverage is a union across deltas, not a requirement that each delta
+        // cover the entire table. A fully covered multi-delta index is a no-op.
+        let mut dataset = Dataset::write(
+            rows(3),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        assert!(btree_count(&dataset.load_indices().await.unwrap()) > 3);
+        store.reload().await.unwrap();
+        let version = store.version();
+        assert!(!index_work(&store, KeyIndexType::Btree)
+            .await
+            .unwrap()
+            .needed());
+        maintain_indexes(&mut store, KeyIndexType::Btree)
+            .await
+            .unwrap();
+        assert_eq!(store.version(), version);
+    }
+
+    #[tokio::test]
+    async fn index_maintenance_honors_configured_key_type() {
+        use lance::dataset::WriteMode;
+        for key_type in [KeyIndexType::Btree, KeyIndexType::Zonemap] {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "sequence",
+                DataType::Int32,
+                false,
+            )]));
+            let rows = || {
+                RecordBatchIterator::new(
+                    vec![Ok(RecordBatch::try_new(
+                        schema.clone(),
+                        vec![Arc::new(Int32Array::from(vec![1]))],
+                    )
+                    .unwrap())],
+                    schema.clone(),
+                )
+            };
+            let dataset = Dataset::write(rows(), uri, None).await.unwrap();
+            let mut options = StorageBaseOptions::new(schema.clone(), "sequence");
+            options.key_index_type = key_type;
+            let mut store = StorageBase::from_dataset(dataset, options).await.unwrap();
+            maintain_indexes(&mut store, key_type).await.unwrap();
+            Dataset::write(
+                rows(),
+                uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            store.reload().await.unwrap();
+            let work = index_work(&store, key_type).await.unwrap();
+            assert!(!work.create_key);
+            assert_eq!(work.extend.len(), 1);
+            maintain_indexes(&mut store, key_type).await.unwrap();
+            assert!(!index_work(&store, key_type).await.unwrap().needed());
+            let version = store.version();
+            maintain_indexes(&mut store, key_type).await.unwrap();
+            assert_eq!(store.version(), version);
+        }
+    }
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]

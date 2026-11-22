@@ -6865,6 +6865,7 @@ pub(crate) mod tests {
             compaction_batch_size: 8,
             compaction_max_source_fragments: 32,
             index_after_compaction: false,
+            index_interval_secs: 0,
             key_index_type: Default::default(),
             index_before_merge: false,
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,

@@ -828,11 +828,7 @@ async fn run_index_id(state: &Arc<MasterState>, target: &str) -> Result<String, 
         let mut store = crate::registered_store::open(state, &uri)
             .await
             .map_err(|e| e.to_string())?;
-        store
-            .create_configured_key_index()
-            .await
-            .map_err(|e| e.to_string())?;
-        crate::registered_store::maintain_indexes(&mut store)
+        crate::registered_store::maintain_indexes(&mut store, state.config.key_index_type)
             .await
             .map_err(|e| e.to_string())?;
         return Ok(format!(
@@ -853,8 +849,7 @@ async fn index_id_inner(state: &Arc<MasterState>, name: &str) -> Result<String, 
     let mut store = crate::registered_store::open(state, &uri)
         .await
         .map_err(|e| e.to_string())?;
-    store
-        .create_configured_key_index()
+    crate::registered_store::maintain_indexes(&mut store, state.config.key_index_type)
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!(
@@ -924,7 +919,7 @@ async fn run_prepared_index(
 }
 
 /// Resolve registration independently of the table's schema or maintenance API.
-async fn maintenance_uri(state: &MasterState, target: &str) -> Result<String, String> {
+pub(crate) async fn maintenance_uri(state: &MasterState, target: &str) -> Result<String, String> {
     match state.target_uri(target).await.map_err(|e| e.to_string())? {
         Some(uri) => Ok(uri),
         // Retain the historical URI convention for explicit legacy rollout
@@ -1271,7 +1266,7 @@ async fn sweep_merge_wal_inner(
     Ok(queued)
 }
 
-async fn enqueue_sweep_candidate(
+pub(crate) async fn enqueue_sweep_candidate(
     state: &Arc<MasterState>,
     publisher: Option<&crate::task_store::TaskStore>,
     kind: TaskKind,
@@ -1774,6 +1769,7 @@ mod tests {
             compaction_batch_size: 8,
             compaction_max_source_fragments: 32,
             index_after_compaction: false,
+            index_interval_secs: 0,
             key_index_type: Default::default(),
             index_before_merge: false,
             compaction_max_bytes_per_file: 1024 * 1024 * 1024,
@@ -6010,6 +6006,161 @@ mod tests {
             "fan-out must never have more than one worker merging at a time"
         );
         worker.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn index_sweep_is_independent_deduplicated_and_respects_cooldown() {
+        use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+        use arrow_schema::{DataType, Field, Schema};
+        use lance::{
+            dataset::{WriteMode, WriteParams},
+            Dataset,
+        };
+
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.managed_store_kind = Some("events".into());
+        cfg.min_fragments = 8;
+        cfg.task_cooldown_after_failures = 1;
+        let state = MasterState::new(cfg).await.unwrap();
+        assert!(crate::periodic_sweep::spawn(&state).is_empty());
+        let uri = format!("{}/events.lance", dir.path().display());
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_id",
+            DataType::Int32,
+            false,
+        )
+        .with_metadata(
+            [("lance-schema:unenforced-primary-key".into(), "true".into())].into(),
+        )]));
+        let rows = |value| {
+            RecordBatchIterator::new(
+                vec![Ok(RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(Int32Array::from(vec![value]))],
+                )
+                .unwrap())],
+                schema.clone(),
+            )
+        };
+        Dataset::write(rows(1), &uri, None).await.unwrap();
+        state
+            .managed_registry
+            .as_ref()
+            .unwrap()
+            .upsert("table", &uri)
+            .await
+            .unwrap();
+        let (mut row, _, _) = crate::registered_store::observe(&state, "events:table", &uri, None)
+            .await
+            .unwrap();
+        // Resolve the registry at inspection time, not an old URI in _stats.
+        row.uri = "missing-old-location".into();
+        state.stats.lock().await.upsert(&row).await.unwrap();
+        let mut skipped = row.clone();
+        skipped.name = "generic:excluded".into();
+        state.stats.lock().await.upsert(&skipped).await.unwrap();
+        skipped.name = "events:missing".into();
+        state.stats.lock().await.upsert(&skipped).await.unwrap();
+        assert_eq!(sweep_candidates(&state).await.unwrap(), 0);
+        assert_eq!(crate::index_sweep::sweep(&state, None).await.unwrap(), 1);
+        assert_eq!(crate::index_sweep::sweep(&state, None).await.unwrap(), 0);
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        assert_eq!(claim.task.kind, TaskKind::IndexId);
+        assert_eq!(claim.task.target, "events:table");
+        let id = claim.task.id.clone();
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        assert_eq!(
+            state.task_store.get(&id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        assert_eq!(crate::index_sweep::sweep(&state, None).await.unwrap(), 0);
+        let dataset = Dataset::open(&uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+        assert!(dataset.tags().list().await.unwrap().is_empty());
+        let version = dataset.version().version;
+        // A task already queued when another builder finishes must also no-op.
+        run_index_id(&state, "events:table").await.unwrap();
+        assert_eq!(
+            Dataset::open(&uri).await.unwrap().version().version,
+            version
+        );
+
+        Dataset::write(
+            rows(2),
+            &uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        // No stats refresh: coverage must still detect the new fragment.
+        assert_eq!(crate::index_sweep::sweep(&state, None).await.unwrap(), 1);
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        state
+            .task_store
+            .finish(claim, Err("temporary index failure".into()))
+            .await
+            .unwrap();
+        assert!(state
+            .task_store
+            .is_cooling_down(TaskKind::IndexId, "events:table")
+            .await
+            .unwrap());
+        assert_eq!(crate::index_sweep::sweep(&state, None).await.unwrap(), 0);
+        assert!(state
+            .task_store
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .all(|task| task.kind == TaskKind::IndexId));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn periodic_index_sweep_runs_without_merge_or_compaction() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.index_interval_secs = 60;
+        let first = MasterState::new(cfg.clone()).await.unwrap();
+        let mut store = RolloutStore::open(&first.rollout_uri("small"))
+            .await
+            .unwrap();
+        store.add(&[rollout_record("a")]).await.unwrap();
+        store.cleanup_own_shard().await.unwrap();
+        let (row, _, _) =
+            crate::registered_store::observe(&first, "small", &first.rollout_uri("small"), None)
+                .await
+                .unwrap();
+        first.stats.lock().await.upsert(&row).await.unwrap();
+        let second = MasterState::new(cfg).await.unwrap();
+        let first_handles = crate::periodic_sweep::spawn(&first);
+        let second_handles = crate::periodic_sweep::spawn(&second);
+        assert_eq!(first_handles.len(), 1);
+        assert_eq!(second_handles.len(), 1);
+        let claim = periodic_wait_claim(&first).await;
+        assert_eq!(claim.task.kind, TaskKind::IndexId);
+        assert_eq!(claim.task.target, "small");
+        let id = claim.task.id.clone();
+        run_task(&first, claim, TaskClaimTiming::default()).await;
+        assert_eq!(
+            first.task_store.get(&id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        first.admission.begin_drain();
+        second.admission.begin_drain();
+        for handle in first_handles.into_iter().chain(second_handles) {
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(first.task_store.list().await.unwrap().len(), 1);
+        store.close().await.unwrap();
     }
 
     /// The compaction sweep must not enqueue generic rows: the master does not
