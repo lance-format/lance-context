@@ -98,6 +98,14 @@ fn options() -> http::Options {
     }
 }
 async fn frontend(c: &network::Cluster, limits: &Limits, uri: &str) -> Result<(Forwarder, Server)> {
+    frontend_with_options(c, limits, uri, options()).await
+}
+async fn frontend_with_options(
+    c: &network::Cluster,
+    limits: &Limits,
+    uri: &str,
+    http_options: http::Options,
+) -> Result<(Forwarder, Server)> {
     let ingress = annotations::connect_ingress(
         c.client.clone(),
         annotation_publication::one_shard(),
@@ -109,7 +117,7 @@ async fn frontend(c: &network::Cluster, limits: &Limits, uri: &str) -> Result<(F
     let gateway = Forwarder::new(
         vec![(ingress, uri.into())],
         keys()?,
-        options(),
+        http_options,
         TOKEN.into(),
     )?;
     let server = Server::start(gateway.router(), None).await?;

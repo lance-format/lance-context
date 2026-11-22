@@ -35,6 +35,8 @@ pub const SEQUENCE: &str = "x-lance-sequence";
 #[serde(default, deny_unknown_fields)]
 pub struct Options {
     pub data_requests: usize,
+    /// Concurrent reads and producer lifecycle requests, across all routed
+    /// shards. Request/response bytes retain their independent memory budget.
     pub control_requests: usize,
     pub admission_timeout: Duration,
     pub body_idle_timeout: Duration,
@@ -124,7 +126,7 @@ impl Gateway {
         );
         ensure!(
             (1..=256).contains(&options.data_requests)
-                && (1..=64).contains(&options.control_requests)
+                && (1..=256).contains(&options.control_requests)
                 && (Duration::from_millis(1)..=Duration::from_secs(30))
                     .contains(&options.admission_timeout)
                 && (Duration::from_millis(1)..=Duration::from_secs(60))

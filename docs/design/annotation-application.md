@@ -161,6 +161,11 @@ file. `http.options.data_requests`, `http.options.control_requests` and
 `ingress_memory_bytes` apply separately to each process. An ingress shares its
 admission budget across its routes; each owner has its own apply and publication
 budgets. A bootstrap file is not evidence of the settings used by either role.
+The control limit accepts 1–256 concurrent requests (default 16). Point reads,
+status filters and producer open/close requests share it, so size an ingress for
+the combined concurrency of its routes. Increasing it does not increase the
+byte budget or the owner's reader limit; requests beyond the configured limit
+still receive `request_capacity` before submission.
 When comparing worker counts, compare the actual owner and ingress files,
 including their budgets and reader settings. Also check the selected Lance
 snapshot's index coverage and uncovered tail; enabling a policy does not mean
