@@ -4,6 +4,9 @@
 //! data, body data, indices, metadata and other. These are process-wide store API
 //! calls and delivered bytes, not caller attribution or HTTP/wire accounting.
 //! Failed and dropped reads are separate; local file payload bytes are unknown.
+//! Response timing ends at headers (GET) or API return (HEAD/ranges). Stream
+//! timing separates unpolled caller delay, Pending wait and time inside poll.
+//! Pending/response timing includes executor delay; neither is server latency.
 //! The existing scheme-level metrics and shared store/cache identity are retained.
 use anyhow::{bail, Context, Result};
 use lance_context_ingest::application::{annotations, Config};

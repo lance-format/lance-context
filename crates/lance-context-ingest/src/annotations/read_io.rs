@@ -22,7 +22,11 @@ use std::{
         Arc,
     },
     task::{Context as TaskContext, Poll},
+    time::Instant,
 };
+
+mod timing;
+use timing::{BodyTiming, Elapsed, ElapsedObservation};
 
 const CLASSES: [&str; 5] = ["narrow_data", "body_data", "index", "metadata", "other"];
 
@@ -36,6 +40,10 @@ struct Counts {
     heads: AtomicU64,
     ranges: AtomicU64,
     file_payloads: AtomicU64,
+    response: Elapsed,
+    body_unpolled: Elapsed,
+    body_pending: Elapsed,
+    body_poll: Elapsed,
 }
 
 /// GET completes at stream EOF; a dropped future/body is counted separately.
@@ -52,6 +60,15 @@ pub(crate) struct Observation {
     heads: u64,
     ranges: u64,
     file_payloads: u64,
+    // GET: until response headers; HEAD/ranges: until return. Includes backend
+    // retries and executor delay, not just server latency. Includes cancellation.
+    response: ElapsedObservation,
+    // Per-stream totals recorded at EOF, error or drop. Pending includes source
+    // and executor wait; unpolled is caller delay between ready chunks/polls.
+    // A local file handle has no observable body timing and remains unchanged.
+    body_unpolled: ElapsedObservation,
+    body_pending: ElapsedObservation,
+    body_poll: ElapsedObservation,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +178,10 @@ impl Scope {
                     heads: c.heads.load(Ordering::Relaxed),
                     ranges: c.ranges.load(Ordering::Relaxed),
                     file_payloads: c.file_payloads.load(Ordering::Relaxed),
+                    response: c.response.observation(),
+                    body_unpolled: c.body_unpolled.observation(),
+                    body_pending: c.body_pending.observation(),
+                    body_poll: c.body_poll.observation(),
                 }
             })
             .filter(|row| row.started != 0)
@@ -252,6 +273,7 @@ impl ReadStore {
             counts: self.counts.clone(),
             class,
             finished: false,
+            response_started: Some(Instant::now()),
         }
     }
 }
@@ -260,13 +282,20 @@ struct Read {
     counts: Arc<[Counts; 5]>,
     class: usize,
     finished: bool,
+    response_started: Option<Instant>,
 }
 
 impl Read {
     fn counts(&self) -> &Counts {
         &self.counts[self.class]
     }
+    fn response(&mut self) {
+        if let Some(start) = self.response_started.take() {
+            self.counts().response.record(start.elapsed());
+        }
+    }
     fn finish(&mut self, failed: bool) {
+        self.response();
         if !self.finished {
             let counter = if failed {
                 &self.counts().failed
@@ -281,6 +310,7 @@ impl Read {
 
 impl Drop for Read {
     fn drop(&mut self) {
+        self.response();
         if !self.finished {
             self.counts().dropped.fetch_add(1, Ordering::Relaxed);
         }
@@ -290,13 +320,33 @@ impl Drop for Read {
 struct Body {
     inner: BoxStream<'static, object_store::Result<Bytes>>,
     read: Read,
+    timing: BodyTiming,
+}
+
+impl Body {
+    fn new(inner: BoxStream<'static, object_store::Result<Bytes>>, mut read: Read) -> Self {
+        read.response();
+        Self {
+            inner,
+            read,
+            timing: BodyTiming::new(Instant::now()),
+        }
+    }
+}
+
+impl Drop for Body {
+    fn drop(&mut self) {
+        self.timing.finish(Instant::now(), self.read.counts());
+    }
 }
 
 impl Stream for Body {
     type Item = object_store::Result<Bytes>;
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        this.timing.before_poll(Instant::now());
         let result = this.inner.as_mut().poll_next(cx);
+        this.timing.after_poll(Instant::now(), result.is_pending());
         match &result {
             Poll::Ready(Some(Ok(bytes))) => {
                 this.read
@@ -304,8 +354,14 @@ impl Stream for Body {
                     .bytes
                     .fetch_add(bytes.len() as u64, Ordering::Relaxed);
             }
-            Poll::Ready(Some(Err(_))) => this.read.finish(true),
-            Poll::Ready(None) => this.read.finish(false),
+            Poll::Ready(Some(Err(_))) => {
+                this.timing.finish(Instant::now(), this.read.counts());
+                this.read.finish(true);
+            }
+            Poll::Ready(None) => {
+                this.timing.finish(Instant::now(), this.read.counts());
+                this.read.finish(false);
+            }
             Poll::Pending => {}
         }
         result
@@ -327,13 +383,14 @@ impl ObjectStore for ReadStore {
                 return Err(error);
             }
         };
+        read.response();
         if head {
             read.finish(false);
             return Ok(result);
         }
         result.payload = match result.payload {
             GetResultPayload::Stream(inner) => {
-                GetResultPayload::Stream(Box::pin(Body { inner, read }))
+                GetResultPayload::Stream(Box::pin(Body::new(inner, read)))
             }
             payload => {
                 read.counts().file_payloads.fetch_add(1, Ordering::Relaxed);
