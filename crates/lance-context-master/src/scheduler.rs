@@ -864,7 +864,7 @@ async fn run_prepared_index(
     claim: &mut TaskClaim,
 ) -> Result<String, String> {
     crate::merge_capacity::phase("preparing_index");
-    let uri = state.rollout_uri(&claim.task.target);
+    let uri = maintenance_uri(state, &claim.task.target).await?;
     let scope = lance_context_core::merge_write_scope::MergeWriteScope::with_preparation_authorizer(
         Arc::new(PreparationOnly),
     );
@@ -873,12 +873,10 @@ async fn run_prepared_index(
         "index file preparation started without table ownership");
     let prepared = {
         let work = scope.run(async {
-            let store =
-                RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
-                    .await
-                    .map_err(|e| e.to_string())?;
-            store
-                .prepare_id_key_index()
+            let store = crate::registered_store::open(state, &uri)
+                .await
+                .map_err(|e| e.to_string())?;
+            crate::registered_store::prepare_indexes(&store, state.config.key_index_type)
                 .await
                 .map_err(|e| e.to_string())
         });
@@ -899,17 +897,16 @@ async fn run_prepared_index(
     crate::maintenance_execution::reconcile_previous(state, claim).await?;
     let started = std::time::Instant::now();
     let result = crate::maintenance_execution::run(state, claim, async {
-        let mut store =
-            RolloutStore::open_existing_with_options(&uri, state.rollout_store_options())
-                .await
-                .map_err(|e| e.to_string())?;
-        store
-            .commit_prepared_id_key_index(prepared)
+        let mut store = crate::registered_store::open(state, &uri)
+            .await
+            .map_err(|e| e.to_string())?;
+        crate::registered_store::commit_prepared_indexes(&mut store, prepared)
             .await
             .map_err(|e| e.to_string())?;
         Ok(format!(
-            "built {} index on id (prepared outside write lock)",
-            state.config.key_index_type.as_str()
+            "maintained {} key index on {} and existing BTree indexes (prepared outside write lock)",
+            state.config.key_index_type.as_str(),
+            store.key_column(),
         ))
     })
     .await;
@@ -4877,7 +4874,7 @@ mod tests {
             assert_eq!(
                 status.detail,
                 Some(format!(
-                    "built {} index on id (prepared outside write lock)",
+                    "maintained {} key index on id and existing BTree indexes (prepared outside write lock)",
                     kind.as_str()
                 ))
             );
@@ -6122,12 +6119,12 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
-    async fn periodic_index_rejects_prepared_execution_with_uncovered_secondary() {
+    async fn periodic_index_prepared_execution_updates_uncovered_secondary() {
         use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
         use lance_index::{scalar::ScalarIndexParams, IndexType};
 
         let dir = TempDir::new().unwrap();
-        let uri = format!("{}/exp.lance", dir.path().display());
+        let uri = format!("{}/exp.rollout.lance", dir.path().display());
         let mut store = RolloutStore::open(&uri).await.unwrap();
         store.add(&[rollout_record("old")]).await.unwrap();
         store.cleanup_own_shard().await.unwrap();
@@ -6156,26 +6153,61 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        let version = dataset.version().version;
-        let indices = dataset.load_indices().await.unwrap();
-        for selection in ["exp", "*"] {
-            let mut cfg = config(&dir);
-            cfg.index_interval_secs = 60;
-            cfg.maintenance.index_prepare_targets = vec![selection.into()];
-            match MasterState::new(cfg).await {
-                Err(lance::Error::InvalidInput { source, .. }) => assert!(
-                    source.to_string().contains(
-                        "INDEX_INTERVAL_SECS cannot be enabled with INDEX_PREPARE_TARGETS"
-                    ),
-                    "{source}",
-                ),
-                Err(error) => panic!("expected unsupported-index-configuration error, got {error}"),
-                Ok(_) => panic!("periodic indexing accepted a key-only prepared executor"),
-            }
-        }
-        let unchanged = lance::Dataset::open(&uri).await.unwrap();
-        assert_eq!(unchanged.version().version, version);
-        assert_eq!(unchanged.load_indices().await.unwrap(), indices);
+        let primary_before = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|index| index.name == "id_idx")
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut cfg = config(&dir);
+        cfg.index_interval_secs = 60;
+        cfg.maintenance.index_prepare_targets = vec!["*".into()];
+        cfg.merge_rollout.owned_targets = vec!["exp".into()];
+        let state = MasterState::new(cfg).await.unwrap();
+        let (row, _, _) = crate::registered_store::observe(&state, "exp", &uri, None)
+            .await
+            .unwrap();
+        state.stats.lock().await.upsert(&row).await.unwrap();
+        assert_eq!(crate::index_sweep::sweep(&state, None).await.unwrap(), 1);
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        assert!(claim.preparing_maintenance());
+        let task_id = claim.task.id.clone();
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        let done = state.task_store.get(&task_id).await.unwrap().unwrap();
+        assert_eq!(done.state, TaskState::Done, "{done:?}");
+        let current = lance::Dataset::open(&uri).await.unwrap();
+        assert!(current
+            .unindexed_fragments("rollout_id_idx")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            primary_before,
+            current
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|index| index.name == "id_idx")
+                .cloned()
+                .collect::<Vec<_>>(),
+            "a fully covered primary must not be rebuilt for secondary work"
+        );
+        let version = current.version().version;
+        assert_eq!(crate::index_sweep::sweep(&state, None).await.unwrap(), 0);
+        let task = enqueue(&state, TaskKind::IndexId, "exp").await.unwrap();
+        let claim = state.task_store.claim_next().await.unwrap().unwrap();
+        run_task(&state, claim, TaskClaimTiming::default()).await;
+        assert_eq!(
+            state.task_store.get(&task.id).await.unwrap().unwrap().state,
+            TaskState::Done
+        );
+        assert_eq!(
+            lance::Dataset::open(&uri).await.unwrap().version().version,
+            version
+        );
         store.close().await.unwrap();
     }
 
@@ -6264,6 +6296,16 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires ETCD_TEST_ENDPOINTS"]
     async fn registered_index_snapshot_is_optional_and_persists_its_exact_version() {
+        check_registered_index_snapshot(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ETCD_TEST_ENDPOINTS"]
+    async fn registered_index_snapshot_keeps_ownership_with_prepared_execution() {
+        check_registered_index_snapshot(true).await;
+    }
+
+    async fn check_registered_index_snapshot(prepared: bool) {
         use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
         use arrow_schema::{DataType, Field, Schema};
         use axum::{extract::State, Json};
@@ -6274,6 +6316,10 @@ mod tests {
         let mut cfg = config(&dir);
         cfg.managed_store_kind = Some("events".into());
         cfg.key_index_type = lance_context_core::KeyIndexType::Btree;
+        if prepared {
+            cfg.maintenance.index_prepare_targets = vec!["*".into()];
+            cfg.index_interval_secs = 60;
+        }
         let state = MasterState::new(cfg).await.unwrap();
         let uri = format!("{}/snapshot.lance", dir.path().display());
         let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)
@@ -6311,6 +6357,7 @@ mod tests {
         .unwrap();
         let claim = state.task_store.claim_next().await.unwrap().unwrap();
         assert_eq!(claim.task.id, normal.id);
+        assert_eq!(claim.preparing_maintenance(), prepared);
         run_task(&state, claim, TaskClaimTiming::default()).await;
         let normal = state.task_store.get(&normal.id).await.unwrap().unwrap();
         assert_eq!(normal.state, TaskState::Done, "{normal:?}");
@@ -6346,8 +6393,15 @@ mod tests {
         assert_ne!(second.id, ordinary.id);
         for _ in 0..3 {
             let claim = state.task_store.claim_next().await.unwrap().unwrap();
-            // Snapshot tasks use the same table ownership as ordinary maintenance.
-            assert!(state.task_store.claim_next().await.unwrap().is_none());
+            if claim.task.snapshot_tag.is_some() {
+                assert!(
+                    !claim.preparing_maintenance(),
+                    "snapshots must hold table ownership from the start"
+                );
+            }
+            if !prepared {
+                assert!(state.task_store.claim_next().await.unwrap().is_none());
+            }
             run_task(&state, claim, TaskClaimTiming::default()).await;
         }
         for task in [first, second] {

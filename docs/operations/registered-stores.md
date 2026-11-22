@@ -66,14 +66,21 @@ This sweep uses the existing stats scanner's inventory of nonempty tables, so
 keep `STATS_SCAN_INTERVAL_SECS` enabled too. It does not depend on `MIN_FRAGMENTS`,
 quiet hours, or the compaction interval. It can run with compaction disabled.
 
-Before enabling this sweep, clear `INDEX_PREPARE_TARGETS` on **all masters sharing
-the task queue**, including executors whose own periodic interval is disabled.
-Prepared index execution currently builds only the primary-key index and cannot
-fulfill secondary-index work discovered by this sweep. Startup rejects a positive
-`INDEX_INTERVAL_SECS` together with any `INDEX_PREPARE_TARGETS` selection (exact
-targets or `*`). Mixing ordinary periodic discovery and prepared-only index
-executors across replicas is unsupported. With the interval disabled, existing
-prepared-index behavior is unchanged; `COMPACTION_PREPARE_TARGETS` is independent.
+Set `INDEX_PREPARE_TARGETS=*` to reuse the existing prepared executor for
+rollout and registered tables (or select exact targets). Ordinary and prepared
+execution share the same coverage plan. Missing key indexes use the existing
+uncommitted key builder; incomplete indexes use Lance's incremental optimize
+plan/build/merge stages. Preparation writes immutable files without holding the
+table writer. Publication acquires the existing maintenance ownership, with
+`INDEX_COMMIT_WAIT_SECS` bounding time without progress from the current writer.
+Source rewrites or same-index changes invalidate preparation and require retry;
+concurrent appends remain valid and are indexed by a later pass.
+
+Upgrade all index executors sharing the queue before enabling periodic discovery:
+older prepared executors only maintain the primary key. This setting does not
+enable native merge or compaction preparation for registered stores. Retained
+snapshot requests always keep their existing full-coverage validation and tag
+creation under table ownership, even with `INDEX_PREPARE_TARGETS=*`.
 
 Only tables missing their configured key index or with uncovered fragments in
 that index or an existing BTree index get an `index_id` task. Checks read current

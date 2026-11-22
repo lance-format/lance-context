@@ -75,6 +75,9 @@ use crate::store::{CompactionConfig, CompactionStats, DroppedFragment, RepairRep
 
 mod grouped;
 pub use grouped::PreparedShardMerge;
+mod index_maintenance;
+pub use index_maintenance::PreparedIndexOptimization;
+use index_maintenance::PreparedIndexSource;
 
 /// Number of shard manifest files to scan per batch when discovering the latest
 /// shard state.
@@ -141,11 +144,14 @@ impl PreparedCompaction {
 /// mutable dataset handle escapes preparation.
 #[derive(Debug)]
 pub struct PreparedKeyIndex {
-    uri: String,
-    schema: Schema,
-    fragments: Vec<lance_table::format::Fragment>,
+    source: PreparedIndexSource,
     index: lance_table::format::IndexMetadata,
-    replaced: Vec<lance_table::format::IndexMetadata>,
+}
+
+impl PreparedKeyIndex {
+    pub fn name(&self) -> &str {
+        &self.index.name
+    }
 }
 
 /// Execute only the first `max_source_fragments` from a Lance compaction plan.
@@ -1973,13 +1979,7 @@ impl StorageBase {
     pub async fn prepare_key_index(&self) -> LanceResult<PreparedKeyIndex> {
         self.ensure_writable()?;
         let mut snapshot = self.dataset.clone();
-        let replaced = snapshot
-            .load_indices()
-            .await?
-            .iter()
-            .filter(|index| index.name == ID_INDEX_NAME)
-            .cloned()
-            .collect();
+        let source = PreparedIndexSource::capture(&snapshot, &[ID_INDEX_NAME.into()]).await?;
         let kind = match self.key_index_type {
             crate::KeyIndexType::Btree => IndexType::BTree,
             crate::KeyIndexType::Zonemap => IndexType::ZoneMap,
@@ -1994,13 +1994,7 @@ impl StorageBase {
             .replace(true)
             .execute_uncommitted()
             .await?;
-        Ok(PreparedKeyIndex {
-            uri: snapshot.uri().to_owned(),
-            schema: Schema::from(snapshot.schema()),
-            fragments: snapshot.manifest().fragments.as_ref().clone(),
-            index,
-            replaced,
-        })
+        Ok(PreparedKeyIndex { source, index })
     }
 
     /// Publish on a fresh fenced handle. Appends may have added uncovered
@@ -2017,55 +2011,12 @@ impl StorageBase {
 
         self.ensure_writable()?;
         self.dataset.checkout_latest().await?;
-        if prepared.uri != self.dataset.uri()
-            || prepared.schema != Schema::from(self.dataset.schema())
-        {
-            return Err(LanceError::invalid_input(
-                MaintenanceErrorCode::StalePreparation
-                    .tag("index dataset or schema changed; reprepare"),
-            ));
-        }
-        let sources: HashMap<_, _> = self
-            .dataset
-            .manifest()
-            .fragments
-            .iter()
-            .map(|f| (f.id, f))
-            .collect();
-        if prepared.fragments.iter().any(|old| {
-            let Some(current) = sources.get(&old.id).copied() else {
-                return true;
-            };
-            // Upsert deletes old rows before appending replacements. A
-            // changed deletion vector does not invalidate the prepared
-            // index: reads still apply the current deletion mask, and the
-            // new fragments remain uncovered. Compare every other field,
-            // including files, overlays, row IDs and physical row counts.
-            let mut expected = old.clone();
-            expected.deletion_file = current.deletion_file.clone();
-            current != &expected
-        }) {
-            return Err(LanceError::invalid_input(
-                MaintenanceErrorCode::StalePreparation
-                    .tag("index source fragment changed; reprepare"),
-            ));
-        }
-        let current = self.dataset.load_indices().await?;
-        let replaced: Vec<_> = current
-            .iter()
-            .filter(|index| index.name == prepared.index.name)
-            .cloned()
-            .collect();
-        if replaced != prepared.replaced {
-            return Err(LanceError::invalid_input(
-                MaintenanceErrorCode::StalePreparation.tag("index metadata changed; reprepare"),
-            ));
-        }
+        prepared.source.validate(&self.dataset).await?;
         let transaction = Transaction::new(
             prepared.index.dataset_version,
             Operation::CreateIndex {
                 new_indices: vec![prepared.index],
-                removed_indices: prepared.replaced,
+                removed_indices: prepared.source.indices,
             },
             None,
         );

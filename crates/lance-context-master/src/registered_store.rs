@@ -6,7 +6,9 @@ use arrow_schema::Schema;
 use chrono::Utc;
 use lance::index::{DatasetIndexExt, DatasetIndexInternalExt};
 use lance::Result;
-use lance_context_core::{KeyIndexType, StorageBase, StorageBaseOptions};
+use lance_context_core::{
+    KeyIndexType, PreparedIndexOptimization, PreparedKeyIndex, StorageBase, StorageBaseOptions,
+};
 use lance_index::optimize::OptimizeOptions;
 
 use crate::{state::MasterState, stats_store::StatRow};
@@ -34,7 +36,9 @@ pub(crate) async fn open(state: &MasterState, uri: &str) -> Result<StorageBase> 
     options.session = state.rollout_session.clone();
     options.key_index_type = state.config.key_index_type;
     options.pending_generations_max = Some(0);
-    StorageBase::from_dataset(dataset, options).await
+    // Metadata inspection and index preparation must not initialize a WAL index
+    // before table ownership. Maintenance only needs the existing base handle.
+    StorageBase::from_dataset_for_read(dataset, options)
 }
 
 #[derive(Default)]
@@ -115,6 +119,48 @@ pub(crate) async fn maintain_indexes(
     Ok(())
 }
 
+pub(crate) struct PreparedIndexes {
+    key: Option<PreparedKeyIndex>,
+    updates: Option<PreparedIndexOptimization>,
+}
+
+/// Use the same coverage plan as ordinary execution, but build files before
+/// acquiring the table writer. Existing indexes use Lance's incremental optimize.
+pub(crate) async fn prepare_indexes(
+    store: &StorageBase,
+    key_type: KeyIndexType,
+) -> Result<PreparedIndexes> {
+    let mut work = index_work(store, key_type).await?;
+    let key = if work.create_key {
+        let key = store.prepare_key_index().await?;
+        // The configured primary may replace an index of the wrong type.
+        // Do not also extend the definition that this commit will replace.
+        work.extend.retain(|name| name != key.name());
+        Some(key)
+    } else {
+        None
+    };
+    let updates = if work.extend.is_empty() {
+        None
+    } else {
+        Some(store.prepare_index_optimization(work.extend).await?)
+    };
+    Ok(PreparedIndexes { key, updates })
+}
+
+pub(crate) async fn commit_prepared_indexes(
+    store: &mut StorageBase,
+    prepared: PreparedIndexes,
+) -> Result<()> {
+    if let Some(key) = prepared.key {
+        store.commit_prepared_key_index(key).await?;
+    }
+    if let Some(updates) = prepared.updates {
+        store.commit_prepared_index_optimization(updates).await?;
+    }
+    Ok(())
+}
+
 /// Return the exact post-index handle; callers can retain it without opening latest.
 pub(crate) async fn indexed_dataset(store: &StorageBase) -> Result<lance::Dataset> {
     let mut dataset = store.dataset().clone();
@@ -184,8 +230,30 @@ mod tests {
     use clap::Parser;
     use lance::dataset::{Dataset, WriteParams};
 
+    async fn maintain_test_indexes(
+        store: &mut StorageBase,
+        kind: KeyIndexType,
+        prepared: bool,
+    ) -> Result<()> {
+        if prepared {
+            let work = prepare_indexes(store, kind).await?;
+            commit_prepared_indexes(store, work).await
+        } else {
+            maintain_indexes(store, kind).await
+        }
+    }
+
     #[tokio::test]
     async fn index_maintenance_extends_all_btrees_and_skips_covered_tables() {
+        check_all_btrees(false).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_index_maintenance_extends_all_btrees_and_skips_covered_tables() {
+        check_all_btrees(true).await;
+    }
+
+    async fn check_all_btrees(prepared: bool) {
         use lance::dataset::WriteMode;
         use lance_index::{scalar::ScalarIndexParams, IndexType};
 
@@ -217,6 +285,18 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // Both secondary indexes need extension while the primary is missing.
+        // The prepared publisher must safely commit both kinds of work.
+        dataset = Dataset::write(
+            rows(0),
+            uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
         let mut store =
             StorageBase::from_dataset(dataset, StorageBaseOptions::new(schema.clone(), "event_id"))
                 .await
@@ -227,7 +307,7 @@ mod tests {
                 .unwrap()
                 .create_key
         );
-        maintain_indexes(&mut store, KeyIndexType::Btree)
+        maintain_test_indexes(&mut store, KeyIndexType::Btree, prepared)
             .await
             .unwrap();
         let version = store.version();
@@ -254,7 +334,7 @@ mod tests {
             .await
             .unwrap()
             .needed());
-        maintain_indexes(&mut store, KeyIndexType::Btree)
+        maintain_test_indexes(&mut store, KeyIndexType::Btree, prepared)
             .await
             .unwrap();
         assert_eq!(store.version(), version, "covered table must not commit");
@@ -278,17 +358,17 @@ mod tests {
             3,
             "primary and both secondary indexes need new coverage"
         );
-        maintain_indexes(&mut store, KeyIndexType::Btree)
+        maintain_test_indexes(&mut store, KeyIndexType::Btree, prepared)
             .await
             .unwrap();
         assert!(!index_work(&store, KeyIndexType::Btree)
             .await
             .unwrap()
             .needed());
-        assert_eq!(store.dataset().count_rows(None).await.unwrap(), 2);
+        assert_eq!(store.dataset().count_rows(None).await.unwrap(), 3);
         assert_eq!(
             store.dataset().get_fragments().len(),
-            2,
+            3,
             "indexing must not compact data"
         );
         assert_eq!(store.dataset().get_fragments()[0].id(), fragments[0]);
@@ -316,7 +396,7 @@ mod tests {
             .await
             .unwrap()
             .needed());
-        maintain_indexes(&mut store, KeyIndexType::Btree)
+        maintain_test_indexes(&mut store, KeyIndexType::Btree, prepared)
             .await
             .unwrap();
         assert_eq!(store.version(), version);
@@ -324,6 +404,15 @@ mod tests {
 
     #[tokio::test]
     async fn index_maintenance_honors_configured_key_type() {
+        check_key_types(false).await;
+    }
+
+    #[tokio::test]
+    async fn prepared_index_maintenance_honors_configured_key_type() {
+        check_key_types(true).await;
+    }
+
+    async fn check_key_types(prepared: bool) {
         use lance::dataset::WriteMode;
         for key_type in [KeyIndexType::Btree, KeyIndexType::Zonemap] {
             let dir = tempfile::tempdir().unwrap();
@@ -347,7 +436,9 @@ mod tests {
             let mut options = StorageBaseOptions::new(schema.clone(), "sequence");
             options.key_index_type = key_type;
             let mut store = StorageBase::from_dataset(dataset, options).await.unwrap();
-            maintain_indexes(&mut store, key_type).await.unwrap();
+            maintain_test_indexes(&mut store, key_type, prepared)
+                .await
+                .unwrap();
             Dataset::write(
                 rows(),
                 uri,
@@ -362,11 +453,42 @@ mod tests {
             let work = index_work(&store, key_type).await.unwrap();
             assert!(!work.create_key);
             assert_eq!(work.extend.len(), 1);
-            maintain_indexes(&mut store, key_type).await.unwrap();
+            maintain_test_indexes(&mut store, key_type, prepared)
+                .await
+                .unwrap();
             assert!(!index_work(&store, key_type).await.unwrap().needed());
             let version = store.version();
-            maintain_indexes(&mut store, key_type).await.unwrap();
+            maintain_test_indexes(&mut store, key_type, prepared)
+                .await
+                .unwrap();
             assert_eq!(store.version(), version);
+
+            // Switching the primary type replaces id_idx. A prepared bundle
+            // must not also extend its obsolete definition under that name.
+            Dataset::write(
+                rows(),
+                uri,
+                Some(WriteParams {
+                    mode: WriteMode::Append,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let next_type = match key_type {
+                KeyIndexType::Btree => KeyIndexType::Zonemap,
+                KeyIndexType::Zonemap => KeyIndexType::Btree,
+            };
+            let mut options = StorageBaseOptions::new(schema.clone(), "sequence");
+            options.key_index_type = next_type;
+            let mut store = StorageBase::from_dataset(Dataset::open(uri).await.unwrap(), options)
+                .await
+                .unwrap();
+            assert!(index_work(&store, next_type).await.unwrap().create_key);
+            maintain_test_indexes(&mut store, next_type, prepared)
+                .await
+                .unwrap();
+            assert!(!index_work(&store, next_type).await.unwrap().needed());
         }
     }
 

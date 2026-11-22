@@ -125,6 +125,8 @@ pub use lance::Error as LanceError;
 // capacity-bounded cache session across all resident rollout stores.
 pub use lance::session::Session;
 
-pub use store_base::{PreparedCompaction, PreparedKeyIndex, PreparedMergeInput};
+pub use store_base::{
+    PreparedCompaction, PreparedIndexOptimization, PreparedKeyIndex, PreparedMergeInput,
+};
 
 mod wal_key_delete;

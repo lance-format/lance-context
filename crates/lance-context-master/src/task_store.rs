@@ -2700,12 +2700,19 @@ impl EtcdTaskStore {
                     .map(serde_json::from_slice)
                     .transpose()
                     .map_err(|e| lance::Error::io(format!("invalid merge execution: {e}")))?;
-                let shape = eligibility::claim_shape(
+                let mut shape = eligibility::claim_shape(
                     task.kind,
                     &task.target,
                     &policy,
                     snapshot[2].is_some(),
                 );
+                // Retained snapshots must validate full coverage and tag the
+                // exact indexed version under table ownership. Keep them on
+                // that path even when ordinary index preparation selects '*'.
+                if task.snapshot_tag.is_some() {
+                    shape.preparing = false;
+                    shape.write_claim = true;
+                }
                 let preparing = shape.preparing;
                 let write_claim = shape.write_claim;
                 let preparation_key = preparing.then_some(preparation_key);
