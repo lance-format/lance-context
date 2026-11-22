@@ -115,7 +115,8 @@ async fn exercise() -> Result<()> {
     assert!(
         message.contains("fenced")
             || message.contains("view is behind source closure")
-            || message == "publication selection rejected: Publisher(Rejected(Authority))"
+            || message
+                == "publication selection rejected: Commit(Committed(Publisher(Rejected(Authority))))"
             || message == "materialization result rejected: Publisher(Rejected(Authority))",
         "{message}"
     );
