@@ -412,6 +412,11 @@ async fn saturated_http_data_lane_keeps_control_available_and_drain_joins_discon
     assert!(response.starts_with("http/1.1 503"), "{response}");
     assert!(response.contains("connection: close"), "{response}");
     assert_eq!(server.gateway.observation().data_inflight, 1);
+    assert_eq!(server.gateway.observation().local_data_request_refusals, 2);
+    assert_eq!(
+        server.gateway.observation().local_control_request_refusals,
+        0
+    );
     let opened_again: Opened = client
         .post(server.endpoint("producer"))
         .json(&opens()[0])
@@ -432,6 +437,21 @@ async fn saturated_http_data_lane_keeps_control_available_and_drain_joins_discon
     assert!(
         !drain.is_finished(),
         "shutdown released a still-admitted body reader"
+    );
+    let draining = client
+        .post(server.endpoint("producer"))
+        .json(&opens()[0])
+        .send()
+        .await?;
+    assert_eq!(draining.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        draining.json::<serde_json::Value>().await?["error"],
+        "draining"
+    );
+    assert_eq!(server.gateway.observation().local_data_request_refusals, 2);
+    assert_eq!(
+        server.gateway.observation().local_control_request_refusals,
+        0
     );
     slow.shutdown().await?;
     let mut discarded = Vec::new();

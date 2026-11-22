@@ -64,6 +64,8 @@ struct Inner {
     control: Arc<Semaphore>,
     lifecycle: Mutex<Lifecycle>,
     idle: Notify,
+    local_data_request_refusals: AtomicU64,
+    local_control_request_refusals: AtomicU64,
     local_status_memory_refusals: AtomicU64,
     local_write_memory_refusals: AtomicU64,
 }
@@ -87,6 +89,13 @@ pub struct Observation {
     pub data_inflight: usize,
     pub control_inflight: usize,
     pub draining: bool,
+    /// Requests refused by this gateway's own HTTP data-lane semaphore.
+    /// Forwarded owner refusals and later WAL admission failures are excluded.
+    pub local_data_request_refusals: u64,
+    /// Requests refused by this gateway's own HTTP control-lane semaphore.
+    /// Reads and producer control operations share this lane. Forwarded owner
+    /// refusals, memory admission failures, and shutdown are excluded.
+    pub local_control_request_refusals: u64,
     /// Status queries refused by this gateway's own memory admission. A
     /// forwarded refusal is counted only by the owner that made the decision.
     pub local_status_memory_refusals: u64,
@@ -132,6 +141,8 @@ impl Gateway {
             options,
             lifecycle: Mutex::new(Lifecycle::default()),
             idle: Notify::new(),
+            local_data_request_refusals: AtomicU64::new(0),
+            local_control_request_refusals: AtomicU64::new(0),
             local_status_memory_refusals: AtomicU64::new(0),
             local_write_memory_refusals: AtomicU64::new(0),
         })))
@@ -158,6 +169,11 @@ impl Gateway {
             data_inflight: self.0.options.data_requests - self.0.data.available_permits(),
             control_inflight: self.0.options.control_requests - self.0.control.available_permits(),
             draining: self.0.lifecycle.lock().unwrap().closed,
+            local_data_request_refusals: self.0.local_data_request_refusals.load(Ordering::Relaxed),
+            local_control_request_refusals: self
+                .0
+                .local_control_request_refusals
+                .load(Ordering::Relaxed),
             local_status_memory_refusals: self
                 .0
                 .local_status_memory_refusals
@@ -200,10 +216,15 @@ impl Gateway {
             return Err(Failure::unavailable("draining", "not_submitted"));
         }
         let lane = if data { &self.0.data } else { &self.0.control };
-        let slot = lane
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Failure::unavailable("request_capacity", "not_submitted"))?;
+        let slot = lane.clone().try_acquire_owned().map_err(|_| {
+            let refusals = if data {
+                &self.0.local_data_request_refusals
+            } else {
+                &self.0.local_control_request_refusals
+            };
+            refusals.fetch_add(1, Ordering::Relaxed);
+            Failure::unavailable("request_capacity", "not_submitted")
+        })?;
         state.active += 1;
         Ok(Guard {
             inner: self.0.clone(),

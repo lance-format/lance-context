@@ -125,6 +125,10 @@ async fn exercise() -> Result<()> {
         assert_eq!(reply["operation_outcome"], "not_submitted");
         assert_eq!(reply["error"], "request_capacity");
     }
+    assert_eq!(owner.observation().local_data_request_refusals, 64);
+    assert_eq!(owner.observation().local_control_request_refusals, 0);
+    assert_eq!(ga.observation().local_data_request_refusals, 0);
+    assert_eq!(gb.observation().local_data_request_refusals, 0);
     chunks.send(body.slice(body.len() / 2..)).await?;
     drop(chunks);
     let held: MutationReply = pending.await??.error_for_status()?.json().await?;
@@ -148,6 +152,8 @@ async fn exercise() -> Result<()> {
         "unknown"
     );
     assert_eq!(requests.load(Ordering::SeqCst), before + 1);
+    assert_eq!(owner.observation().local_data_request_refusals, 64);
+    assert_eq!(gb.observation().local_data_request_refusals, 0);
     let current = point(&client, &a).await?.unwrap();
     assert_eq!(current.status.as_deref(), Some(status.as_str()));
     assert_eq!(current.score, Some(0.9));
