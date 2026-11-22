@@ -17,6 +17,9 @@ mod listing_tests;
 mod manifest_cache;
 mod paired;
 
+#[cfg(test)]
+pub(crate) use manifest_cache::read_body as read_body_reference_for_test;
+
 #[derive(Debug)]
 struct ListingFailure;
 
@@ -511,15 +514,16 @@ impl Collector {
                         // The same finite durable narrow history selects the body
                         // roots. Never infer liveness from the body table's latest
                         // mainline or from detached-version numeric ordering.
-                        let narrow =
-                            checkpoint::load(&service.ingress, storage, record.version).await?;
-                        ensure!(
-                            narrow.manifest_location().path == path,
-                            "retained narrow manifest identity changed"
-                        );
-                        paired::protect_body(
+                        let reference = manifest_cache::read_body(
+                            &self.metadata,
+                            &service.ingress,
+                            storage,
+                            record,
+                        )
+                        .await?;
+                        paired::protect_reference(
                             &mut candidates,
-                            &narrow,
+                            &reference.0,
                             body,
                             &object_store,
                             service.ingress.scope.incarnation,

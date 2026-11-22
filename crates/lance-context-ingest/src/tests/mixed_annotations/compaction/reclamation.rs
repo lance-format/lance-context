@@ -2,6 +2,7 @@ use super::*;
 use lance_context_core::annotation_staging::TurnBodySource;
 use std::{collections::BTreeSet, path::PathBuf};
 
+mod reference_cache;
 mod takeover;
 
 fn files(dataset: &Dataset, root: &std::path::Path) -> BTreeSet<PathBuf> {
