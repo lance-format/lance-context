@@ -14,8 +14,8 @@ async fn background_compaction_preserves_rounded_body_writer_headroom() -> Resul
         .await?;
         let body = storage(root.path(), "body.lance").await?;
         fragmented(&c, &narrow, &body).await?;
-        // The background rewrite and mixed body writer each need four whole
-        // MiB permits, even though their nominal byte sum fits seven MiB.
+        // The old source-workspace estimate plus rewrite fits seven MiB, but
+        // the actual rewrite and mixed body writer each need four MiB permits.
         let (a, mut runtime) = compact_owner_budget(&c, &narrow, &body, 7 << 20).await?;
         while annotation_publication::read(&c, &narrow, None)
             .await?
