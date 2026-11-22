@@ -3,6 +3,15 @@ use super::*;
 #[tokio::test]
 async fn owned_point_reads_wait_for_bounded_admission_and_capture_after_publication() -> Result<()>
 {
+    queued_point_reads(2).await
+}
+
+#[tokio::test]
+async fn large_http_control_budget_keeps_waiters_bounded_and_reads_current() -> Result<()> {
+    queued_point_reads(128).await
+}
+
+async fn queued_point_reads(control_requests: usize) -> Result<()> {
     let root = tempfile::tempdir()?;
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
     let storage = Storage::resolve(
@@ -29,14 +38,38 @@ async fn owned_point_reads_wait_for_bounded_admission_and_capture_after_publicat
         &runtime,
         keys()?,
         http::Options {
-            control_requests: 2,
+            control_requests,
             ..options()
         },
     )?;
     let (stop, task) = annotation_runtime::run_owner(runtime);
     let server = Server::start(owner.router(), None).await?;
-    let (ga, a) = frontend(&c, &limits, &server.uri()).await?;
-    let (gb, b) = frontend(&c, &limits, &server.uri()).await?;
+    // Forwarding reservations round up to MiB. Provision the larger test's
+    // separate byte budget so it reaches the HTTP limit, while retaining the
+    // single snapshot reader below it. Small-budget admission is tested apart.
+    let ingress_memory_bytes = control_requests.max(8) << 20;
+    let (ga, a) = frontend_with_options(
+        &c,
+        &limits,
+        &server.uri(),
+        http::Options {
+            control_requests,
+            ..options()
+        },
+        ingress_memory_bytes,
+    )
+    .await?;
+    let (gb, b) = frontend_with_options(
+        &c,
+        &limits,
+        &server.uri(),
+        http::Options {
+            control_requests,
+            ..options()
+        },
+        ingress_memory_bytes,
+    )
+    .await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()?;
@@ -65,24 +98,35 @@ async fn owned_point_reads_wait_for_bounded_admission_and_capture_after_publicat
             .unwrap()
     };
     let started = phase().started;
-    let left = tokio::spawn(
-        post(&client, &a, "read")
-            .json(&PointRequest { turn: "T".into() })
-            .send(),
-    );
-    let right = tokio::spawn(
-        post(&client, &b, "read")
-            .json(&PointRequest { turn: "T".into() })
-            .send(),
-    );
+    let reads: Vec<_> = (0..control_requests)
+        .map(|i| {
+            tokio::spawn(
+                post(&client, if i % 2 == 0 { &a } else { &b }, "read")
+                    .json(&PointRequest { turn: "T".into() })
+                    .send(),
+            )
+        })
+        .collect();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while phase().started < started + 2 {
+        while phase().started < started + control_requests as u64 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
-    .await?;
+    .await
+    .with_context(|| {
+        format!(
+            "read admission: phase={:?}, owner={:?}, ingress_a={:?}, ingress_b={:?}, finished={}",
+            phase(),
+            serde_json::to_value(owner.observation()).unwrap(),
+            serde_json::to_value(ga.observation()).unwrap(),
+            serde_json::to_value(gb.observation()).unwrap(),
+            reads.iter().filter(|read| read.is_finished()).count(),
+        )
+    })?;
     let observed = phase();
     let queued = observed.started - observed.completed - observed.cancelled;
+    assert_eq!(owner.observation().control_inflight, control_requests);
+    assert_eq!(service.observation().await.0.readers, 1);
     // The existing HTTP gate bounds waiters; there is no extra unbounded queue.
     let overflow = post(&client, &a, "read")
         .json(&PointRequest { turn: "T".into() })
@@ -108,12 +152,11 @@ async fn owned_point_reads_wait_for_bounded_admission_and_capture_after_publicat
     annotation_runtime::drained(&c, &service, applied.completion.index).await?;
     let held_value = held.resolve().await?.unwrap();
     drop(held);
-    let left = left.await??;
-    let right = right.await??;
-    let left_status = left.status();
-    let right_status = right.status();
-    let left: serde_json::Value = left.json().await?;
-    let right: serde_json::Value = right.json().await?;
+    let mut values = Vec::new();
+    for read in reads {
+        let response = read.await??.error_for_status()?;
+        values.push(response.json::<TurnAnnotation>().await?);
+    }
     let readers_after = service.observation().await.0.readers;
 
     stop.send(()).unwrap();
@@ -132,17 +175,16 @@ async fn owned_point_reads_wait_for_bounded_admission_and_capture_after_publicat
     );
     assert!(format!("{expired:#}").contains("annotation owned read deadline expired"));
     assert_eq!(readers_after_cancel, 1);
-    assert_eq!(queued, 2);
+    assert_eq!(queued, control_requests as u64);
     assert_eq!(overflow_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(overflow["error"], "request_capacity");
     assert_eq!(held_value, initial);
-    assert_eq!(left_status, StatusCode::OK);
-    assert_eq!(right_status, StatusCode::OK);
-    for value in [left, right] {
-        let value: TurnAnnotation = serde_json::from_value(value)?;
+    assert_eq!(values.len(), control_requests);
+    for value in values {
         assert_eq!(value.status.as_deref(), Some("reviewed"));
         assert_eq!(value.score, Some(0.9));
     }
     assert_eq!(readers_after, 0);
+    assert_eq!(owner.observation().control_inflight, 0);
     Ok(())
 }
