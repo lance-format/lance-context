@@ -2,7 +2,8 @@
 //! Called only between publications in the same serial publisher loop. A pending
 //! listing response can span publications. One concurrent annotation index job protects
 //! its source and defers index-page collection; data collection can continue.
-//! Other native preparation remains serial. A successor fences the final catalog operation
+//! A background rewrite pins its source and exact registered output paths.
+//! A successor fences the final catalog operation
 //! and opens its recovery base after acquisition.
 use super::*;
 use futures::{stream, stream::BoxStream, StreamExt, TryStreamExt};
@@ -172,6 +173,7 @@ impl Collector {
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
         index_source: Option<&Dataset>,
+        compaction: Option<&materializer::annotation_compaction::Preparation>,
     ) -> Result<bool> {
         // A sealed page cannot gain paths. Its protection/fence completed before
         // any native preparation resumes; future publications use protected live
@@ -193,7 +195,7 @@ impl Collector {
             self.delete_page(service).await?;
             Ok(())
         } else {
-            self.collect_page(service, catalog, storage, budget, index_source)
+            self.collect_page(service, catalog, storage, budget, index_source, compaction)
                 .await
         };
         if self.deleting.get_mut().unwrap().is_some() {
@@ -277,6 +279,7 @@ impl Collector {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn collect_page(
         &mut self,
         service: &Service,
@@ -284,6 +287,7 @@ impl Collector {
         storage: &Storage,
         budget: &Arc<MergeMemoryBudget>,
         index_source: Option<&Dataset>,
+        compaction: Option<&materializer::annotation_compaction::Preparation>,
     ) -> Result<()> {
         let phases = service.shared.phases.clone();
         let state = catalog.state().await?;
@@ -437,6 +441,27 @@ impl Collector {
                 // This memo never outlives the closed page or crosses destinations.
                 let mut protected_body = paired::Protection::default();
                 if body_storage.is_none() {
+                    if let Some(job) = compaction {
+                        job.protect_files(&mut candidates);
+                        protect(
+                            &mut candidates,
+                            job.source.manifest(),
+                            &job.source.manifest_location().path,
+                            &storage.base,
+                            false,
+                        )?;
+                        indices::protect(
+                            &mut candidates,
+                            job.source.manifest(),
+                            job.source.manifest_location(),
+                            &storage.base,
+                            &object_store,
+                            &self.metadata,
+                            budget,
+                            page_charge,
+                        )
+                        .await?;
+                    }
                     if let Some(source) = index_source {
                         // The job's original native snapshot remains readable
                         // even after its catalog history entry is retired.

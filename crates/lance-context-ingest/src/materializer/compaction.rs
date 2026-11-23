@@ -26,7 +26,7 @@ impl Default for SmallFileCompaction {
     }
 }
 impl SmallFileCompaction {
-    fn workspace(&self, record_bytes: usize) -> Result<usize> {
+    pub(super) fn workspace(&self, record_bytes: usize) -> Result<usize> {
         // One task admits at most twice the target on disk. Also allow for
         // four late-materialization batches and decode/encoding workspace.
         // These are targets, not an allocator/RSS cap on Lance internals.
@@ -180,28 +180,28 @@ pub(crate) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Optio
     }))
 }
 
-pub(super) async fn prepare(
+pub(crate) async fn prepare_task(
     publisher: &Publisher,
-    pending: &p::PendingPlan,
-) -> Result<p::Descriptors> {
+    dataset: &Dataset,
+) -> Result<Option<CompactionTask>> {
     let options = publisher
         .options
         .compaction
         .as_ref()
-        .context("pending compaction needs configured limits")?;
-    let dataset = read_compaction_base(publisher, pending.plan.read_version).await?;
-    let indices = supported_indices(&dataset).await?;
-    let fragments = options
-        .fragments(
-            &dataset,
-            &indices,
-            publisher
-                .options
-                .turn_id_index
-                .as_ref()
-                .map(|_| turn_id_index::MAX_BUILD_ROWS),
-        )
-        .context("pending compaction has no eligible fragments under configured limits")?;
+        .context("compaction options missing")?;
+    let indices = supported_indices(dataset).await?;
+    let fragments = options.fragments(
+        dataset,
+        &indices,
+        publisher
+            .options
+            .turn_id_index
+            .as_ref()
+            .map(|_| turn_id_index::MAX_BUILD_ROWS),
+    );
+    let Some(fragments) = fragments else {
+        return Ok(None);
+    };
     let rows = fragments
         .iter()
         .try_fold(0usize, |n, f| n.checked_add(f.physical_rows?))
@@ -220,7 +220,7 @@ pub(super) async fn prepare(
     }
     let task = CompactionTask {
         task: TaskData { fragments },
-        read_version: pending.plan.read_version,
+        read_version: dataset.version_id(),
         options: CompactionOptions {
             target_rows_per_fragment: rows,
             max_bytes_per_file: Some(options.target_file_bytes),
@@ -232,6 +232,23 @@ pub(super) async fn prepare(
             ..Default::default()
         },
     };
+    Ok(Some(task))
+}
+
+pub(super) async fn prepare(
+    publisher: &Publisher,
+    pending: &p::PendingPlan,
+) -> Result<p::Descriptors> {
+    let options = publisher
+        .options
+        .compaction
+        .as_ref()
+        .context("pending compaction needs configured limits")?;
+    let dataset = read_compaction_base(publisher, pending.plan.read_version).await?;
+    let task = prepare_task(publisher, &dataset)
+        .await?
+        .context("pending compaction has no eligible fragments under configured limits")?;
+    let record_bytes = publisher.ingress.scope.contract.max_record_bytes as usize;
     let reservation = publisher
         .phases
         .measure(Phase::Admission, async {
@@ -417,7 +434,7 @@ pub(crate) async fn validate_result(dataset: &Dataset, result: &RewriteResult) -
     Ok(())
 }
 
-fn next_fragment_id(dataset: &Dataset, ordinal: usize) -> Result<u64> {
+pub(crate) fn next_fragment_id(dataset: &Dataset, ordinal: usize) -> Result<u64> {
     let base = dataset
         .manifest()
         .max_fragment_id

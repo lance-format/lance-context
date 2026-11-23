@@ -33,6 +33,58 @@ impl Publisher {
     }
 
     async fn select_compaction(&mut self, view: &p::Table) -> Result<bool> {
+        if let Some(job) = &self.compaction_preparation {
+            ensure!(
+                view.progress.pending.is_none() && self.index_preparation.is_none(),
+                "background compaction overlaps another maintenance plan"
+            );
+            if !job.is_finished() {
+                return Ok(false);
+            }
+            let current = materializer::compaction::read_compaction_base(
+                &self.catalog,
+                view.progress.minimum_read_version,
+            )
+            .await?;
+            let version = current.version_id();
+            let Some(ready) = self
+                .compaction_preparation
+                .take()
+                .unwrap()
+                .finish(current)
+                .await?
+            else {
+                // A field update changed a source fragment. Do not publish the
+                // stale rewrite. The next eligible rewrite uses the existing
+                // serial path so continuous updates cannot starve compaction.
+                self.compaction_retry_serial = true;
+                return Ok(false);
+            };
+            self.catalog
+                .record_plan(p::Plan {
+                    transaction: Uuid::new_v4(),
+                    read_version: version,
+                    sources: BTreeMap::new(),
+                    next_group: self.service.group()?,
+                })
+                .await?;
+            let selected = self.catalog.state().await?;
+            let pending = selected
+                .progress
+                .pending
+                .as_ref()
+                .context("background compaction plan missing")?;
+            let descriptors = ready.descriptors(&self.catalog, pending).await?;
+            self.catalog
+                .record_preparation(p::PrepareRequest {
+                    authority: self.catalog.authority().clone(),
+                    transaction: pending.plan.transaction,
+                    plan_index: pending.index,
+                    descriptors,
+                })
+                .await?;
+            return Ok(true);
+        }
         if let Some(job) = &self.index_preparation {
             ensure!(
                 view.progress.pending.is_none(),
@@ -206,6 +258,15 @@ impl Publisher {
                     self.index_preparation = Some(job);
                     return Ok(false);
                 }
+                if !self.compaction_retry_serial {
+                    if let Some(job) =
+                        materializer::annotation_compaction::start(&self.catalog, plan.read_version)
+                            .await?
+                    {
+                        self.compaction_preparation = Some(job);
+                        return Ok(false);
+                    }
+                }
             }
             self.catalog.retire_history(view).await?;
             self.catalog.record_plan(plan).await?;
@@ -254,6 +315,7 @@ impl Publisher {
                     .staging
                     .install_compacted(&transaction, selected)
                     .await?;
+                self.compaction_retry_serial = false;
             } else if matches!(
                 transaction.operation,
                 lance_table::transaction::Operation::CreateIndex { .. }
