@@ -70,7 +70,7 @@ impl Runtime {
             .map(materializer::annotation_index::Preparation::is_finished)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "http"))]
     pub(crate) fn compaction_preparation_finished_for_test(&self) -> Option<bool> {
         self.publisher
             .compaction_preparation
@@ -78,7 +78,7 @@ impl Runtime {
             .map(materializer::annotation_compaction::Preparation::is_finished)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "http"))]
     pub(crate) async fn collect_once_for_test(&mut self) -> Result<bool> {
         let publisher = &mut self.publisher;
         publisher
