@@ -1,6 +1,9 @@
 use super::*;
 use crate::tests::annotation_runtime::automatic_reclamation::deletion_faults::fault_store;
 
+#[cfg(unix)]
+mod process;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn background_compaction_preserves_rounded_body_writer_headroom() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(60), async {
