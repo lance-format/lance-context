@@ -4133,11 +4133,13 @@ dependencies = [
 name = "lance-context-client"
 version = "0.6.7"
 dependencies = [
+ "axum",
  "lance-context-api",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
