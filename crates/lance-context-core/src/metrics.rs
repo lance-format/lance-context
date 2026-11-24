@@ -209,6 +209,20 @@ pub(crate) struct MemtableFlushMetrics {
 #[cfg(feature = "metrics")]
 impl Default for MemtableFlushMetrics {
     fn default() -> Self {
+        use lance::dataset::mem_wal::observer::MemtableFlushPhase;
+        // Register bounded outcome series before the first event, so a scrape
+        // can establish a zero baseline. New writers must not reset totals.
+        for phase in [
+            MemtableFlushPhase::WalWait,
+            MemtableFlushPhase::IndexWait,
+            MemtableFlushPhase::Prepare,
+            MemtableFlushPhase::Publish,
+        ] {
+            ::metrics::counter!("rollout_memtable_flush_phase_errors_total", "phase" => phase.as_str())
+                .increment(0);
+            ::metrics::counter!("rollout_memtable_flush_phase_abandoned_total", "phase" => phase.as_str())
+                .increment(0);
+        }
         for result in ["ok", "error"] {
             ::metrics::counter!("rollout_memtable_flush_attempts_total", "result" => result)
                 .increment(0);
@@ -326,5 +340,64 @@ impl Drop for MemtableFlushMetrics {
         let (generations, bytes) = *self.pending.get_mut().unwrap();
         ::metrics::gauge!("rollout_memtable_flush_retry_generations").decrement(generations as f64);
         ::metrics::gauge!("rollout_memtable_flush_retry_bytes").decrement(bytes as f64);
+    }
+}
+
+#[cfg(all(test, feature = "metrics"))]
+mod tests {
+    use super::*;
+    use lance::dataset::mem_wal::observer::{FlushPhaseOutcome, MemtableFlushPhase, WalObserver};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::time::Duration;
+
+    #[test]
+    fn phase_counters_have_a_baseline_and_survive_new_writers() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let counter = |name: &str, phase: &str| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(key, _, _, value)| {
+                    (key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "phase" && l.value() == phase))
+                    .then_some(value)
+                    .and_then(|value| match value {
+                        DebugValue::Counter(value) => Some(value),
+                        _ => None,
+                    })
+                })
+        };
+        ::metrics::with_local_recorder(&recorder, || {
+            let observer = MemtableFlushMetrics::default();
+            for phase in [
+                MemtableFlushPhase::WalWait,
+                MemtableFlushPhase::IndexWait,
+                MemtableFlushPhase::Prepare,
+                MemtableFlushPhase::Publish,
+            ] {
+                for (name, outcome) in [
+                    (
+                        "rollout_memtable_flush_phase_errors_total",
+                        FlushPhaseOutcome::Error,
+                    ),
+                    (
+                        "rollout_memtable_flush_phase_abandoned_total",
+                        FlushPhaseOutcome::Abandoned,
+                    ),
+                ] {
+                    assert_eq!(counter(name, phase.as_str()), Some(0));
+                    observer.on_memtable_flush_phase_start(phase);
+                    observer.on_memtable_flush_phase_finish(phase, Duration::ZERO, outcome);
+                    assert_eq!(counter(name, phase.as_str()), Some(1));
+                    let _another_writer = MemtableFlushMetrics::default();
+                    assert_eq!(counter(name, phase.as_str()), Some(1));
+                }
+            }
+        });
     }
 }

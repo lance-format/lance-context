@@ -40,6 +40,12 @@ mod runtime_resources;
 /// people actually alert on (10ms, 100ms, 250ms, 1s).
 const REQUEST_LATENCY_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0, 60.0];
 
+/// Flushes are normally short but can stall for minutes on storage or WAL work.
+/// Keep request-scale resolution and add four tail buckets only for flushes.
+const FLUSH_LATENCY_BUCKETS: &[f64] = &[
+    0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+];
+
 /// Coarser buckets (upper bounds, seconds) for long-running background jobs
 /// (compaction, WAL merge, index builds) whose latency can reach minutes.
 /// Without the extended tail every sample over 60s would fall into `+Inf`,
@@ -103,6 +109,15 @@ pub fn install_recorder() -> MetricsHandle {
             REQUEST_LATENCY_BUCKETS,
         )
         .expect("request latency buckets are non-empty");
+    for name in [
+        "rollout_wal_flush_duration_seconds",
+        "rollout_memtable_flush_duration_seconds",
+        "rollout_memtable_flush_phase_duration_seconds",
+    ] {
+        builder = builder
+            .set_buckets_for_metric(Matcher::Full(name.to_string()), FLUSH_LATENCY_BUCKETS)
+            .expect("flush latency buckets are non-empty");
+    }
     for name in JOB_LATENCY_METRICS {
         builder = builder
             .set_buckets_for_metric(Matcher::Full((*name).to_string()), JOB_LATENCY_BUCKETS)
@@ -442,6 +457,20 @@ mod tests {
             "kind" => "merge_wal", "phase" => "claim")
         .record(90.0);
         metrics::histogram!("master_merge_wal_worker_duration_seconds").record(200.0);
+        // Flushes need to distinguish subsecond work from minute-long stalls.
+        for name in [
+            "rollout_wal_flush_duration_seconds",
+            "rollout_memtable_flush_duration_seconds",
+            "rollout_memtable_flush_phase_duration_seconds",
+        ] {
+            let histogram = if name == "rollout_memtable_flush_phase_duration_seconds" {
+                metrics::histogram!(name, "phase" => "prepare")
+            } else {
+                metrics::histogram!(name)
+            };
+            histogram.record(0.02);
+            histogram.record(180.0);
+        }
         metrics::counter!("master_merge_wal_workers_total", "result" => "http_error").increment(1);
         metrics::gauge!("master_experiments").set(3.0);
 
@@ -562,6 +591,22 @@ mod tests {
             );
         }
 
+        for name in [
+            "rollout_wal_flush_duration_seconds",
+            "rollout_memtable_flush_duration_seconds",
+            "rollout_memtable_flush_phase_duration_seconds",
+        ] {
+            for (bound, count) in [("0.1", 1), ("300", 2)] {
+                assert!(
+                    text.lines().any(|line| {
+                        line.starts_with(&format!("{name}_bucket{{"))
+                            && line.contains(&format!("le=\"{bound}\""))
+                            && line.ends_with(&format!(" {count}"))
+                    }),
+                    "{name} must resolve both fast and slow flushes: {text}"
+                );
+            }
+        }
         // Every application metric should carry HELP so a scrape is
         // interpretable without reading the source, and so Datadog's
         // OpenMetrics check can infer the right type.
@@ -593,7 +638,10 @@ mod tests {
 
         // Cardinality budget. Every series is a billed custom metric in Datadog,
         // so a label added without thought is a cost regression. The bound is
-        // deliberately close to the actual count (112 at the time of writing):
+        // deliberately close to the actual count (about 160). The three flush
+        // series exercised above add 48 exported series to the old fixture:
+        // 13 finite buckets, +Inf, sum and count each. In production, the four
+        // added tail buckets cost 24 series across two flushes and four phases.
         // adding one two-valued label to a job-scale histogram costs ~9 series
         // and trips this, forcing the tradeoff to be made explicitly rather than
         // discovered on an invoice.
@@ -602,8 +650,8 @@ mod tests {
             .filter(|l| !l.starts_with('#') && !l.is_empty())
             .count();
         assert!(
-            series <= 125,
-            "metric cardinality regressed to {series} series (budget 125). Every series is a \
+            series <= 173,
+            "metric cardinality regressed to {series} series (budget 173). Every series is a \
              billed custom metric in Datadog — prefer a counter label over a histogram label."
         );
     }

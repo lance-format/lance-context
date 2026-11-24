@@ -648,6 +648,14 @@ mod http {
 
     impl MeteringHttpConnector {
         pub fn new(base: String) -> Self {
+            // These bounded series need a baseline before the first error.
+            // Incrementing by zero preserves counts across connector reuse.
+            for status in [429, 503] {
+                metrics::counter!(METRIC_THROTTLE, status_labels(&base, status)).increment(0);
+            }
+            for status in [408, 429].into_iter().chain(500..600) {
+                metrics::counter!(METRIC_RETRYABLE, status_labels(&base, status)).increment(0);
+            }
             Self {
                 base,
                 inner: ReqwestConnector::default(),
@@ -819,6 +827,64 @@ mod http {
             assert_eq!(throttle("gs", "429"), 1);
             assert_eq!(retryable("gs", "429"), 1);
             assert_eq!(throttle("gs", "503"), 0);
+        }
+
+        #[test]
+        fn http_counters_have_a_baseline_and_survive_new_connectors() {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let counter = |name: &str, status: u16| {
+                snapshotter
+                    .snapshot()
+                    .into_vec()
+                    .into_iter()
+                    .find_map(|(key, _, _, value)| {
+                        (key.key().name() == name
+                            && key
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "status" && l.value() == status.to_string())
+                            && key
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "base" && l.value() == "az"))
+                        .then_some(value)
+                        .and_then(|value| match value {
+                            DebugValue::Counter(value) => Some(value),
+                            _ => None,
+                        })
+                    })
+            };
+            metrics::with_local_recorder(&recorder, || {
+                let _connector = MeteringHttpConnector::new("az".into());
+                for status in [408, 429].into_iter().chain(500..600) {
+                    assert_eq!(counter(METRIC_RETRYABLE, status), Some(0));
+                }
+                for status in [429, 503] {
+                    assert_eq!(counter(METRIC_THROTTLE, status), Some(0));
+                }
+                assert_eq!(counter(METRIC_RETRYABLE, 409), None);
+                assert_eq!(counter(METRIC_THROTTLE, 500), None);
+
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    for status in [408, 429, 500, 503, 599] {
+                        let service = MeteringHttpService {
+                            base: "az".into(),
+                            inner: HttpClient::new(StaticStatusService { status }),
+                        };
+                        service.call(request()).await.unwrap();
+                        assert_eq!(counter(METRIC_RETRYABLE, status), Some(1));
+                        let _another_connector = MeteringHttpConnector::new("az".into());
+                        assert_eq!(counter(METRIC_RETRYABLE, status), Some(1));
+                    }
+                });
+                for status in [429, 503] {
+                    assert_eq!(counter(METRIC_THROTTLE, status), Some(1));
+                }
+            });
         }
     }
 }
