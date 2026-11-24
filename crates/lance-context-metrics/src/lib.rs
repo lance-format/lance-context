@@ -179,7 +179,7 @@ fn describe_metrics() {
     describe_histogram!(
         "rollout_add_duration_seconds",
         Unit::Seconds,
-        "RolloutStore::add — the durable WAL append only, success path."
+        "Successful storage put, including admission, insertion, WAL/index visibility and optional sealing."
     );
     describe_counter!(
         "rollout_add_errors_total",
@@ -221,6 +221,22 @@ fn describe_metrics() {
         Unit::Seconds,
         "Time waiting for the store write lock before compaction."
     );
+
+    describe_histogram!(
+        "rollout_wal_flush_duration_seconds", Unit::Seconds,
+        "Successful non-empty WAL flush work, including encoding and persistence; excludes time queued before the flush handler."
+    );
+    describe_counter!("rollout_wal_flushes_total", "Successful non-empty WAL flushes; divide persisted bytes by this count for mean WAL flush size.");
+    describe_histogram!(
+        "rollout_memtable_flush_phase_duration_seconds", Unit::Seconds,
+        "Successful memtable flush phases: wal_wait, index_wait, prepare (fence refresh, data/index files), publish (shard manifest). Excludes attempt queueing and retry backoff; skipped retry work emits no sample."
+    );
+    describe_gauge!("rollout_memtable_flush_phase_in_flight", "Active memtable flush phases in this process, including phases still waiting. Label: phase.");
+    describe_counter!(
+        "rollout_memtable_flush_phase_errors_total",
+        "Failed memtable flush phases. Label: phase."
+    );
+    describe_counter!("rollout_memtable_flush_phase_abandoned_total", "Locally abandoned memtable flush phase futures; remote outcome may be unknown. Label: phase.");
 
     // Master task lifecycle.
     describe_histogram!(

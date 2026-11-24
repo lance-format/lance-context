@@ -30,7 +30,8 @@
 #[cfg(feature = "lance-io-metrics")]
 pub use lance_io::object_store::metrics::describe_metrics as describe_lance_io_metrics;
 
-/// Latency of one [`crate::RolloutStore::add`] — the durable WAL append only.
+/// Successful storage put latency: admission, insertion and WAL/index visibility.
+/// Includes sealing when the store enables `seal_on_put`.
 /// Unlabelled: failures are counted by [`ROLLOUT_ADD_ERRORS`] instead.
 pub const ROLLOUT_ADD_DURATION: &str = "rollout_add_duration_seconds";
 
@@ -216,6 +217,7 @@ impl Default for MemtableFlushMetrics {
         ::metrics::counter!("rollout_memtable_flush_unresolved_writer_drops_total").increment(0);
         ::metrics::counter!("rollout_memtable_flush_rows_total").increment(0);
         ::metrics::counter!("rollout_wal_persisted_bytes_total").increment(0);
+        ::metrics::counter!("rollout_wal_flushes_total").increment(0);
         ::metrics::counter!("rollout_memtable_flush_backpressure_rejections_total").increment(0);
         ::metrics::gauge!("rollout_memtable_flush_retry_generations").increment(0.0);
         ::metrics::gauge!("rollout_memtable_flush_retry_bytes").increment(0.0);
@@ -237,8 +239,43 @@ impl MemtableFlushMetrics {
 
 #[cfg(feature = "metrics")]
 impl lance::dataset::mem_wal::observer::WalObserver for MemtableFlushMetrics {
-    fn on_wal_flush(&self, _duration: std::time::Duration, bytes: usize) {
+    fn on_wal_flush(&self, duration: std::time::Duration, bytes: usize) {
+        ::metrics::histogram!("rollout_wal_flush_duration_seconds").record(duration.as_secs_f64());
+        ::metrics::counter!("rollout_wal_flushes_total").increment(1);
         ::metrics::counter!("rollout_wal_persisted_bytes_total").increment(bytes as u64);
+    }
+
+    fn on_memtable_flush_phase_start(
+        &self,
+        phase: lance::dataset::mem_wal::observer::MemtableFlushPhase,
+    ) {
+        ::metrics::gauge!("rollout_memtable_flush_phase_in_flight", "phase" => phase.as_str())
+            .increment(1.0);
+    }
+
+    fn on_memtable_flush_phase_finish(
+        &self,
+        phase: lance::dataset::mem_wal::observer::MemtableFlushPhase,
+        duration: std::time::Duration,
+        outcome: lance::dataset::mem_wal::observer::FlushPhaseOutcome,
+    ) {
+        use lance::dataset::mem_wal::observer::FlushPhaseOutcome;
+        ::metrics::gauge!("rollout_memtable_flush_phase_in_flight", "phase" => phase.as_str())
+            .decrement(1.0);
+        match outcome {
+            FlushPhaseOutcome::Ok => {
+                ::metrics::histogram!("rollout_memtable_flush_phase_duration_seconds", "phase" => phase.as_str())
+                    .record(duration.as_secs_f64());
+            }
+            FlushPhaseOutcome::Error => {
+                ::metrics::counter!("rollout_memtable_flush_phase_errors_total", "phase" => phase.as_str())
+                    .increment(1);
+            }
+            FlushPhaseOutcome::Abandoned => {
+                ::metrics::counter!("rollout_memtable_flush_phase_abandoned_total", "phase" => phase.as_str())
+                    .increment(1);
+            }
+        }
     }
 
     fn on_memtable_flush(&self, duration: std::time::Duration, rows: usize) {
