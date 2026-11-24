@@ -37,5 +37,9 @@ object_writer.rs, local.rs, object_store.rs, and object_store/providers/local.rs
 See ../lance-core/BACKPORT.md: physical IO/upload work retains ownership until
 it actually completes or its state is destroyed.
 
+HTTP metric connectors initialize throttle and retryable-response counters at
+zero for all counted status codes before use. This gives collectors a baseline
+for the first response without resetting counters when a connector is recreated.
+
 Remove local compatibility patches only after equivalent upstream behavior
 passes the context cancellation, multipart, and storage-error regressions.
