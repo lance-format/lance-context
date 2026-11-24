@@ -1,7 +1,7 @@
 # lance-context
 
 **A storage engine for AI data — agent memory and RL training data — built on
-[Lance](https://lancedb.github.io/lance/).**
+[Lance](https://lance.org/).**
 
 Modern AI systems produce two kinds of data that are awkward to store well:
 

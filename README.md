@@ -1,6 +1,6 @@
 # lance-context
 
-**A storage engine for AI data — agent memory and RL training data — built on [Lance](https://lancedb.github.io/lance/).**
+**A storage engine for AI data — agent memory and RL training data — built on [Lance](https://lance.org/).**
 
 Modern AI systems produce two kinds of data that are awkward to store well:
 
@@ -30,7 +30,7 @@ one).
 
 ## Documentation
 
-Full documentation: **<https://lance-format.github.io/lance-context/>**
+Full documentation: **<https://lance.org/integrations/context/>**
 
 For deduplicated conversation turns, see [Trace records](docs/trace-records.md):
 `TraceRecord` supplies `session_id`, ordered `turn_id`, role and content in one
