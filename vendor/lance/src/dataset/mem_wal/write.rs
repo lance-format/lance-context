@@ -48,7 +48,7 @@ pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, Wa
 
 use super::index::{MemIndexPlugin, MemIndexRegistry};
 use super::memtable::flush::{PreparedMemTableFlush, TriggerMemTableFlush};
-use super::observer::WalObserver;
+use super::observer::{MemtableFlushPhase, WalObserver, observe_flush_phase};
 use super::scanner::InMemoryMemTableRef;
 use super::scanner::SsTableWarmer;
 use super::wal::{
@@ -5122,17 +5122,24 @@ impl MemTableFlushHandler {
                     ))
                 })
             };
-            let boundary = if let Some(mut reader) = memtable.take_wal_flush_completion() {
-                match reader.await_value().await {
-                    Some(Ok(_)) => receipt(),
-                    Some(Err(failure)) => Err(failure),
-                    None => Err(WalFlushFailure::from_error(&Error::io(
-                        "WAL flush handler exited before reporting completion",
-                    ))),
-                }
-            } else {
-                receipt()
-            };
+            let boundary = observe_flush_phase(
+                self.observer.as_deref(),
+                MemtableFlushPhase::WalWait,
+                async {
+                    if let Some(mut reader) = memtable.take_wal_flush_completion() {
+                        match reader.await_value().await {
+                            Some(Ok(_)) => receipt(),
+                            Some(Err(failure)) => Err(failure),
+                            None => Err(WalFlushFailure::from_error(&Error::io(
+                                "WAL flush handler exited before reporting completion",
+                            ))),
+                        }
+                    } else {
+                        receipt()
+                    }
+                },
+            )
+            .await;
             pending.wal_boundary = Some(boundary);
         }
         let covered = pending
@@ -5148,26 +5155,37 @@ impl MemTableFlushHandler {
             if !pending.index_specs.is_empty()
                 && let Some(indexes) = memtable.indexes_arc()
             {
-                self.wal_flusher
-                    .track_batch(Some(indexes), memtable.batch_count(), 0)
-                    .wait()
-                    .await?;
+                observe_flush_phase(
+                    self.observer.as_deref(),
+                    MemtableFlushPhase::IndexWait,
+                    self.wal_flusher
+                        .track_batch(Some(indexes), memtable.batch_count(), 0)
+                        .wait(),
+                )
+                .await?;
             }
             let durable = self.wal_flusher.durable();
-            let prepared = if pending.index_specs.is_empty() {
-                self.flusher
-                    .prepare(memtable, self.epoch, covered, durable)
-                    .await?
-            } else {
-                Box::pin(self.flusher.prepare_with_indexes(
-                    memtable,
-                    self.epoch,
-                    &pending.index_specs,
-                    covered,
-                    durable,
-                ))
-                .await?
-            };
+            let prepared = observe_flush_phase(
+                self.observer.as_deref(),
+                MemtableFlushPhase::Prepare,
+                async {
+                    if pending.index_specs.is_empty() {
+                        self.flusher
+                            .prepare(memtable, self.epoch, covered, durable)
+                            .await
+                    } else {
+                        Box::pin(self.flusher.prepare_with_indexes(
+                            memtable,
+                            self.epoch,
+                            &pending.index_specs,
+                            covered,
+                            durable,
+                        ))
+                        .await
+                    }
+                },
+            )
+            .await?;
             // Retain immutable files before awaiting publication, so lost ACKs
             // never lead to rewriting sidecars a merger may already be reading.
             pending.prepared = Some(prepared);
@@ -5175,9 +5193,13 @@ impl MemTableFlushHandler {
         if let Some(observer) = &self.observer {
             observer.on_memtable_flush_stage(memtable.generation(), "prepared");
         }
-        self.flusher
-            .publish_prepared(pending.prepared.as_ref().unwrap(), self.epoch)
-            .await
+        observe_flush_phase(
+            self.observer.as_deref(),
+            MemtableFlushPhase::Publish,
+            self.flusher
+                .publish_prepared(pending.prepared.as_ref().unwrap(), self.epoch),
+        )
+        .await
     }
 
     async fn retire_generation(&self, generation: u64) {

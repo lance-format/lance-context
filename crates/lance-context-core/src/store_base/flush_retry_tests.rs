@@ -210,6 +210,11 @@ fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
     metrics::with_local_recorder(&recorder, || {
         runtime.block_on(async {
             for failure_mode in [1, 2, 3] {
+                let failed_phase = if failure_mode == 3 {
+                    "prepare"
+                } else {
+                    "publish"
+                };
                 let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
                 let batch = RecordBatch::try_new(
                     schema.clone(),
@@ -281,6 +286,35 @@ fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
                     "injected failure mode {failure_mode} must be surfaced"
                 );
                 assert!(writer.memory().frozen_bytes() > 0);
+                // DebuggingRecorder snapshots drain histogram samples: inspect
+                // the error and successful preparation from the same snapshot.
+                let phase_metrics = snapshotter.snapshot().into_vec();
+                assert!(phase_metrics
+                    .iter()
+                    .any(|(key, _, _, value)| key.key().name()
+                        == "rollout_memtable_flush_phase_errors_total"
+                        && key
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "phase" && l.value() == failed_phase)
+                        && matches!(value, DebugValue::Counter(n) if *n > 0)));
+                let prepare_samples = phase_metrics
+                    .iter()
+                    .find_map(|(key, _, _, value)| {
+                        if key.key().name() == "rollout_memtable_flush_phase_duration_seconds"
+                            && key
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "phase" && l.value() == "prepare")
+                        {
+                            if let DebugValue::Histogram(samples) = value {
+                                return Some(samples.len());
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or(0);
+                assert_eq!(prepare_samples, usize::from(failure_mode != 3));
                 assert_eq!(gauge("rollout_memtable_flush_retry_generations"), 1.0);
                 assert!(gauge("rollout_memtable_flush_retry_bytes") > 0.0);
                 let health = crate::flush_health::snapshot();
@@ -341,6 +375,32 @@ fn failed_flush_recovers_without_new_rows_and_reports_retry_metrics() {
                         .unwrap();
                 }
                 assert_eq!(writer.memory().frozen_bytes(), 0);
+                // Reusing prepared files on publication retry must not produce
+                // extra zero-duration preparation samples. Earlier snapshots
+                // consumed the original successful preparation.
+                let phase_metrics = snapshotter.snapshot().into_vec();
+                let prepare_samples = phase_metrics
+                    .iter()
+                    .find_map(|(key, _, _, value)| {
+                        if key.key().name() == "rollout_memtable_flush_phase_duration_seconds"
+                            && key
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "phase" && l.value() == "prepare")
+                        {
+                            if let DebugValue::Histogram(samples) = value {
+                                return Some(samples.len());
+                            }
+                        }
+                        None
+                    })
+                    .unwrap_or(0);
+                assert_eq!(prepare_samples, usize::from(failure_mode == 3));
+                for (key, _, _, value) in phase_metrics {
+                    if key.key().name() == "rollout_memtable_flush_phase_in_flight" {
+                        assert!(matches!(value, DebugValue::Gauge(n) if n.into_inner() == 0.0));
+                    }
+                }
                 assert_eq!(gauge("rollout_memtable_flush_retry_generations"), 0.0);
                 assert_eq!(gauge("rollout_memtable_flush_retry_bytes"), 0.0);
                 assert!(!crate::flush_health::snapshot()
