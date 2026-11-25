@@ -22,6 +22,14 @@ pub struct WorkerDiscoveryConfig {
         requires = "managed_worker_service"
     )]
     pub managed_worker_namespace: Option<String>,
+    /// Require every desired StatefulSet ordinal before acknowledging publication.
+    /// Use with stable worker identities; scale-down still requires draining retired writers.
+    #[arg(
+        long,
+        env = "MANAGED_WORKER_STATEFULSET",
+        requires = "managed_worker_service"
+    )]
+    pub managed_worker_statefulset: Option<String>,
     /// Named TCP endpoint port exposed by the worker Service.
     #[arg(long, env = "MANAGED_WORKER_PORT_NAME", default_value = "http")]
     pub managed_worker_port_name: String,
@@ -32,6 +40,7 @@ impl Default for WorkerDiscoveryConfig {
         Self {
             managed_worker_service: None,
             managed_worker_namespace: None,
+            managed_worker_statefulset: None,
             managed_worker_port_name: "http".into(),
         }
     }
@@ -43,6 +52,7 @@ pub(crate) struct KubernetesWorkers {
     token_file: std::path::PathBuf,
     service: String,
     port_name: String,
+    statefulset_url: Option<String>,
 }
 
 /// Include Pod identity as well as address so replacement during a barrier fails.
@@ -95,6 +105,29 @@ struct Endpoint {
 #[derive(Deserialize)]
 struct Target {
     uid: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StatefulSet {
+    metadata: StatefulSetMetadata,
+    spec: StatefulSetSpec,
+}
+
+#[derive(Deserialize)]
+struct StatefulSetMetadata {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct StatefulSetSpec {
+    replicas: u32,
+    ordinals: Option<Ordinals>,
+}
+
+#[derive(Deserialize)]
+struct Ordinals {
+    start: u32,
 }
 
 #[derive(Deserialize)]
@@ -117,7 +150,15 @@ impl KubernetesWorkers {
                 .trim()
                 .to_string(),
         };
-        for (label, value) in [("Service", service.as_str()), ("namespace", &namespace)] {
+        for (label, value) in [("Service", service.as_str()), ("namespace", &namespace)]
+            .into_iter()
+            .chain(
+                config
+                    .managed_worker_statefulset
+                    .as_deref()
+                    .map(|name| ("StatefulSet", name)),
+            )
+        {
             if value.is_empty()
                 || value.len() > 63
                 || !value
@@ -146,10 +187,15 @@ impl KubernetesWorkers {
             token_file: directory.join("token"),
             service: service.clone(),
             port_name: config.managed_worker_port_name.clone(),
+            statefulset_url: config.managed_worker_statefulset.as_ref().map(|name| {
+                format!("https://kubernetes.default.svc/apis/apps/v1/namespaces/{namespace}/statefulsets/{name}")
+            }),
         }))
     }
 
     pub(crate) async fn snapshot(&self) -> Result<Membership, String> {
+        let expected = self.expected_ordinals().await?;
+        let mut pod_names = BTreeSet::new();
         let mut workers = BTreeSet::new();
         let mut next = String::new();
         let mut revision = None;
@@ -217,8 +263,16 @@ impl KubernetesWorkers {
                             "worker EndpointSlice contains an endpoint without addresses".into(),
                         );
                     }
-                    let pod_uid = endpoint
-                        .target_ref
+                    let target = endpoint.target_ref;
+                    if expected.is_some() {
+                        let name = target
+                            .as_ref()
+                            .and_then(|target| target.name.clone())
+                            .filter(|name| !name.is_empty())
+                            .ok_or("worker EndpointSlice is missing its Pod name")?;
+                        pod_names.insert(name);
+                    }
+                    let pod_uid = target
                         .and_then(|target| target.uid)
                         .filter(|uid| !uid.trim().is_empty())
                         .ok_or("worker EndpointSlice endpoint is missing a non-empty Pod UID")?;
@@ -241,7 +295,53 @@ impl KubernetesWorkers {
         if workers.is_empty() {
             return Err("worker discovery returned no endpoints".into());
         }
+        if let Some(expected) = expected {
+            if expected != pod_names {
+                return Err(format!(
+                    "worker StatefulSet membership is incomplete; missing {:?}, unexpected {:?}",
+                    expected.difference(&pod_names).collect::<Vec<_>>(),
+                    pod_names.difference(&expected).collect::<Vec<_>>()
+                ));
+            }
+        }
         Ok(Membership(workers))
+    }
+
+    async fn expected_ordinals(&self) -> Result<Option<BTreeSet<String>>, String> {
+        let Some(url) = &self.statefulset_url else {
+            return Ok(None);
+        };
+        let token = std::fs::read_to_string(&self.token_file)
+            .map_err(|error| format!("read Kubernetes token: {error}"))?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .map_err(|error| format!("worker StatefulSet discovery failed: {error}"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(format!(
+                "worker StatefulSet discovery returned HTTP {}",
+                response.status()
+            ));
+        }
+        let statefulset: StatefulSet = response
+            .json()
+            .await
+            .map_err(|error| format!("invalid worker StatefulSet response: {error}"))?;
+        let start = statefulset
+            .spec
+            .ordinals
+            .map_or(0, |ordinals| ordinals.start);
+        let end = start
+            .checked_add(statefulset.spec.replicas)
+            .ok_or("worker StatefulSet ordinal range overflow")?;
+        Ok(Some(
+            (start..end)
+                .map(|ordinal| format!("{}-{ordinal}", statefulset.metadata.name))
+                .collect(),
+        ))
     }
 }
 

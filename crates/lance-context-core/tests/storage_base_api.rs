@@ -110,6 +110,50 @@ fn payloads(batches: &[RecordBatch]) -> BTreeMap<String, Vec<u8>> {
     result
 }
 
+#[test]
+fn cold_publication_recovers_only_the_owned_wal_without_a_new_append_or_merge() {
+    let directory = TempDir::new().unwrap();
+    let uri = directory.path().to_str().unwrap();
+    let mut owned = options();
+    owned.seal_on_put = false;
+    let mut foreign = owned.clone();
+    foreign.shard_id = Some("other-worker".into());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let writers = runtime.block_on(async {
+        let mut writers = Vec::new();
+        for (options, key) in [(owned.clone(), "owned"), (foreign.clone(), "foreign")] {
+            let writer = StorageBase::open(uri, options, true).await.unwrap();
+            writer
+                .put(vec![batch(key, "test", key.as_bytes())])
+                .await
+                .unwrap();
+            writers.push(writer);
+        }
+        writers
+    });
+    // Stop all executors before dropping handles. Dropping StorageBase inside a
+    // live Tokio runtime would spawn a graceful close and would not model a crash.
+    drop(runtime);
+    drop(writers);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut replacement = StorageBase::open(uri, owned, false).await.unwrap();
+        let base_version = replacement.version();
+        replacement.flush().await.unwrap();
+        assert!(payloads(&read_batches(&replacement, None, None).await).is_empty());
+        assert!(replacement.recover_and_flush_own_wal().await.unwrap());
+        assert_eq!(
+            payloads(&read_batches(&replacement, None, None).await),
+            BTreeMap::from([("owned".into(), b"owned".to_vec())])
+        );
+        assert_eq!(replacement.version(), base_version);
+        replacement.close().await.unwrap();
+        let mut other = StorageBase::open(uri, foreign, false).await.unwrap();
+        assert!(other.recover_and_flush_own_wal().await.unwrap());
+        assert_eq!(payloads(&read_batches(&other, None, None).await).len(), 2);
+        other.close().await.unwrap();
+    });
+}
+
 #[tokio::test]
 async fn external_store_reads_custom_keys_and_binary_columns_across_wal_merge_and_reopen() {
     let directory = TempDir::new().unwrap();

@@ -70,12 +70,21 @@ MANAGED_STORE_KIND=events
 MANAGED_WORKER_SERVICE=event-workers
 MANAGED_WORKER_NAMESPACE=events
 MANAGED_WORKER_PORT_NAME=http
+MANAGED_WORKER_STATEFULSET=event-workers
 ```
 
 The namespace defaults to the master's mounted service-account namespace; the
 port name defaults to `http`. Discovery overrides `WORKER_ENDPOINTS` only for the
 managed store kind. It also supplies that kind's background merge fan-out and
 merge admission. Other store kinds retain their existing routing.
+
+`MANAGED_WORKER_STATEFULSET` is optional. When set, discovery also reads that
+StatefulSet and requires the complete set of desired Pod ordinal names (including
+its configured starting ordinal). A deleted Pod temporarily absent from every
+EndpointSlice therefore cannot turn a smaller membership into a successful
+barrier. Replacement/recovery is a retryable wait, not permission to skip a writer.
+Grant namespace-scoped GET on that named StatefulSet in addition to the LIST
+permission below. Ordinary Service discovery remains unchanged when unset.
 
 Each publication request lists the Service's EndpointSlices through the Kubernetes
 API, using Most Recent read semantics and following every page. It contacts the
@@ -111,6 +120,10 @@ rules:
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [list]
+  - apiGroups: [apps]
+    resources: [statefulsets]
+    resourceNames: [event-workers]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -139,7 +152,11 @@ EndpointSlice. A fresh API snapshot therefore avoids the independent, stale work
 list that could previously omit a newly scaled writer.
 
 Discovery is not a historical writer registry. A Pod removed before the first
-snapshot is no longer discoverable. Graceful scale-down must stop new appends,
+snapshot is no longer discoverable through EndpointSlices alone. StatefulSet
+validation closes the replacement gap while its ordinal remains desired; the
+worker's publication handler must also replay and publish its own durable WAL
+after restart. `StorageBase::recover_and_flush_own_wal` provides that operation
+without merging or taking over another live writer's shard. Graceful scale-down must stop new appends,
 drain and publish the retiring worker before its endpoint disappears. Abrupt
 worker loss, direct-to-Pod writes outside this Service, and concurrent old-run
 writes require additional recovery or fencing; this barrier does not provide it.
