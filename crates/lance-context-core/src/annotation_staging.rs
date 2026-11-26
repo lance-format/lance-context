@@ -18,6 +18,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 mod body;
 mod cold_points;
 mod compaction;
+mod immutable;
 mod patch_lookup;
 mod preserve_id;
 mod publication;
@@ -27,6 +28,7 @@ mod registration_lookup;
 mod status_filter;
 mod views;
 pub use body::{BodySnapshot, TurnBodySource, TurnRead, BODY_SNAPSHOT_PROPERTY};
+pub use immutable::{ImmutableBase, ImmutableBodyRead, ImmutableRegistration};
 pub use patch_lookup::PatchLookup;
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
@@ -143,6 +145,7 @@ struct State {
 /// values may share the existing, bounded Lance session cache for later apply.
 /// Point reads retain only a selected value or a base handle, never whole maps.
 pub struct AnnotationStaging {
+    immutable_body: bool,
     scope: Scope,
     limits: Limits,
     // Writers queue here before requesting exclusive state access. Cold apply
@@ -232,6 +235,16 @@ impl AnnotationStaging {
         limits: Limits,
     ) -> Result<Self> {
         validate_schema(&base)?;
+        Self::new_inner(base, scope, materialized, limits, false)
+    }
+
+    fn new_inner(
+        base: Arc<Dataset>,
+        scope: Scope,
+        materialized: u64,
+        limits: Limits,
+        immutable_body: bool,
+    ) -> Result<Self> {
         limits.validate()?;
         if scope.table_instance.is_empty()
             || scope.table_instance.len() > 256
@@ -244,6 +257,7 @@ impl AnnotationStaging {
             published_values::PublishedValues::new(&base, materialized, limits.readers);
         let (base, views) = views::Registry::new(base);
         Ok(Self {
+            immutable_body,
             scope,
             bytes: Arc::new(Semaphore::new(limits.retained_bytes)),
             entries: Arc::new(Semaphore::new(limits.retained_entries)),
@@ -336,6 +350,11 @@ impl AnnotationStaging {
         lookup: Option<&RegistrationLookup>,
         patch_lookup: Option<&PatchLookup>,
     ) -> Result<ApplyOutcome> {
+        if self.immutable_body {
+            return Err(invalid(
+                "immutable body staging does not accept annotation mutations",
+            ));
+        }
         let _mutation = self.mutation.lock().await;
         let pending = {
             let state = self.state.read().await;
@@ -590,6 +609,9 @@ impl AnnotationStaging {
         body: bool,
         wait_for_reader: bool,
     ) -> Result<(PointRead, Option<body::CapturedBody>)> {
+        if self.immutable_body {
+            return Err(invalid("immutable body staging has no annotation view"));
+        }
         if turn.is_empty() || turn.len() > self.limits.value_bytes {
             return Err(invalid("invalid annotation turn key"));
         }
