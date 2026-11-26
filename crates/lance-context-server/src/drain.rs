@@ -32,7 +32,11 @@ use tokio::{
 
 /// Serve until shutdown, joining storage handlers before retiring blocked
 /// response sockets. Returning also joins handlers detached by client disconnect.
-pub(crate) async fn serve(
+///
+/// `response_idle` limits stalled socket writes only during shutdown, after
+/// accepted handlers finish. It never limits handler execution or storage work.
+/// Callers should close storage resources only after this function returns.
+pub async fn serve(
     listener: TcpListener,
     app: Router,
     response_idle: Duration,
@@ -255,15 +259,17 @@ impl Drain {
 /// A route may opt its audited read-only phase into client cancellation while
 /// keeping store opening and accepted mutations protected by the handler task.
 #[derive(Clone)]
-pub(crate) struct ClientCancellation(tokio::sync::watch::Receiver<()>);
+pub struct ClientCancellation(tokio::sync::watch::Receiver<()>);
 
 impl ClientCancellation {
-    pub(crate) fn channel() -> (tokio::sync::watch::Sender<()>, Self) {
+    /// Create a signal that fires when its sender is dropped or sends a value.
+    pub fn channel() -> (tokio::sync::watch::Sender<()>, Self) {
         let (sender, receiver) = tokio::sync::watch::channel(());
         (sender, Self(receiver))
     }
 
-    pub(crate) async fn cancelled(&self) {
+    /// Wait for the HTTP caller to disconnect. Only use around cancellable work.
+    pub async fn cancelled(&self) {
         let mut receiver = self.0.clone();
         // The only sender belongs to the outer HTTP future. Closing admission
         // does not drop it; disconnecting that request does.

@@ -1000,14 +1000,15 @@ impl StorageBase {
         result
     }
 
-    /// Recover a restarted instance's durable WAL before its cleanup merge.
+    /// Recover and publish a restarted instance's durable WAL without merging it.
     /// Ordinary flush sweeps stay cheap: they only touch resident writers.
     /// This path is for this handle's OWN write shard, never a foreign shard;
     /// as with `put`, the caller must have exclusive ownership of that writer ID.
     /// Opening a writer claims its epoch, so this is not a mechanism for taking
     /// over an instance that is still alive.
-    /// Returns false when there is no own shard to merge.
-    async fn recover_and_flush_own_wal(&self) -> LanceResult<bool> {
+    /// Returns false when there is no own shard. Unlike `flush`, this opens a
+    /// cold writer and replays its durable WAL even without a new append.
+    pub async fn recover_and_flush_own_wal(&self) -> LanceResult<bool> {
         if self.is_version_pinned() || self.deleted {
             return Ok(false);
         }

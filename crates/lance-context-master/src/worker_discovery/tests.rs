@@ -60,7 +60,78 @@ fn client(url: String, token: &tempfile::NamedTempFile) -> KubernetesWorkers {
         token_file: token.path().to_path_buf(),
         service: "workers".into(),
         port_name: "http".into(),
+        statefulset_url: None,
     }
+}
+
+#[tokio::test]
+async fn statefulset_replacement_gap_cannot_acknowledge_a_smaller_worker_list() {
+    let flushed = Arc::new(AtomicUsize::new(0));
+    let (worker, _worker_server) = serve(Router::new().route(
+        "/api/v1/events/table/flush-local",
+        post({
+            let flushed = flushed.clone();
+            move || {
+                let flushed = flushed.clone();
+                async move {
+                    flushed.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }
+        }),
+    ))
+    .await;
+    let named = |name: &str| {
+        let mut value = slice(&worker, name, true);
+        value["endpoints"][0]["targetRef"]["name"] = json!(name);
+        value
+    };
+    let members = Arc::new(Mutex::new(vec![named("workers-5")]));
+    let (url, _api) = serve(
+        Router::new()
+            .route(
+                "/",
+                get({
+                    let members = members.clone();
+                    move || {
+                        let members = members.clone();
+                        async move { Json(page(members.lock().unwrap().clone(), "10", "")) }
+                    }
+                }),
+            )
+            .route(
+                "/statefulset",
+                get(|| async {
+                    Json(json!({
+                        "metadata":{"name":"workers"},
+                        "spec":{"replicas":2,"ordinals":{"start":5}}
+                    }))
+                }),
+            ),
+    )
+    .await;
+    let token = tempfile::NamedTempFile::new().unwrap();
+    let mut discovery = client(url.clone(), &token);
+    discovery.statefulset_url = Some(format!("{url}/statefulset"));
+    let http = crate::state::worker_http_client().unwrap();
+    for list in [
+        vec![named("workers-5")],
+        vec![named("workers-5"), named("unrelated-6")],
+    ] {
+        *members.lock().unwrap() = list;
+        let result =
+            crate::publication::flush_discovered(&http, &discovery, "events", "table").await;
+        assert!(
+            matches!(result, Err(crate::error::MasterError::Unavailable(message))
+            if message.contains("membership is incomplete"))
+        );
+        assert_eq!(flushed.load(Ordering::SeqCst), 0);
+    }
+    *members.lock().unwrap() = vec![named("workers-5"), named("workers-6")];
+    crate::publication::flush_discovered(&http, &discovery, "events", "table")
+        .await
+        .unwrap();
+    assert_eq!(flushed.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

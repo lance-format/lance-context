@@ -3,7 +3,7 @@
 mod body_timeout;
 mod config;
 mod demand_publish;
-mod drain;
+use lance_context_server::drain;
 mod error;
 mod legacy_merge;
 mod merge_execution;

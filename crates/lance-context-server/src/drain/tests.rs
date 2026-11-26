@@ -456,17 +456,6 @@ async fn progressing_download_survives_beyond_total_idle_duration() {
     server.await.unwrap().unwrap();
 }
 
-#[test]
-fn response_idle_timeout_must_be_positive() {
-    use clap::Parser;
-    assert!(crate::config::ServerConfig::try_parse_from([
-        "server",
-        "--http-shutdown-response-idle-secs",
-        "0"
-    ])
-    .is_err());
-}
-
 #[tokio::test]
 async fn resumed_socket_writes_reset_idle_even_when_download_exceeds_it() {
     let idle = Duration::from_secs(1);
