@@ -111,9 +111,7 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     assert_eq!(selected.uri, body.uri);
     assert_eq!(selected.incarnation, binding().incarnation);
     assert!(selected.through >= through);
-    let durable =
-        crate::annotations::checkpoint::load(service.ingress(), &body, selected.manifest.version)
-            .await?;
+    let durable = annotation_publication::read(&c, &body, Some(selected.manifest.version)).await?;
     assert_eq!(durable.count_rows(None).await?, 6);
     assert_eq!(
         Schema::from(durable.schema()),
@@ -157,9 +155,7 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     let result = service.submit(&repeated, DEADLINE).await?;
     drained(&c, &service, result.index).await?;
     let selected = service.selected_full_body(DEADLINE).await?;
-    let replayed =
-        crate::annotations::checkpoint::load(service.ingress(), &body, selected.manifest.version)
-            .await?;
+    let replayed = annotation_publication::read(&c, &body, Some(selected.manifest.version)).await?;
     assert_eq!(replayed.manifest().fragments, durable.manifest().fragments);
     assert_eq!(service.submit(&repeated, DEADLINE).await?, result);
     // More concurrent lanes than the frame budget can admit at once. Queued
@@ -188,8 +184,7 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     assert_eq!(service.retained_body_frames(), (0, 0));
     let selected = service.selected_full_body(DEADLINE).await?;
     let after_burst =
-        crate::annotations::checkpoint::load(service.ingress(), &body, selected.manifest.version)
-            .await?;
+        annotation_publication::read(&c, &body, Some(selected.manifest.version)).await?;
     assert_eq!(
         after_burst.manifest().fragments,
         durable.manifest().fragments
