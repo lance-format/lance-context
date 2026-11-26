@@ -12,6 +12,8 @@ use lance_file::writer::FileWriterOptions;
 use lance_table::transaction::{Operation, Transaction};
 use std::collections::HashMap;
 
+mod immutable;
+
 use crate::{MergeMemoryBudget, MergeReservation};
 
 pub const RESULTS_PROPERTY: &str = "lance-context.annotation-results";
@@ -19,6 +21,7 @@ pub const MAX_RESULTS_BYTES: usize = 640 << 10;
 pub(super) const METADATA_BUDGET: usize = 8 * MAX_RESULTS_BYTES + 1024;
 
 pub(super) struct Generation {
+    immutable_body: bool,
     pub values: Values,
     base: Arc<views::Base>,
     base_cut: u64,
@@ -105,6 +108,7 @@ impl AnnotationStaging {
             })
             .transpose()?;
         let generation = Arc::new(Generation {
+            immutable_body: self.immutable_body,
             values: std::mem::take(&mut state.active),
             base: state.base.clone(),
             base_cut: state.materialized,
@@ -150,9 +154,11 @@ impl AnnotationStaging {
         // valid. Warming fences cold-read promotion before replacing keys, so
         // a delayed old read cannot replace a newer published value. Neither
         // cache owns staging permits or base handles.
-        self.published_values
-            .remember(&generation.values, generation.through)
-            .await?;
+        if !self.immutable_body {
+            self.published_values
+                .remember(&generation.values, generation.through)
+                .await?;
+        }
         drop(state);
         let mut state = self.state.write().await;
         state.base = state.views.install(selected);
@@ -223,6 +229,11 @@ impl FrozenAnnotations {
         batch_rows: usize,
         body: Option<BodySnapshot>,
     ) -> Result<PreparedAnnotations> {
+        if self.0.immutable_body {
+            return Err(invalid(
+                "immutable body generation requires full-body preparation",
+            ));
+        }
         if !(1..=65_536).contains(&batch_rows) {
             return Err(invalid("invalid annotation publication batch rows"));
         }

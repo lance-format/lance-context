@@ -77,6 +77,11 @@ impl AnnotationStaging {
         response_bytes: usize,
         wait_for_reader: bool,
     ) -> Result<StatusRead> {
+        if self.immutable_body {
+            return Err(invalid(
+                "immutable body staging has no annotation status view",
+            ));
+        }
         if !(1..=MAX_STATUS_MATCHES).contains(&limit)
             || status
                 .as_ref()
