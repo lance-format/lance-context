@@ -26,6 +26,11 @@ pub struct TurnLookupObservation {
     pub lance_bytes_read: Option<usize>,
     pub lance_requests: Option<usize>,
     pub lance_indices_loaded: Option<usize>,
+    pub fragments_scanned: Option<usize>,
+    pub ranges_scanned: Option<usize>,
+    pub rows_scanned: Option<usize>,
+    /// Native task-stream wait time in nanoseconds; this is not CPU time.
+    pub task_wait_time_ns: Option<usize>,
 }
 
 /// Key-only results for one exact captured base. A miss is meaningful only for
@@ -254,6 +259,10 @@ impl TurnIngestionSpec {
             observation.lance_bytes_read = Some(stats.bytes_read);
             observation.lance_requests = Some(stats.requests);
             observation.lance_indices_loaded = Some(stats.indices_loaded);
+            observation.fragments_scanned = stats.all_counts.get("fragments_scanned").copied();
+            observation.ranges_scanned = stats.all_counts.get("ranges_scanned").copied();
+            observation.rows_scanned = stats.all_counts.get("rows_scanned").copied();
+            observation.task_wait_time_ns = stats.all_times.get("task_wait_time").copied();
         }
         observation.elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         Ok(TurnLookup {

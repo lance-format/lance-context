@@ -37,7 +37,7 @@ mod status_filter;
 mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
-pub use lookup_observation::BodyLookupObservation;
+pub use lookup_observation::{BodyLookupObservation, LookupMetricObservation};
 pub use shard::Shard;
 pub use window::SourceObservation;
 

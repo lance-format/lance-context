@@ -52,6 +52,104 @@ fn body() -> Result<RecordBatch> {
     )?)
 }
 
+#[tokio::test]
+async fn key_scan_reports_native_work_for_missing_composite_key() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("body.lance");
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(body()?)], schema());
+    let base = Arc::new(lance::Dataset::write(reader, path.to_str().unwrap(), None).await?);
+    // Both column values exist, but this tuple does not. The miss exhausts the
+    // native stream, so a zero-row result must still expose its scan work.
+    let key = spec()?.business_key(&["b", "y"], 1024)?;
+    let budget = lance_context_core::MergeMemoryBudget::new(1 << 20);
+    let lookup = spec()?
+        .lookup_existing(base, &[key.as_str()], &budget)
+        .await?
+        .expect("lookup workspace admitted");
+    assert_eq!(lookup.get(&key), Some(false));
+    let observed = lookup.observation();
+    assert_eq!(observed.scans_started, 1);
+    assert_eq!(observed.projected_rows, 0);
+    assert_eq!(observed.fragments_scanned, Some(1));
+    assert!(observed.ranges_scanned.is_some_and(|count| count > 0));
+    assert_eq!(observed.rows_scanned, Some(4));
+    assert!(observed.task_wait_time_ns.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn key_scan_uses_existing_zone_maps_and_reads_uncovered_fragments() -> Result<()> {
+    use lance::index::DatasetIndexExt;
+    use lance_index::{
+        scalar::{BuiltinIndexType, ScalarIndexParams},
+        IndexType,
+    };
+
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("body.lance");
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(body()?)], schema());
+    let mut base = lance::Dataset::write(reader, path.to_str().unwrap(), None).await?;
+    let spec = spec()?;
+    let budget = lance_context_core::MergeMemoryBudget::new(1 << 20);
+    let in_range = spec.business_key(&["b", "y"], 1024)?;
+    let new_key = spec.business_key(&["z", "y"], 1024)?;
+    let missing = spec.business_key(&["zz", "y"], 1024)?;
+
+    let unindexed = spec
+        .lookup_existing(Arc::new(base.clone()), &[&new_key, &missing], &budget)
+        .await?
+        .unwrap();
+    assert_eq!(unindexed.observation().rows_scanned, Some(4));
+    drop(unindexed);
+    for column in ["session_id", "id"] {
+        base.create_index(
+            &[column],
+            IndexType::ZoneMap,
+            None,
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap),
+            false,
+        )
+        .await?;
+    }
+    let indexed = spec
+        .lookup_existing(Arc::new(base.clone()), &[&new_key, &missing], &budget)
+        .await?
+        .unwrap();
+    assert_eq!(indexed.get(&new_key), Some(false));
+    assert_eq!(indexed.observation().rows_scanned, Some(0));
+    assert_eq!(indexed.observation().fragments_scanned, Some(0));
+    drop(indexed);
+
+    // Independent column extrema cannot prove that an in-range tuple is absent.
+    let in_range_lookup = spec
+        .lookup_existing(Arc::new(base.clone()), &[&in_range], &budget)
+        .await?
+        .unwrap();
+    assert_eq!(in_range_lookup.get(&in_range), Some(false));
+    assert_eq!(in_range_lookup.observation().rows_scanned, Some(4));
+    drop(in_range_lookup);
+
+    let one = body()?.slice(0, 1);
+    let mut columns = one.columns().to_vec();
+    columns[0] = Arc::new(StringArray::from(vec!["z"]));
+    columns[1] = Arc::new(StringArray::from(vec!["y"]));
+    let appended = RecordBatch::try_new(schema(), columns)?;
+    base.append(
+        arrow_array::RecordBatchIterator::new(vec![Ok(appended)], schema()),
+        None,
+    )
+    .await?;
+    let uncovered = spec
+        .lookup_existing(Arc::new(base), &[&new_key, &missing], &budget)
+        .await?
+        .unwrap();
+    assert_eq!(uncovered.get(&new_key), Some(true));
+    assert_eq!(uncovered.get(&missing), Some(false));
+    assert_eq!(uncovered.observation().rows_scanned, Some(1));
+    assert_eq!(uncovered.observation().fragments_scanned, Some(1));
+    Ok(())
+}
+
 fn layout() -> Layout {
     Layout {
         cluster: Uuid::from_u128(1),
