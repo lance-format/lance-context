@@ -197,7 +197,8 @@ impl FrozenCheckpoint {
             annotations: self
                 .annotations
                 .prepare_immutable_body(workspace, batches, self.bodies.clone())
-                .await?,
+                .await
+                .map_err(runtime::publication_write_error)?,
             results: self.results.clone(),
             bodies: self.bodies.clone(),
         })
