@@ -11,6 +11,31 @@ pub struct Shard {
 }
 
 impl Shard {
+    /// Session routing for a table explicitly provisioned with a generic spec.
+    pub fn for_session(layout: &Layout, binding: &TableBinding, session: &str) -> Result<Self> {
+        Self::for_turn(layout, binding, session)
+    }
+
+    pub fn turn_schema(
+        &self,
+        spec: &crate::turn_ingestion::TurnIngestionSpec,
+        limits: &Limits,
+    ) -> Result<SchemaRef> {
+        self.bind_schema(mixed::wire::schema_for(spec, limits)?)
+    }
+
+    pub fn turn_contract(
+        &self,
+        binding: &TableBinding,
+        spec: &crate::turn_ingestion::TurnIngestionSpec,
+        limits: &Limits,
+    ) -> Result<IngestContract> {
+        Ok(IngestContract {
+            policy: WritePolicy::TurnIngestion,
+            schema: arrow_schema_fingerprint(self.turn_schema(spec, limits)?.as_ref())?,
+            ..binding.contract()?
+        })
+    }
     /// Reuse the immutable layout's stable length-prefixed key routing. Turn IDs
     /// are sufficient for both point reads and updates; no directory lookup or
     /// body/session projection is required. Changing the layout is a migration.
@@ -54,7 +79,7 @@ impl Shard {
         )?)
     }
 
-    fn bind_schema(&self, schema: SchemaRef) -> Result<SchemaRef> {
+    pub(super) fn bind_schema(&self, schema: SchemaRef) -> Result<SchemaRef> {
         ensure!(self.bucket < 65_536, "annotation shard out of bounds");
         ensure!(
             schema
@@ -125,6 +150,7 @@ impl mixed::Decoded {
         shard: Option<Shard>,
         layout: &Layout,
         contract: &IngestContract,
+        spec: Option<&crate::turn_ingestion::TurnIngestionSpec>,
     ) -> Result<()> {
         let Some(shard) = shard else {
             return Ok(());
@@ -132,12 +158,24 @@ impl mixed::Decoded {
         match self {
             Self::Patches(rows) => {
                 for row in rows {
-                    shard.validate_turn(layout, contract, &row.turn)?;
+                    if let Some(spec) = spec {
+                        shard.validate_turn(layout, contract, &spec.routing_key(&row.turn)?)?;
+                    } else {
+                        shard.validate_turn(layout, contract, &row.turn)?;
+                    }
                 }
             }
             Self::Creates { rows, .. } => {
                 for row in rows {
-                    shard.validate_turn(layout, contract, &row.turn)?;
+                    shard.validate_turn(
+                        layout,
+                        contract,
+                        if spec.is_some() {
+                            &row.rollout_id
+                        } else {
+                            &row.turn
+                        },
+                    )?;
                 }
             }
         }

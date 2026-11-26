@@ -387,6 +387,7 @@ async fn annotation_projection_application_config_routes_bootstrap_and_rejects_b
         bootstrap: identity(),
     });
     config.annotations = Some(config::Annotations {
+        turns: None,
         shard: None,
         routes: vec![],
         wal_clusters: BTreeMap::new(),

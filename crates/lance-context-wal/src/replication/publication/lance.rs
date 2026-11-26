@@ -24,8 +24,10 @@ use object_store::path::Path;
 use std::{fmt::Debug, sync::Arc};
 use uuid::Uuid;
 
+mod pinned;
 mod reservation;
 mod transaction;
+pub use pinned::PinnedManifest;
 
 /// A trusted, bounded transport adapter. A local replica read is not sufficient.
 #[async_trait::async_trait]

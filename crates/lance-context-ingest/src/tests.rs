@@ -31,6 +31,8 @@ mod annotation_storage_retry;
 mod annotations;
 #[cfg(feature = "materializer")]
 mod bootstrap;
+#[cfg(feature = "materializer")]
+mod generic_turns;
 #[cfg(all(feature = "http-client", feature = "materializer"))]
 mod http;
 #[cfg(feature = "materializer")]

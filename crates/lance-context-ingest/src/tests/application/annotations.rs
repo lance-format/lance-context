@@ -164,6 +164,7 @@ async fn annotation_executable_two_ingresses_restart_owner_and_fence_lost_lease(
         },
     });
     config.annotations = Some(config::Annotations {
+        turns: None,
         shard: None,
         routes: vec![],
         wal_clusters: BTreeMap::new(),

@@ -111,8 +111,8 @@ pub(super) async fn validate(
             && reference.transaction == transaction.uuid,
         "body maintenance changed destination or native identity"
     );
-    let previous = super::load_body(body, &prior, &scope.table_instance).await?;
-    let next = super::load_body(body, &reference, &scope.table_instance).await?;
+    let previous = super::load_body(base, body, &prior, &scope.table_instance).await?;
+    let next = super::load_body(base, body, &reference, &scope.table_instance).await?;
     let native = next
         .read_transaction()
         .await?

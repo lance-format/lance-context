@@ -85,6 +85,7 @@ pub(super) async fn fetch(
     let shard = service.shard;
     let layout = ingress.layout.clone();
     let scope = ingress.scope.clone();
+    let spec = ingress.turn_spec.clone();
     Ok(Some(
         service
             .shared
@@ -96,7 +97,7 @@ pub(super) async fn fetch(
                     } else {
                         mixed::Decoded::Patches(wire::decode(body, schema, max_rows, value_bytes)?)
                     };
-                    decoded.validate_shard(shard, &layout, &scope.contract)?;
+                    decoded.validate_shard(shard, &layout, &scope.contract, spec.as_deref())?;
                     Ok(Pending {
                         index,
                         meta,

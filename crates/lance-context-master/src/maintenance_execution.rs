@@ -358,6 +358,14 @@ where
 }
 
 fn fenced(config: &crate::config::MasterConfig, target: &str) -> bool {
+    if config.managed_store_kind.as_deref().is_some_and(|kind| {
+        target
+            .strip_prefix(kind)
+            .is_some_and(|tail| tail.starts_with(':'))
+    }) {
+        // An exact append selector must not enroll the other registered tables.
+        return config.append.managed(config, target);
+    }
     config.merge_rollout.owned(target)
         || (config.maintenance.fence_legacy_maintenance && !target.starts_with("datagen:"))
 }
@@ -372,10 +380,10 @@ where
     F: Future<Output = Result<String, String>>,
 {
     crate::merge_capacity::phase("fenced_maintenance");
-    let uri = match claim.task.target.strip_prefix("generic:") {
-        Some(name) => state.generic_uri(name),
-        None => state.rollout_uri(&claim.task.target),
-    };
+    let uri = state
+        .maintenance_uri(&claim.task.target)
+        .await
+        .map_err(|e| e.to_string())?;
     if !lance_context_core::merge_write_scope::supports_version_fencing(&uri) {
         return Err("invalid storage backend for maintenance fencing".into());
     }
@@ -898,6 +906,29 @@ mod tests {
         assert!(!fenced(&enabled, "datagen:legacy"));
         assert!(!enabled.merge_rollout.owned("new-hot-table"));
         assert!(!enabled.merge_rollout.owned("generic:new-hot-table"));
+    }
+
+    #[test]
+    fn registered_maintenance_follows_the_append_target_selector() {
+        for kind in ["datagen", "events"] {
+            let selected = format!("{kind}:selected");
+            let other = format!("{kind}:other");
+            let mut config = MasterConfig::parse_from([
+                "master",
+                "--managed-store-kind",
+                kind,
+                "--rollout-append-local",
+                "--rollout-append-targets",
+                &selected,
+                "--fence-legacy-maintenance",
+            ]);
+            assert!(fenced(&config, &selected));
+            assert!(!fenced(&config, &other));
+            config.append.rollout_append_targets = vec!["*".into()];
+            assert!(fenced(&config, &other));
+            config.append.rollout_append_targets.clear();
+            assert!(!fenced(&config, &selected));
+        }
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<MasterState>) {

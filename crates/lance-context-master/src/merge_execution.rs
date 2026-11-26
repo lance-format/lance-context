@@ -137,7 +137,10 @@ pub(crate) async fn run_merge_wal(
         }
         return Err("merge target draining for protocol transition".into());
     }
-    if !state.config.merge_rollout.owned(target) && !state.config.merge_rollout.fence_legacy {
+    if !state.config.merge_rollout.owned(target)
+        && !state.config.merge_rollout.fence_legacy
+        && !state.config.append.managed(&state.config, target)
+    {
         if let Some(old) = coordinator.get(target).await? {
             let old =
                 crate::legacy_retirement::reconcile_prepared(&state.config, &coordinator, old)
@@ -199,7 +202,10 @@ pub(crate) async fn run_merge_wal(
             claim,
             lance_context_merge::MaintenanceKind::Catchup,
             async {
-                if state.config.merge_rollout.owned(target) && state.config.append.enabled(target) {
+                if state.config.append.managed(&state.config, target)
+                    || state.config.merge_rollout.owned(target)
+                        && state.config.append.enabled(target)
+                {
                     crate::rollout_append::run(state, target).await
                 } else {
                     crate::local_merge::run(state, target).await
@@ -765,15 +771,13 @@ pub(crate) async fn recover_execution(
             return coordinator.release(proof, &terminal).await?.then_some(())
                 .ok_or_else(|| "claim lost before releasing cancelled merge reservation".to_string());
         }
-        if state.registered_target(&old.target).is_some() {
+        if state.registered_target(&old.target).is_some() && old.maintenance.is_none() {
             return Err("unresolved registered-store execution requires owner reconciliation; rollout storage recovery does not apply".into());
         }
         let frozen = coordinator.freeze(proof, &old).await?
             .ok_or_else(|| "merge execution changed while freezing commit admission".to_string())?;
         let watermarks = coordinator.watermarks(&frozen).await?;
-        let uri = match frozen.target.strip_prefix("generic:") {
-            Some(name) => state.generic_uri(name), None => state.rollout_uri(&frozen.target),
-        };
+        let uri = state.maintenance_uri(&frozen.target).await.map_err(|e| e.to_string())?;
         if watermarks.dataset_uri.as_deref().is_some_and(|worker_uri| worker_uri != uri) {
             return Err("dataset URI mismatch between worker and recovery master".into());
         }

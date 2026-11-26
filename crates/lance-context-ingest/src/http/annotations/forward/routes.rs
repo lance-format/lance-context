@@ -146,12 +146,18 @@ impl Routes {
                         return Err(Failure::bad("invalid_point_route"));
                     }
                     let ingress = &self.owners.values().next().unwrap().ingress;
+                    let routing = ingress
+                        .turn_spec
+                        .as_ref()
+                        .map(|spec| spec.routing_key(&point.turn))
+                        .transpose()
+                        .map_err(|_| Failure::bad("invalid_point_route"))?;
                     ingress
                         .layout
                         .session_bucket(
                             &ingress.scope.contract.tenant,
                             &ingress.scope.contract.qualified_table,
-                            &point.turn,
+                            routing.as_deref().unwrap_or(&point.turn),
                         )
                         .map_err(|_| Failure::bad("invalid_point_route"))?
                 }
@@ -163,6 +169,11 @@ impl Routes {
                 Operation::FilterStatus => {
                     serde_json::from_slice::<StatusRequest>(&bytes)
                         .map_err(|_| Failure::bad("invalid_status_filter"))?
+                        .bucket
+                }
+                Operation::SelectedBody => {
+                    serde_json::from_slice::<SelectedBodyRequest>(&bytes)
+                        .map_err(|_| Failure::bad("invalid_selected_body_request"))?
                         .bucket
                 }
                 Operation::Update => unreachable!(),
