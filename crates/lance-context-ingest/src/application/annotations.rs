@@ -52,6 +52,21 @@ pub async fn provision(config: &Config) -> Result<()> {
         )
         .await?;
         if let Some(shard) = a.shard {
+            if let Some(spec) = &a.turns {
+                bootstrap::annotations::mixed::provision_turn_shard(
+                    config.client()?,
+                    Arc::new(config.layout.clone()),
+                    table.binding.clone(),
+                    storage,
+                    body,
+                    table.bootstrap.clone(),
+                    a.staging.clone(),
+                    shard,
+                    spec,
+                )
+                .await?;
+                return Ok(());
+            }
             bootstrap::annotations::mixed::provision_shard(
                 config.client()?,
                 Arc::new(config.layout.clone()),
@@ -119,6 +134,18 @@ async fn connect(config: &Config) -> Result<Ingress> {
     let binding = config.tables[0].binding.clone();
     let budget = MergeMemoryBudget::new(config.ingress_memory_bytes);
     if let Some(shard) = options.shard {
+        if let Some(spec) = &options.turns {
+            return annotations::mixed::connect_turn_ingress(
+                client,
+                layout,
+                binding,
+                &options.staging,
+                budget,
+                shard,
+                spec,
+            )
+            .await;
+        }
         annotations::mixed::connect_shard_ingress(
             client,
             layout,
@@ -166,15 +193,28 @@ async fn connect_routes(config: &Config) -> Result<Vec<(Ingress, String)>> {
         } else {
             (&client, &layout)
         };
-        let ingress = annotations::mixed::connect_shard_ingress(
-            client.clone(),
-            layout.clone(),
-            route.binding.clone(),
-            &a.staging,
-            budget.clone(),
-            route.shard,
-        )
-        .await?;
+        let ingress = if let Some(spec) = &a.turns {
+            annotations::mixed::connect_turn_ingress(
+                client.clone(),
+                layout.clone(),
+                route.binding.clone(),
+                &a.staging,
+                budget.clone(),
+                route.shard,
+                spec,
+            )
+            .await?
+        } else {
+            annotations::mixed::connect_shard_ingress(
+                client.clone(),
+                layout.clone(),
+                route.binding.clone(),
+                &a.staging,
+                budget.clone(),
+                route.shard,
+            )
+            .await?
+        };
         routes.push((ingress, route.owner_url.clone()));
     }
     Ok(routes)
@@ -291,10 +331,15 @@ pub async fn serve_owner(
             };
         let (service, runtime) = if let Some(body) = body {
             if let Some(shard) = a.shard {
+                if let Some(spec) = &a.turns {
+                    runtime::Runtime::connect_turn_shard(ingress.client.clone(), ingress.layout.clone(),
+                        table.binding.clone(), storage, body, configuration, acquisition, shard, spec).await?
+                } else {
                 runtime::Runtime::connect_mixed_shard(
                     ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
                     storage, body, configuration, acquisition, shard,
                 ).await?
+                }
             } else {
                 runtime::Runtime::connect_mixed(
                     ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),

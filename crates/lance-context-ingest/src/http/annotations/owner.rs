@@ -37,6 +37,10 @@ impl Owner {
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
             .route(
+                "/api/v1/annotations/{table}/selected-body",
+                post(selected_body),
+            )
+            .route(
                 "/api/v1/annotations/{table}/filter-status",
                 post(filter_status),
             )
@@ -265,6 +269,21 @@ impl Owner {
                     reservation = Some(held);
                     Json(result).into_response()
                 }
+                Operation::SelectedBody => {
+                    let query: SelectedBodyRequest = serde_json::from_slice(&bytes)
+                        .map_err(|_| Failure::bad("invalid_selected_body_request"))?;
+                    if query.bucket != self.service.bucket() {
+                        return Err(Failure::bad("foreign_selected_body_shard"));
+                    }
+                    let selected = self
+                        .service
+                        .selected_body(options.body_total_timeout)
+                        .await
+                        .map_err(|_| {
+                            Failure::unavailable("selected_body_unavailable", "not_submitted")
+                        })?;
+                    Json(selected).into_response()
+                }
                 Operation::Close => {
                     let close: CloseRequest = serde_json::from_slice(&bytes)
                         .map_err(|_| Failure::bad("invalid_close"))?;
@@ -338,6 +357,16 @@ async fn close(
     request: Request,
 ) -> Response {
     owner.dispatch(table, request, Operation::Close).await
+}
+
+async fn selected_body(
+    State(owner): State<Owner>,
+    Path(table): Path<String>,
+    request: Request,
+) -> Response {
+    owner
+        .dispatch(table, request, Operation::SelectedBody)
+        .await
 }
 
 async fn filter_status(

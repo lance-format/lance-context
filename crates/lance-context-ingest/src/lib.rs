@@ -92,6 +92,8 @@ pub struct Ingress {
     layout: Arc<Layout>,
     scope: Arc<Scope>,
     schema: SchemaRef,
+    #[cfg(feature = "materializer")]
+    turn_spec: Option<Arc<turn_ingestion::TurnIngestionSpec>>,
     budget: Arc<MergeMemoryBudget>,
     #[cfg(feature = "materializer")]
     session_read_concurrency: usize,
@@ -260,6 +262,8 @@ impl Ingress {
             workspace(&contract, contract.max_record_bytes as usize)? <= budget.limit(),
             "contract exceeds shared ingress workspace"
         );
+        #[cfg(feature = "materializer")]
+        let turn_spec = turn_ingestion::TurnIngestionSpec::from_schema(&schema)?.map(Arc::new);
         let value = Self {
             client,
             layout: layout.clone(),
@@ -272,6 +276,8 @@ impl Ingress {
                 contract,
             }),
             schema,
+            #[cfg(feature = "materializer")]
+            turn_spec,
             budget,
             #[cfg(feature = "materializer")]
             session_read_concurrency: reader::default_concurrency(),

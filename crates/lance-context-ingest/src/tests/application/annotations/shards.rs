@@ -224,6 +224,7 @@ async fn exercise() -> Result<()> {
             },
         });
         config.annotations = Some(config::Annotations {
+            turns: None,
             owner_url: bases[bucket as usize].clone(),
             shard: Some(physical.shard),
             routes: vec![],

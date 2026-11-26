@@ -80,6 +80,7 @@ async fn frontend_with_settings(
         options: settings.http,
     });
     config.annotations = Some(config::Annotations {
+        turns: None,
         shard: None,
         routes: vec![],
         wal_clusters: BTreeMap::new(),

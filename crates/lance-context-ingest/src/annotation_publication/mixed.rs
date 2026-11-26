@@ -132,8 +132,8 @@ async fn validate(
             && lance_table::format::is_detached_version(reference.version),
         "mixed ingestion may only advance the body for new turns"
     );
-    let previous = load_body(body, &prior, &reference.table_instance).await?;
-    let next = load_body(body, &reference, &reference.table_instance).await?;
+    let previous = load_body(base, body, &prior, &reference.table_instance).await?;
+    let next = load_body(base, body, &reference, &reference.table_instance).await?;
     let native = next
         .read_transaction()
         .await?
@@ -253,6 +253,7 @@ pub async fn publish(
 }
 
 async fn load_body(
+    narrow: &Dataset,
     storage: &Storage,
     reference: &lance_context_core::annotation_staging::BodySnapshot,
     incarnation: &str,
@@ -274,8 +275,14 @@ async fn load_body(
         "body native identity differs from selected reference"
     );
     let schema: arrow_schema::Schema = body.schema().into();
+    let narrow_schema: arrow_schema::Schema = narrow.schema().into();
+    let spec = crate::turn_ingestion::TurnIngestionSpec::from_schema(&narrow_schema)?;
     ensure!(
-        schema == crate::rollout_schema(),
+        &schema
+            == spec
+                .as_ref()
+                .map(|s| s.body_schema().as_ref())
+                .unwrap_or(&crate::rollout_schema()),
         "body snapshot has a foreign schema"
     );
     Ok(body)

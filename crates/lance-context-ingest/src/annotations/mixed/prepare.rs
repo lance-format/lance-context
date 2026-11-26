@@ -62,7 +62,9 @@ impl FrozenCheckpoint {
                     if self.annotations.new_turns().next().is_none() {
                         return Ok::<_, anyhow::Error>(prior);
                     }
-                    let base = Arc::new(load_body(storage, &prior, &prior.table_instance).await?);
+                    let base = Arc::new(
+                        open_body(storage, self.annotations.base(), &prior.table_instance).await?,
+                    );
                     let reservation = workspace.reserve(workspace.limit() / 2).await;
                     let mut selection = BTreeMap::<u64, Vec<(u32, &str)>>::new();
                     for (turn, source) in self.annotations.new_turns() {
