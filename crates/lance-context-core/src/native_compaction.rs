@@ -12,6 +12,21 @@ use roaring::RoaringTreemap;
 use std::collections::HashSet;
 use std::io::Cursor;
 
+#[cfg(test)]
+mod tests;
+
+/// Native ordinary rewrites withdraw moved fragments from ZoneMap coverage.
+/// The immutable old pages remain valid for retained snapshots; the new rows
+/// are scanned until a later index build. No address translation is asserted.
+pub fn withdraws_zone_map_coverage(index: &lance_table::format::IndexMetadata) -> bool {
+    index.index_version == 0
+        && index.index_details.as_ref().is_some_and(|details| {
+            details
+                .to_msg::<lance_index::pbold::ZoneMapIndexDetails>()
+                .is_ok()
+        })
+}
+
 /// Prepare one bounded, append-only rewrite against its exact source snapshot.
 /// The caller assigns final fragment IDs under its publication fence, retains
 /// its workspace reservation, and persists the returned operation before commit.
@@ -105,6 +120,9 @@ pub async fn prepare_rewrite(
         }
         if covered && index.results_are_row_addrs() {
             if !index.supports_eager_remap() {
+                if withdraws_zone_map_coverage(index) {
+                    continue;
+                }
                 return Err(invalid("compaction cannot preserve this address index"));
             }
             required_remaps.insert(index.uuid);
@@ -213,6 +231,9 @@ pub async fn validate_index_remaps(base: &Dataset, operation: &Operation) -> Res
         }
         if covered && index.results_are_row_addrs() {
             if !index.supports_eager_remap() {
+                if withdraws_zone_map_coverage(index) {
+                    continue;
+                }
                 return Err(invalid(
                     "prepared compaction cannot preserve this address index",
                 ));
