@@ -17,6 +17,7 @@ fn configuration(c: &network::Cluster, physical: &Physical, owner_url: String) -
         },
     }];
     config.annotations = Some(config::Annotations {
+        turns: None,
         owner_url,
         shard: Some(physical.shard),
         routes: vec![],

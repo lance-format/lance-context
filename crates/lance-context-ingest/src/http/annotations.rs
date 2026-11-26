@@ -24,6 +24,13 @@ pub struct PointRequest {
     pub turn: String,
 }
 
+/// Select the managed body snapshot for one configured physical shard.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectedBodyRequest {
+    pub bucket: u32,
+}
+
 /// One physical shard, selected from trusted deployment routes. Callers may
 /// query different buckets concurrently; positions are never combined globally.
 #[derive(Serialize, Deserialize)]
@@ -40,6 +47,7 @@ enum Operation {
     Update,
     Read,
     FilterStatus,
+    SelectedBody,
     Close,
 }
 impl Operation {
@@ -50,11 +58,12 @@ impl Operation {
             Self::Update => "update",
             Self::Read => "read",
             Self::FilterStatus => "filter-status",
+            Self::SelectedBody => "selected-body",
             Self::Close => "close",
         }
     }
     fn is_write(self) -> bool {
-        !matches!(self, Self::Read | Self::FilterStatus)
+        !matches!(self, Self::Read | Self::FilterStatus | Self::SelectedBody)
     }
 }
 

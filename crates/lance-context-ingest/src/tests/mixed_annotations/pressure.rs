@@ -30,7 +30,7 @@ async fn received_request(
     Ok(prepared)
 }
 
-pub(super) async fn publish(
+pub(in crate::tests) async fn publish(
     c: &network::Cluster,
     service: &Service,
     narrow: &Storage,
@@ -43,7 +43,7 @@ pub(super) async fn publish(
     publish_frozen(c, service, narrow, body, frozen).await
 }
 
-pub(super) async fn publish_frozen(
+pub(in crate::tests) async fn publish_frozen(
     c: &network::Cluster,
     service: &Service,
     narrow: &Storage,

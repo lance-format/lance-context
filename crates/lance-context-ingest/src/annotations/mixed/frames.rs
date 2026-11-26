@@ -7,6 +7,7 @@ mod memory;
 pub(crate) struct Frame {
     pub batches: Vec<RecordBatch>,
     pub reservation: MergeReservation,
+    spec: Option<Arc<crate::turn_ingestion::TurnIngestionSpec>>,
 }
 
 pub(crate) struct HeldRow {
@@ -15,6 +16,18 @@ pub(crate) struct HeldRow {
 }
 
 impl Frame {
+    fn matches(&self, batch: &RecordBatch, row: usize, turn: &str) -> Result<bool> {
+        if let Some(spec) = &self.spec {
+            return Ok(spec.row_key(batch, row, turn.len())? == turn);
+        }
+        let ids = batch
+            .column_by_name("id")
+            .context("missing body IDs")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("invalid body IDs")?;
+        Ok(!ids.is_null(row) && ids.value(row) == turn)
+    }
     /// Validate first-create origins and slice consecutive rows together. The
     /// common all-new import keeps each original Arrow batch intact; duplicate
     /// imports only split at omitted rows, without copying body buffers.
@@ -30,12 +43,6 @@ impl Frame {
             let end = offset
                 .checked_add(batch.num_rows())
                 .context("body ordinal overflow")?;
-            let ids = batch
-                .column_by_name("id")
-                .context("missing body IDs")?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .context("invalid body IDs")?;
             let mut run: Option<(usize, usize)> = None;
             while remaining
                 .peek()
@@ -46,7 +53,7 @@ impl Frame {
                     .checked_sub(offset)
                     .context("body ordinal regressed")?;
                 ensure!(
-                    ids.value(row) == turn,
+                    self.matches(batch, row, turn)?,
                     "body selection differs from first-create identity"
                 );
                 match &mut run {
@@ -75,14 +82,8 @@ impl Frame {
         let mut row = ordinal as usize;
         for batch in &self.batches {
             if row < batch.num_rows() {
-                let ids = batch
-                    .column_by_name("id")
-                    .unwrap()
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .context("invalid retained body IDs")?;
                 ensure!(
-                    ids.value(row) == turn,
+                    self.matches(batch, row, turn)?,
                     "retained body row differs from turn origin"
                 );
                 return Ok(HeldRow {
@@ -105,13 +106,33 @@ pub(crate) struct Window {
 }
 
 impl Window {
+    #[cfg(test)]
     pub fn record(
+        &mut self,
+        index: u64,
+        batches: Vec<RecordBatch>,
+        reservation: MergeReservation,
+        input_bytes: usize,
+        input_allocation: Option<(usize, usize)>,
+    ) {
+        self.record_with_spec(
+            index,
+            batches,
+            reservation,
+            input_bytes,
+            input_allocation,
+            None,
+        )
+    }
+
+    pub fn record_with_spec(
         &mut self,
         index: u64,
         batches: Vec<RecordBatch>,
         mut reservation: MergeReservation,
         input_bytes: usize,
         input_allocation: Option<(usize, usize)>,
+        spec: Option<Arc<crate::turn_ingestion::TurnIngestionSpec>>,
     ) {
         if let Some(bytes) =
             memory::retained_bytes(&batches, input_bytes, reservation.bytes(), input_allocation)
@@ -124,7 +145,8 @@ impl Window {
                 index,
                 Arc::new(Frame {
                     batches,
-                    reservation
+                    reservation,
+                    spec,
                 })
             )
             .is_none());

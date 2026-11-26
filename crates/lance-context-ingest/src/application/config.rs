@@ -84,6 +84,10 @@ pub struct Http {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Annotations {
+    /// Schema/key/session definition for a fresh generic managed turn table.
+    /// Absent preserves the legacy rollout contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<crate::turn_ingestion::TurnIngestionSpec>,
     /// Stable deployment-authorized service address; never supplied by a client.
     pub owner_url: String,
     /// Explicit physical bucket for this table. Only fresh mixed bindings opt in.
@@ -351,6 +355,13 @@ impl Config {
                 "annotation application requires exactly one local physical table"
             );
             a.validate_shards(&self.layout, &self.tables[0].binding)?;
+            if let Some(spec) = &a.turns {
+                ensure!(a.body.is_some() && a.shard.is_some() && a.exclusive_reclamation.is_none(),
+                    "generic turns require explicit body/shard and no exclusive physical reclamation");
+                a.shard
+                    .unwrap()
+                    .turn_contract(&self.tables[0].binding, spec, &a.staging)?;
+            }
             ensure!(
                 a.apply_memory_bytes > 0
                     && !a.owner_url.is_empty()

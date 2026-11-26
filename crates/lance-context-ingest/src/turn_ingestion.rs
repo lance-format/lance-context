@@ -8,6 +8,8 @@ use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use lance_context_wal::{ingest_contract::arrow_schema_fingerprint, placement::Layout};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "materializer")]
+use std::sync::Arc;
 use std::{collections::HashSet, mem::size_of};
 
 const SPEC_KEY: &str = "lance-context.turn-ingestion-spec.v1";
@@ -111,6 +113,115 @@ impl TurnIngestionSpec {
 
     pub fn routing_column(&self) -> &str {
         self.body_schema.field(self.routing_index).name()
+    }
+
+    /// Persist the complete definition with a transport or narrow-table schema.
+    /// Schema metadata maps must have a stable order across independent hosts.
+    #[cfg(feature = "materializer")]
+    pub(crate) fn bind_schema(&self, schema: &Schema) -> Result<SchemaRef> {
+        fn canonical(value: serde_json::Value) -> serde_json::Value {
+            use serde_json::Value;
+            match value {
+                Value::Object(fields) => Value::Object(
+                    fields
+                        .into_iter()
+                        .map(|(key, value)| (key, canonical(value)))
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                        .into_iter()
+                        .collect(),
+                ),
+                Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
+                value => value,
+            }
+        }
+        let value = serde_json::to_string(&canonical(serde_json::to_value(Persisted {
+            schema: self.body_schema.as_ref().clone(),
+            primary_key: self.primary_key.clone(),
+            routing_column: self.routing_column().into(),
+        })?))?;
+        ensure!(
+            value.len() <= 32 << 10,
+            "turn ingestion specification too large"
+        );
+        ensure!(
+            schema
+                .metadata()
+                .get(SPEC_KEY)
+                .is_none_or(|old| old == &value),
+            "schema already binds a different turn ingestion specification"
+        );
+        let mut metadata = schema.metadata().clone();
+        metadata.insert(SPEC_KEY.into(), value);
+        Ok(Arc::new(Schema::new_with_metadata(
+            schema.fields().clone(),
+            metadata,
+        )))
+    }
+
+    #[cfg(feature = "materializer")]
+    pub(crate) fn from_schema(schema: &Schema) -> Result<Option<Self>> {
+        let Some(value) = schema.metadata().get(SPEC_KEY) else {
+            return Ok(None);
+        };
+        ensure!(
+            value.len() <= 32 << 10,
+            "turn ingestion specification too large"
+        );
+        let p: Persisted = serde_json::from_str(value)?;
+        Ok(Some(Self::new(
+            Arc::new(p.schema),
+            p.primary_key,
+            &p.routing_column,
+        )?))
+    }
+
+    #[cfg(feature = "materializer")]
+    pub(crate) fn key_values<'a>(&self, key: &'a str) -> Result<Vec<std::borrow::Cow<'a, str>>> {
+        // JSON escaping may require owned components. This is a narrow point
+        // key, never a body decode or history scan.
+        let values: Vec<std::borrow::Cow<'a, str>> = serde_json::from_str(key)?;
+        let borrowed = values
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<_>>();
+        ensure!(
+            self.business_key(&borrowed, key.len())? == key,
+            "noncanonical turn key"
+        );
+        Ok(values)
+    }
+
+    #[cfg(feature = "materializer")]
+    pub(crate) fn routing_key(&self, key: &str) -> Result<String> {
+        let values = self.key_values(key)?;
+        let index = self
+            .key_indices
+            .iter()
+            .position(|&i| i == self.routing_index)
+            .unwrap();
+        Ok(values[index].to_string())
+    }
+
+    #[cfg(feature = "materializer")]
+    pub(crate) fn row_key(&self, body: &RecordBatch, row: usize, maximum: usize) -> Result<String> {
+        ensure!(
+            row < body.num_rows() && body.schema() == self.body_schema,
+            "foreign turn row"
+        );
+        let values = self
+            .key_indices
+            .iter()
+            .map(|&index| {
+                let column = body
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .context("invalid turn key column")?;
+                ensure!(!column.is_null(row), "null turn key component");
+                Ok(column.value(row))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.business_key(&values, maximum)
     }
 
     /// Includes the actual body schema and its metadata, ordered key columns,

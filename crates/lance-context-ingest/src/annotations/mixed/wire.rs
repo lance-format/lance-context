@@ -3,6 +3,9 @@ use super::*;
 use arrow_array::{new_null_array, UInt8Array};
 use arrow_schema::{DataType, Field, Schema};
 
+mod generic;
+pub use generic::{creates_for, patches_for, schema_for};
+
 const PATCH_COLUMNS: usize = 7;
 const OPERATION: usize = PATCH_COLUMNS;
 pub const PATCH: u8 = 0;
@@ -78,6 +81,9 @@ pub(in crate::annotations) fn decode(
     max_rows: u32,
     value_bytes: usize,
 ) -> Result<Decoded> {
+    if let Some(spec) = crate::turn_ingestion::TurnIngestionSpec::from_schema(&expected)? {
+        return generic::decode(body, expected, max_rows, value_bytes, &spec);
+    }
     let batches = ipc::decode(body, expected)?;
     let rows = batches
         .iter()
