@@ -166,6 +166,8 @@ async fn body_compaction_keeps_active_updates_old_readers_and_later_publication(
     staging
         .install_body_compacted(&transaction, selected.clone())
         .await?;
+    let mut before = before;
+    before.installed_base.version = selected.version_id();
     assert_eq!(staging.observation().await, before);
     assert_eq!(selected.manifest().fragments, base.manifest().fragments);
     assert_eq!(read_all(&selected).await?, read_all(&base).await?);

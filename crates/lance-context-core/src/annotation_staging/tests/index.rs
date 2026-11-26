@@ -52,6 +52,8 @@ async fn indexed_base_keeps_active_updates_readers_and_replay_boundary() -> Resu
     staging
         .install_indexed(&transaction, selected.clone())
         .await?;
+    let mut before = before;
+    before.installed_base.version = selected.version_id();
     assert_eq!(staging.observation().await, before);
     assert_eq!(current(&staging, "turn-000000").await?, expected);
     assert_eq!(selected.manifest().fragments, base.manifest().fragments);
@@ -216,6 +218,8 @@ async fn index_install_requires_the_exact_selected_transaction() -> Result<()> {
     staging
         .install_indexed(&transaction, selected.clone())
         .await?;
+    let mut before = before;
+    before.installed_base.version = selected.version_id();
     // An already installed publication is not a new base transition.
     assert!(staging
         .install_indexed(&transaction, selected)

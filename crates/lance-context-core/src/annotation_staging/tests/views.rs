@@ -45,6 +45,10 @@ async fn bases_remain_protected_until_both_reader_and_preparation_release() -> R
         0,
         Limits::default(),
     )?;
+    let initial = staging.observation().await.installed_base;
+    assert!(!initial.immutable_body);
+    assert_eq!(initial.source, scope());
+    assert_eq!(initial.rows, Some(3));
     drop(publish(&staging, 1).await?);
     let held = staging.capture("T").await?;
     let (frozen, prepared) = publish(&staging, 2).await?;
