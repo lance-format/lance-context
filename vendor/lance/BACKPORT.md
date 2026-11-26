@@ -40,3 +40,8 @@ original writer-bookkeeping window. It also checks the correct normal cursor.
 These patches remain necessary for context's existing flush-retry, replay-boundary,
 publication-loss, scalar-index, and task-lifetime regressions. They do not add a
 new persisted format. Remove only when upstream semantics and tests cover them.
+
+Fragment open retries through the optional task-owned lance-file read policy
+after failed open state is released. Per-file recovery remains disabled for
+adaptive multi-file reads to preserve merged physical batch alignment. See
+../lance-file/BACKPORT.md.
