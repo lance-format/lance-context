@@ -51,6 +51,12 @@ Transport failures leave the original pending body and sequence intact; `resume`
 resends that intent. Cancellation or an unknown local journal write fences the
 lane until reopen. The local client journal is not itself a replicated volume.
 
+For unresolved HTTP responses, downcast the error chain to
+`http::journal::UnresolvedResponseStatus` for the status even if an intermediary
+returned empty or malformed JSON. `AppendResponseError` additionally preserves
+validated service labels when present. Status alone does not establish whether
+a mutation committed or authorize replacing its durable pending intent.
+
 ## Read and source progress
 
 Annotation point reads use the internal business key and the existing owner read
