@@ -1032,3 +1032,275 @@ impl ScalarIndex for InvertedIndex {
         })
     }
 }
+impl InvertedIndex {
+    /// Check whether any already-analyzed term occurs in a modern segment's
+    /// dictionaries, without opening postings or document files. Callers must
+    /// use this segment's tokenizer. `true` is only an upper bound: predicates,
+    /// deletions and exact text matching still apply. Missing files return errors.
+    pub async fn may_match_terms(store: &dyn IndexStore, terms: &[String]) -> Result<bool> {
+        if terms.is_empty() {
+            return Ok(false);
+        }
+        let metadata = store.open_index_file(METADATA_FILE).await?;
+        let schema = metadata.schema();
+        let partitions: Vec<u64> = serde_json::from_str(
+            schema
+                .metadata
+                .get("partitions")
+                .ok_or_else(|| Error::index("modern inverted segment partitions missing"))?,
+        )?;
+        let format = schema
+            .metadata
+            .get(TOKEN_SET_FORMAT_KEY)
+            .map(|name| TokenSetFormat::from_str(name))
+            .transpose()?
+            .unwrap_or(TokenSetFormat::Arrow);
+        let mut lookups = stream::iter(partitions)
+            .map(|id| async move {
+                let reader = store.open_index_file(&token_file_path(id)).await?;
+                let tokens =
+                    TokenSet::load_for_terms(reader, format, terms, &LanceCache::no_cache())
+                        .await?;
+                Ok::<_, Error>(terms.iter().any(|term| tokens.get(term).is_some()))
+            })
+            .buffer_unordered(8);
+        while let Some(present) = lookups.try_next().await? {
+            if present {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+impl InvertedIndex {
+    /// Open metadata now and stream unranked matches as individual partitions
+    /// become readable. At most eight partitions are open at once; dropping the
+    /// stream cancels their pending I/O. The caller must apply dataset deletions
+    /// and the returned deleted-fragment bitmap before materializing rows.
+    pub async fn stream_from_store(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+        query: &str,
+        batch_size: usize,
+    ) -> Result<(
+        futures::stream::BoxStream<'static, Result<Vec<u64>>>,
+        RoaringBitmap,
+    )> {
+        if !(1..=1024).contains(&batch_size) {
+            return Err(Error::invalid_input(
+                "match batch_size must be between 1 and 1024",
+            ));
+        }
+        let metadata = store.open_index_file(METADATA_FILE).await?;
+        let schema = metadata.schema();
+        let params: InvertedIndexParams = serde_json::from_str(
+            schema
+                .metadata
+                .get("params")
+                .ok_or_else(|| Error::index("params not found in metadata"))?,
+        )?;
+        let partitions: Vec<u64> = serde_json::from_str(
+            schema
+                .metadata
+                .get("partitions")
+                .ok_or_else(|| Error::index("partitions not found in metadata"))?,
+        )?;
+        let format = schema
+            .metadata
+            .get(TOKEN_SET_FORMAT_KEY)
+            .map(|name| TokenSetFormat::from_str(name))
+            .transpose()?
+            .unwrap_or(TokenSetFormat::Arrow);
+        if parse_format_version_from_metadata(&schema.metadata)? == InvertedListFormatVersion::V1 {
+            return Err(Error::invalid_input(
+                "streaming matches require a modern inverted index",
+            ));
+        }
+        let deleted_fragments = if metadata.num_rows() > 0 {
+            let batch = metadata.read_range(0..1, None).await?;
+            if let Some(column) = batch.column_by_name(DELETED_FRAGMENTS_COL) {
+                RoaringBitmap::deserialize_from(
+                    column.as_binary_opt::<i32>().expect_ok()?.value(0),
+                )?
+            } else {
+                RoaringBitmap::new()
+            }
+        } else {
+            RoaringBitmap::new()
+        };
+        let tokens = collect_query_tokens(query, &mut params.build()?);
+        let mut terms: Vec<String> = (&tokens).into_iter().cloned().collect();
+        terms.sort_unstable();
+        terms.dedup();
+        if terms.is_empty() {
+            return Ok((stream::empty().boxed(), deleted_fragments));
+        }
+        let terms = Arc::new(terms);
+        let index_cache = index_cache.clone();
+        let rows = stream::iter(partitions.into_iter().enumerate())
+            .map(move |(priority, id)| {
+                let store = store.with_io_priority(priority as u64);
+                let remapper = frag_reuse_index.clone();
+                let batch_remapper = batch_remapper.clone();
+                let cache = index_cache.with_key_prefix(&format!("part-{id}"));
+                let terms = terms.clone();
+                // Opening belongs to each partition's stream, not a collect barrier.
+                // flatten_unordered counts opening and reading against the same bound.
+                stream::once(async move {
+                    let partition = InvertedPartition::load_for_matches(
+                        store,
+                        id,
+                        remapper,
+                        batch_remapper,
+                        &cache,
+                        format,
+                        terms.as_slice(),
+                    )
+                    .await?;
+                    if partition.is_legacy() {
+                        return Err(Error::invalid_input(
+                            "streaming matches require a modern inverted index",
+                        ));
+                    }
+                    Ok::<_, Error>(super::matches::partition_matches(
+                        Arc::new(partition),
+                        terms,
+                        batch_size,
+                    ))
+                })
+                .try_flatten()
+                .boxed()
+            })
+            .flatten_unordered(8)
+            .boxed();
+        Ok((rows, deleted_fragments))
+    }
+}
+
+impl InvertedIndex {
+    pub async fn load_for_query(
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        index_cache: &LanceCache,
+        terms: &[String],
+    ) -> Result<Arc<Self>>
+    where
+        Self: Sized,
+    {
+        // for new index format, there is a metadata file and multiple partitions,
+        // each partition is a separate index containing tokens, inverted list and docs.
+        // for old index format, there is no metadata file, and it's just like a single partition
+
+        match store.open_index_file(METADATA_FILE).await {
+            Ok(reader) => {
+                let params = reader
+                    .schema()
+                    .metadata
+                    .get("params")
+                    .ok_or(Error::index("params not found in metadata".to_owned()))?;
+                let mut params = serde_json::from_str::<InvertedIndexParams>(params)?;
+                let partitions = reader
+                    .schema()
+                    .metadata
+                    .get("partitions")
+                    .ok_or(Error::index("partitions not found in metadata".to_owned()))?;
+                let partitions: Vec<u64> = serde_json::from_str(partitions)?;
+                let token_set_format = reader
+                    .schema()
+                    .metadata
+                    .get(TOKEN_SET_FORMAT_KEY)
+                    .map(|name| TokenSetFormat::from_str(name))
+                    .transpose()?
+                    .unwrap_or(TokenSetFormat::Arrow);
+                let format_version = parse_format_version_from_metadata(&reader.schema().metadata)?;
+
+                // Load deleted_fragments if present (optional for backward compatibility)
+                let deleted_fragments = if reader.num_rows() > 0 {
+                    let metadata_batch = reader.read_range(0..1, None).await?;
+                    if let Some(col) = metadata_batch.column_by_name(DELETED_FRAGMENTS_COL) {
+                        let arr = col.as_binary_opt::<i32>().expect_ok()?;
+                        RoaringBitmap::deserialize_from(arr.value(0))?
+                    } else {
+                        RoaringBitmap::new()
+                    }
+                } else {
+                    RoaringBitmap::new()
+                };
+
+                let format = token_set_format;
+                let partitions = partitions.into_iter().enumerate().map(|(priority, id)| {
+                    let store = store.with_io_priority(priority as u64);
+                    let frag_reuse_index_clone = frag_reuse_index.clone();
+                    let batch_remapper = batch_remapper.clone();
+                    let index_cache_for_part =
+                        index_cache.with_key_prefix(format!("part-{}", id).as_str());
+                    let token_set_format = format;
+                    async move {
+                        Result::Ok(Arc::new(
+                            InvertedPartition::load_for_matches(
+                                store,
+                                id,
+                                frag_reuse_index_clone,
+                                batch_remapper,
+                                &index_cache_for_part,
+                                token_set_format,
+                                terms,
+                            )
+                            .await?,
+                        ))
+                    }
+                });
+                let partitions = stream::iter(partitions)
+                    .buffer_unordered(store.io_parallelism())
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                let coordinate_rank = partitions
+                    .first()
+                    .map(|partition| partition.docs.coordinate_rank())
+                    .unwrap_or(0);
+                if partitions
+                    .iter()
+                    .any(|partition| partition.docs.coordinate_rank() != coordinate_rank)
+                {
+                    return Err(Error::index(
+                        "FTS partitions have inconsistent document coordinate ranks".to_string(),
+                    ));
+                }
+                params.document_granularity = if coordinate_rank == 0 {
+                    DocumentGranularity::Row
+                } else {
+                    DocumentGranularity::ListElement
+                };
+
+                let tokenizer = params.build()?;
+                Ok(Arc::new(Self {
+                    params,
+                    store,
+                    tokenizer,
+                    token_set_format,
+                    format_version,
+                    partitions,
+                    corpus_stats: Arc::new(OnceCell::new()),
+                    prewarm_state: Arc::new(Mutex::new(InvertedPrewarmState::default())),
+                    document_projections_resident: Arc::new(AtomicBool::new(false)),
+                    deleted_fragments,
+                }))
+            }
+            Err(_) => {
+                // old index format
+                match batch_remapper {
+                    Some(remapper) => {
+                        Self::load_legacy_index_with_remapping(store, Some(remapper), index_cache)
+                            .await
+                    }
+                    None => Self::load_legacy_index(store, frag_reuse_index, index_cache).await,
+                }
+            }
+        }
+    }
+}

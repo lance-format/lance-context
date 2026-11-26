@@ -2218,3 +2218,52 @@ mod tests {
         );
     }
 }
+impl InvertedPartition {
+    /// Open only the prepared term dictionary pages. Documents remain deferred
+    /// until an unranked posting batch needs its row addresses.
+    pub(super) async fn load_for_matches(
+        store: Arc<dyn IndexStore>,
+        id: u64,
+        remapper: Option<Arc<dyn RowIdRemapper>>,
+        batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+        cache: &LanceCache,
+        format: TokenSetFormat,
+        terms: &[String],
+    ) -> Result<Self> {
+        let token_file = store.open_index_file(&token_file_path(id)).await?;
+        let tokens = TokenSet::load_for_terms(token_file, format, terms, cache).await?;
+        let posting_file = store.open_index_file(&posting_file_path(id)).await?;
+        let mut inverted_list = PostingListReader::try_new(posting_file, cache).await?;
+        let docs_path = doc_file_path(id);
+        let docs_reader = store.open_index_file(&docs_path).await?;
+        let docs = match batch_remapper {
+            Some(remapper) => PartitionDocuments::try_new_with_remapping(
+                store.clone(),
+                docs_path,
+                id,
+                WeakLanceCache::from(cache),
+                docs_reader.as_ref(),
+                Some(remapper),
+                inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
+            )?,
+            None => PartitionDocuments::try_new(
+                store.clone(),
+                docs_path,
+                id,
+                WeakLanceCache::from(cache),
+                docs_reader.as_ref(),
+                remapper,
+                inverted_list.block_size() == MAX_POSTING_BLOCK_SIZE,
+            )?,
+        };
+        inverted_list.modern_num_docs = Some(docs.len());
+        Ok(Self {
+            id,
+            store,
+            tokens,
+            inverted_list: Arc::new(inverted_list),
+            docs: PartitionDocumentStore::Modern(Arc::new(docs)),
+            token_set_format: format,
+        })
+    }
+}

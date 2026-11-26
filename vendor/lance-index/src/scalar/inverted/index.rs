@@ -159,3 +159,5 @@ pub(in crate::scalar::inverted) fn live_posting_rows<'a>(
 
 #[cfg(test)]
 mod tests;
+
+mod matches;

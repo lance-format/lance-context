@@ -7,7 +7,9 @@ use bytes::Bytes;
 
 use hashbrown::{HashTable, hash_table::Entry};
 
+use super::super::token_lookup;
 use super::*;
+use token_lookup::{FIRST_TOKEN_COL, LOOKUP_FST_COL, LOOKUP_VERSION_KEY};
 
 // Bytes keeps the Arrow allocation (and any native-memory reservation) alive.
 // Arrow implements AsRef<[u8]> for &Buffer, but not for an owned Buffer.
@@ -111,6 +113,28 @@ impl TokenMap {
     }
 }
 
+struct CompleteTokenSetKey;
+impl CacheKey for CompleteTokenSetKey {
+    type ValueType = TokenSet;
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "complete-tokens".into()
+    }
+    fn type_name() -> &'static str {
+        "FTS/CompleteTokenSet"
+    }
+}
+
+struct TokenLookupScalarsKey;
+impl CacheKey for TokenLookupScalarsKey {
+    type ValueType = (u32, usize);
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "token-lookup-scalars".into()
+    }
+    fn type_name() -> &'static str {
+        "FTS/TokenLookupScalars"
+    }
+}
+
 // TokenSet is a mapping from tokens to token ids
 #[derive(Debug, Clone, Default, DeepSizeOf)]
 pub struct TokenSet {
@@ -189,18 +213,27 @@ impl TokenSet {
     }
 
     fn build_fst_from_map(map: HashMap<String, u32>) -> Result<fst::Map<Bytes>> {
+        Self::build_fst_with_memory(map, None)
+    }
+
+    fn build_fst_with_memory(
+        map: HashMap<String, u32>,
+        memory: lance_core::memory::NativeMemory,
+    ) -> Result<fst::Map<Bytes>> {
         let mut entries: Vec<_> = map.into_iter().collect();
         entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
-        let mut builder = fst::MapBuilder::memory();
+        let mut builder = fst::MapBuilder::new(TokenBytesWriter::new(memory))
+            .map_err(|error| Error::index(error.to_string()))?;
         for (token, token_id) in entries {
             builder
                 .insert(&token, token_id as u64)
                 .map_err(|e| Error::index(format!("failed to insert token {}: {}", token, e)))?;
         }
-        builder
-            .into_map()
-            .map_data(Bytes::from)
-            .map_err(|error| Error::index(error.to_string()))
+        let bytes = builder
+            .into_inner()
+            .map_err(|error| Error::index(error.to_string()))?
+            .into_bytes();
+        fst::Map::new(bytes).map_err(|error| Error::index(error.to_string()))
     }
 
     pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
@@ -208,6 +241,100 @@ impl TokenSet {
             TokenSetFormat::Arrow => Self::load_arrow(reader).await,
             TokenSetFormat::Fst => Self::load_fst(reader).await,
         }
+    }
+
+    async fn load_cached(
+        reader: Arc<dyn IndexReader>,
+        format: TokenSetFormat,
+        cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        cache
+            .get_or_insert_with_key(CompleteTokenSetKey, || Self::load(reader, format))
+            .await
+    }
+
+    pub(crate) async fn load_for_terms(
+        reader: Arc<dyn IndexReader>,
+        format: TokenSetFormat,
+        terms: &[String],
+        cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        let memory = reader.native_memory();
+        if let Some(tokens) = cache.get_with_key(&CompleteTokenSetKey).await {
+            return tokens.for_terms(terms, memory);
+        }
+        if format != TokenSetFormat::Fst {
+            return Self::load_cached(reader, format, cache)
+                .await?
+                .for_terms(terms, memory);
+        }
+        let Some(tokens) = token_lookup::lookup(&reader, terms, cache).await? else {
+            return Self::load_cached(reader, format, cache)
+                .await?
+                .for_terms(terms, memory);
+        };
+        let scalars = cache
+            .get_or_insert_with_key(TokenLookupScalarsKey, || async {
+                let batch = reader
+                    .read_range(0..1, Some(&[TOKEN_NEXT_ID_COL, TOKEN_TOTAL_LENGTH_COL]))
+                    .await?;
+                if batch.num_rows() != 1 {
+                    return Err(Error::index("token lookup scalar row is missing"));
+                }
+                let next_id = batch
+                    .column_by_name(TOKEN_NEXT_ID_COL)
+                    .and_then(|array| array.as_primitive_opt::<datatypes::UInt32Type>())
+                    .filter(|array| array.null_count() == 0)
+                    .ok_or_else(|| Error::index("token lookup next ID is invalid"))?
+                    .value(0);
+                let total_length = batch
+                    .column_by_name(TOKEN_TOTAL_LENGTH_COL)
+                    .and_then(|array| array.as_primitive_opt::<datatypes::UInt64Type>())
+                    .filter(|array| array.null_count() == 0)
+                    .ok_or_else(|| Error::index("token lookup total length is invalid"))?
+                    .value(0);
+                if reader.num_rows()
+                    != (next_id as usize)
+                        .div_ceil(token_lookup::BLOCK_TERMS)
+                        .max(1)
+                {
+                    return Err(Error::index(
+                        "token lookup block count disagrees with token count",
+                    ));
+                }
+                let total_length = usize::try_from(total_length).map_err(|error| {
+                    Error::index(format!("token total length exceeds usize: {error}"))
+                })?;
+                Ok((next_id, total_length))
+            })
+            .await?;
+        let (next_id, total_length) = *scalars;
+        if tokens.values().any(|id| *id >= next_id) {
+            return Err(Error::index("token lookup ID exceeds the dictionary size"));
+        }
+        Ok(Arc::new(Self {
+            tokens: TokenMap::Fst(Self::build_fst_with_memory(tokens, memory)?),
+            next_id,
+            total_length,
+        }))
+    }
+
+    // Preserve original posting IDs and corpus metadata, without retaining the
+    // full cached dictionary in every active exact-query partition handle.
+    fn for_terms(
+        &self,
+        terms: &[String],
+        memory: lance_core::memory::NativeMemory,
+    ) -> Result<Arc<Self>> {
+        let selected = terms
+            .iter()
+            .filter_map(|term| self.get(term).map(|id| (term.clone(), id)))
+            .collect();
+        Ok(Arc::new(Self {
+            tokens: TokenMap::Fst(Self::build_fst_with_memory(selected, memory)?),
+            next_id: self.next_id,
+            total_length: self.total_length,
+        }))
     }
 
     async fn load_arrow(reader: Arc<dyn IndexReader>) -> Result<Self> {
@@ -461,28 +588,51 @@ fn arrow_token_batch(
 
 fn fst_token_batch(
     fst_map: fst::Map<Bytes>,
-    next_id: u32,
+    _next_id: u32,
     total_length: usize,
 ) -> Result<RecordBatch> {
+    let (first_tokens, lookup_blocks) = token_lookup::encode(&fst_map)?;
+    let rows = first_tokens.len();
+    let next_id = u32::try_from(fst_map.len())
+        .map_err(|error| Error::index(format!("token count exceeds u32: {error}")))?;
     let bytes = fst_map.into_fst().into_inner();
+    // Transfer the original FST allocation, including its native reservation,
+    // into the first Arrow cell. Remaining lookup rows carry empty cells.
+    let end = i64::try_from(bytes.len())
+        .map_err(|error| Error::index(format!("token bytes exceed i64: {error}")))?;
+    let mut offsets = vec![end; rows + 1];
+    offsets[0] = 0;
+    let fst_col = arrow_array::LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(offsets.into()),
+        arrow::buffer::Buffer::from(bytes),
+        None,
+    );
 
-    let mut fst_builder = LargeBinaryBuilder::with_capacity(1, bytes.len());
-    fst_builder.append_value(bytes);
-    let fst_col = fst_builder.finish();
-
-    let mut next_id_builder = UInt32Builder::with_capacity(1);
+    let mut next_id_builder = UInt32Builder::with_capacity(rows);
     next_id_builder.append_value(next_id);
+    for _ in 1..rows {
+        next_id_builder.append_value(0);
+    }
     let next_id_col = next_id_builder.finish();
 
-    let mut total_length_builder = UInt64Builder::with_capacity(1);
+    let mut total_length_builder = UInt64Builder::with_capacity(rows);
     total_length_builder.append_value(total_length as u64);
+    for _ in 1..rows {
+        total_length_builder.append_value(0);
+    }
     let total_length_col = total_length_builder.finish();
 
     let schema = arrow_schema::Schema::new(vec![
         arrow_schema::Field::new(TOKEN_FST_BYTES_COL, DataType::LargeBinary, false),
         arrow_schema::Field::new(TOKEN_NEXT_ID_COL, DataType::UInt32, false),
         arrow_schema::Field::new(TOKEN_TOTAL_LENGTH_COL, DataType::UInt64, false),
-    ]);
+        arrow_schema::Field::new(FIRST_TOKEN_COL, DataType::Utf8, false),
+        arrow_schema::Field::new(LOOKUP_FST_COL, DataType::LargeBinary, false),
+    ])
+    .with_metadata(HashMap::from([(
+        LOOKUP_VERSION_KEY.to_owned(),
+        "1".to_owned(),
+    )]));
 
     let batch = RecordBatch::try_new(
         Arc::new(schema),
@@ -490,6 +640,8 @@ fn fst_token_batch(
             Arc::new(fst_col) as ArrayRef,
             Arc::new(next_id_col) as ArrayRef,
             Arc::new(total_length_col) as ArrayRef,
+            Arc::new(first_tokens) as ArrayRef,
+            Arc::new(lookup_blocks) as ArrayRef,
         ],
     )?;
     Ok(batch)
@@ -703,6 +855,9 @@ fn prefetch_fst_node(fst_bytes: &[u8], addr: fst::raw::CompiledAddr) {
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 fn prefetch_fst_node(_fst_bytes: &[u8], _addr: fst::raw::CompiledAddr) {}
+
+#[cfg(test)]
+mod query_tests;
 
 #[cfg(test)]
 mod tests {

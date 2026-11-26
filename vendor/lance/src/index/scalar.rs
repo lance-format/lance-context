@@ -2821,3 +2821,79 @@ mod tests {
         );
     }
 }
+/// Stream unranked matches as individual partitions become readable. The caller
+/// applies dataset deletions and the returned fragment exclusions before take.
+pub async fn open_query_matches(
+    dataset: &Dataset,
+    column: &str,
+    segment: &IndexMetadata,
+    query: &str,
+    batch_size: usize,
+    metrics: &dyn MetricsCollector,
+) -> Result<(
+    futures::stream::BoxStream<'static, Result<Vec<u64>>>,
+    roaring::RoaringBitmap,
+)> {
+    load_segment_details(dataset, column, std::slice::from_ref(segment)).await?;
+    let store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, segment).await?);
+    let resolved = super::frag_reuse::open_row_id_remapping(dataset, segment, metrics).await?;
+    let cache_id = super::frag_reuse::fri_cache_id(&resolved);
+    let cache = super::frag_reuse::scoped_index_cache(dataset, &resolved)
+        .for_index(&segment.uuid, cache_id);
+    let (remapper, batch_remapper) = match resolved.as_ref().map(|(_, remapping)| remapping) {
+        Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
+        Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
+        Some(ResolvedRemapping::V1Identity) | None => (None, None),
+    };
+    let matches = lance_index::scalar::inverted::InvertedIndex::stream_from_store(
+        store,
+        remapper,
+        batch_remapper,
+        &cache,
+        query,
+        batch_size,
+    )
+    .await?;
+    metrics.record_index_load();
+    Ok(matches)
+}
+
+/// Open a literal FTS query with only its dictionary pages. Fuzzy callers pass
+/// `None` because expansion needs the complete vocabulary.
+pub async fn open_query_index(
+    dataset: &Dataset,
+    column: &str,
+    segment: &IndexMetadata,
+    terms: Option<&[String]>,
+    metrics: &dyn MetricsCollector,
+) -> Result<Arc<lance_index::scalar::inverted::InvertedIndex>> {
+    let Some(terms) = terms else {
+        let index = open_scalar_index(dataset, column, segment, metrics).await?;
+        let inverted = index
+            .as_any()
+            .downcast_ref::<lance_index::scalar::inverted::InvertedIndex>()
+            .ok_or_else(|| Error::index("search segment is not inverted"))?;
+        return Ok(Arc::new(inverted.clone()));
+    };
+    load_segment_details(dataset, column, std::slice::from_ref(segment)).await?;
+    let store = Arc::new(LanceIndexStore::from_dataset_for_existing(dataset, segment).await?);
+    let resolved = super::frag_reuse::open_row_id_remapping(dataset, segment, metrics).await?;
+    let cache_id = super::frag_reuse::fri_cache_id(&resolved);
+    let cache = super::frag_reuse::scoped_index_cache(dataset, &resolved)
+        .for_index(&segment.uuid, cache_id);
+    let (remapper, batch_remapper) = match resolved.as_ref().map(|(_, remapping)| remapping) {
+        Some(ResolvedRemapping::V0(remapper)) => (Some(remapper.clone()), None),
+        Some(ResolvedRemapping::V1Translate { remapper, .. }) => (None, Some(remapper.clone())),
+        Some(ResolvedRemapping::V1Identity) | None => (None, None),
+    };
+    let index = lance_index::scalar::inverted::InvertedIndex::load_for_query(
+        store,
+        remapper,
+        batch_remapper,
+        &cache,
+        terms,
+    )
+    .await?;
+    metrics.record_index_load();
+    Ok(index)
+}

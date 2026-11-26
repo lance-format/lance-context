@@ -3829,3 +3829,44 @@ mod tests {
         assert!(!documents.projection_loaded());
     }
 }
+impl PartitionDocuments {
+    /// Resolve just the streamed matches, without retaining a complete address
+    /// column. The caller has already checked that these are modern DocIds.
+    pub(crate) async fn match_row_ids(&self, ids: &[u64]) -> Result<Vec<u64>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.iter().any(|id| *id >= self.num_docs as u64) {
+            return Err(Error::index("posting document ID exceeds document count"));
+        }
+        let ranges = ids
+            .iter()
+            .map(|id| *id as usize..*id as usize + 1)
+            .collect::<Vec<_>>();
+        let batch = self
+            .reader()
+            .await?
+            .read_ranges(&ranges, Some(&[ROW_ID]))
+            .await?;
+        let rows = batch[ROW_ID]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .ok_or_else(|| Error::index("document row IDs are not UInt64"))?;
+        if let Some(remapper) = &self.batch_remapper {
+            Ok(remapper
+                .remap_row_ids(rows.values())
+                .await?
+                .into_iter()
+                .flatten()
+                .collect())
+        } else if let Some(remapper) = &self.remapper {
+            Ok(rows
+                .values()
+                .iter()
+                .filter_map(|id| remapper.remap_row_id(*id))
+                .collect())
+        } else {
+            Ok(rows.values().to_vec())
+        }
+    }
+}
