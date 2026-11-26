@@ -156,15 +156,19 @@ async fn pinned_staging_manifest_opens_and_supports_explicit_detached_derivation
         .execute(transaction.clone())
         .await
         .is_err());
-    let detached = CommitBuilder::new(Arc::new(selected))
+    let detached = CommitBuilder::new(Arc::new(selected.clone()))
         .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
         .with_detached(true)
         .with_max_retries(1)
         .execute(transaction)
         .await?;
     assert!(detached.version().version >= 1u64 << 63);
-    let reopened = DatasetBuilder::from_uri(uri)
-        .with_version(detached.version().version)
+    let first_version = detached.version().version;
+    // CommitBuilder's write override does not replace the returned Dataset's
+    // inherited read handler. Reopen before continuing a derived index chain.
+    assert!(detached.checkout_version(first_version).await.is_err());
+    let mut reopened = DatasetBuilder::from_uri(uri)
+        .with_version(first_version)
         .load()
         .await?;
     assert_eq!(reopened.count_rows(None).await?, 3);
@@ -175,6 +179,71 @@ async fn pinned_staging_manifest_opens_and_supports_explicit_detached_derivation
         .try_into_batch()
         .await?;
     assert_eq!(rows.num_rows(), 2);
+
+    let bloom_params = ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter);
+    let bloom = reopened
+        .create_index_builder(&["value"], IndexType::BloomFilter, &bloom_params)
+        .name("values_bloom".into())
+        .execute_uncommitted()
+        .await?;
+    let second = CommitBuilder::new(Arc::new(reopened))
+        .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
+        .with_detached(true)
+        .execute(NativeTransaction::new(
+            first_version,
+            Operation::CreateIndex {
+                new_indices: vec![bloom],
+                removed_indices: vec![],
+            },
+            None,
+        ))
+        .await?;
+    let chain = DatasetBuilder::from_uri(uri)
+        .with_version(second.version().version)
+        .load()
+        .await?;
+    assert_eq!(chain.load_indices().await?.len(), 2);
+    assert_eq!(
+        chain
+            .checkout_version(first_version)
+            .await?
+            .load_indices()
+            .await?[0]
+            .uuid,
+        index_id
+    );
+    let last = chain
+        .read_version_transaction(chain.version().version)
+        .await?
+        .transaction
+        .unwrap();
+    assert!(matches!(last.operation, Operation::CreateIndex { .. }));
+    assert_eq!(last.read_version, first_version);
+    let previous = chain
+        .read_version_transaction(first_version)
+        .await?
+        .transaction
+        .unwrap();
+    assert!(matches!(previous.operation, Operation::CreateIndex { .. }));
+    assert_eq!(previous.read_version, version);
+    // Stop ordinary ancestor traversal at the selected base. Its unique
+    // staging path is resolved only through the independently pinned handle.
+    assert!(chain.checkout_version(version).await.is_err());
+    assert!(chain.read_version_transaction(version).await.is_err());
+    let selected_transaction = selected
+        .read_version_transaction(version)
+        .await?
+        .transaction
+        .unwrap();
+    assert_eq!(selected_transaction.uuid, record.transaction.to_string());
+    assert_eq!(
+        selected
+            .checkout_version(version)
+            .await?
+            .count_rows(None)
+            .await?,
+        3
+    );
     // Publishing the detached index cannot move the selected body snapshot.
     assert!(DatasetBuilder::from_uri(uri)
         .with_commit_handler(handler.clone())
