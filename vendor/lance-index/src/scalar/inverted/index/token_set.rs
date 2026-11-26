@@ -3,16 +3,57 @@
 
 use std::hash::{BuildHasher, RandomState};
 
+use bytes::Bytes;
+
 use hashbrown::{HashTable, hash_table::Entry};
 
 use super::*;
+
+struct TokenBytesWriter {
+    values: Vec<u8>,
+    reservation: lance_core::memory::NativeReservation,
+    memory: lance_core::memory::NativeMemory,
+}
+
+impl TokenBytesWriter {
+    fn new(memory: lance_core::memory::NativeMemory) -> Self {
+        Self {
+            values: Vec::new(),
+            reservation: None,
+            memory,
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        lance_core::memory::retain_bytes(Bytes::from(self.values), self.reservation)
+    }
+}
+
+impl std::io::Write for TokenBytesWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        lance_core::memory::reserve_vec(
+            &mut self.values,
+            &mut self.reservation,
+            &self.memory,
+            lance_core::memory::NativeMemoryKind::Index,
+            bytes.len(),
+        )
+        .map_err(std::io::Error::other)?;
+        self.values.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 // at indexing, we use HashMap because we need it to be mutable,
 // at searching, we use fst::Map because it's more efficient
 #[derive(Debug, Clone)]
 pub enum TokenMap {
     HashMap(HashMap<String, u32>),
-    Fst(fst::Map<Vec<u8>>),
+    Fst(fst::Map<Bytes>),
 }
 
 impl Default for TokenMap {
@@ -137,7 +178,7 @@ impl TokenSet {
         fst_token_batch(fst_map, self.next_id, self.total_length)
     }
 
-    fn build_fst_from_map(map: HashMap<String, u32>) -> Result<fst::Map<Vec<u8>>> {
+    fn build_fst_from_map(map: HashMap<String, u32>) -> Result<fst::Map<Bytes>> {
         let mut entries: Vec<_> = map.into_iter().collect();
         entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
         let mut builder = fst::MapBuilder::memory();
@@ -146,7 +187,10 @@ impl TokenSet {
                 .insert(&token, token_id as u64)
                 .map_err(|e| Error::index(format!("failed to insert token {}: {}", token, e)))?;
         }
-        Ok(builder.into_map())
+        builder
+            .into_map()
+            .map_data(Bytes::from)
+            .map_err(|error| Error::index(error.to_string()))
     }
 
     pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
@@ -159,10 +203,12 @@ impl TokenSet {
     async fn load_arrow(reader: Arc<dyn IndexReader>) -> Result<Self> {
         let batch = reader.read_range(0..reader.num_rows(), None).await?;
 
+        let memory = reader.native_memory();
         let (tokens, next_id, total_length) = spawn_blocking(move || {
             let mut next_id = 0;
             let mut total_length = 0;
-            let mut tokens = fst::MapBuilder::memory();
+            let mut tokens = fst::MapBuilder::new(TokenBytesWriter::new(memory))
+                .map_err(|error| Error::index(error.to_string()))?;
 
             let token_col = batch[TOKEN_COL].as_string::<i32>();
             let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
@@ -177,7 +223,12 @@ impl TokenSet {
                 })?;
             }
 
-            Ok::<_, Error>((tokens.into_map(), next_id, total_length))
+            let bytes = tokens
+                .into_inner()
+                .map_err(|error| Error::index(error.to_string()))?
+                .into_bytes();
+            let tokens = fst::Map::new(bytes).map_err(|error| Error::index(error.to_string()))?;
+            Ok::<_, Error>((tokens, next_id, total_length))
         })
         .await
         .map_err(|err| Error::execution(format!("failed to spawn blocking task: {}", err)))??;
@@ -196,8 +247,10 @@ impl TokenSet {
         }
 
         let fst_col = batch[TOKEN_FST_BYTES_COL].as_binary::<i64>();
-        let bytes = fst_col.value(0);
-        let map = fst::Map::new(bytes.to_vec())
+        let start = fst_col.value_offsets()[0] as usize;
+        let end = fst_col.value_offsets()[1] as usize;
+        let bytes = Bytes::from_owner(fst_col.values().slice_with_length(start, end - start));
+        let map = fst::Map::new(bytes)
             .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
 
         let total_length_col =
@@ -265,7 +318,7 @@ impl TokenSet {
 
         struct Walk<'a> {
             lookup: usize,
-            fst: &'a fst::raw::Fst<Vec<u8>>,
+            fst: &'a fst::raw::Fst<Bytes>,
             key: &'a [u8],
             depth: usize,
             addr: fst::raw::CompiledAddr,
@@ -395,7 +448,7 @@ fn arrow_token_batch(
 }
 
 fn fst_token_batch(
-    fst_map: fst::Map<Vec<u8>>,
+    fst_map: fst::Map<Bytes>,
     next_id: u32,
     total_length: usize,
 ) -> Result<RecordBatch> {
@@ -650,7 +703,7 @@ mod tests {
         )
         .unwrap();
         TokenSet {
-            tokens: TokenMap::Fst(map),
+            tokens: TokenMap::Fst(map.map_data(Bytes::from).unwrap()),
             next_id: terms.len() as u32,
             total_length: terms.iter().map(|term| term.len()).sum(),
         }
