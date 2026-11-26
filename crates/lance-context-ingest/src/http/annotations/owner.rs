@@ -133,12 +133,25 @@ impl Owner {
                 .map_err(|_| self.gate.write_memory_refusal())?
                 .map_err(|_| Failure::bad("invalid_upload_size"))?
             };
+            let payload_memory = ingress.client.payload_memory_pool();
+            let backing = crate::payload_memory::reserve(payload_memory.as_deref(), length)
+                .map_err(|error| {
+                    if error.is::<lance_context_wal::replication::runtime::client::payload_memory::Unavailable>() {
+                        self.gate.write_memory_refusal()
+                    } else {
+                        Failure {
+                            status: StatusCode::INTERNAL_SERVER_ERROR,
+                            code: "upload_memory_admission_failed",
+                            outcome: "not_submitted",
+                        }
+                    }
+                })?;
             let (bytes, capacity) = self
                 .service
                 .phase_counters()
                 .measure(
                     Phase::AnnotationUploadRead,
-                    body::read_exact_accounted(request, length, options),
+                    body::read_exact_admitted(request, length, options, backing),
                 )
                 .await?;
             let prepared = self

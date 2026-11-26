@@ -577,6 +577,8 @@ impl Service {
     /// Prepare shared input without assuming its visible length is the backing
     /// allocation size. The caller must keep the backing within its upload
     /// allowance; use `prepare_owned` to release validation credit precisely.
+    /// With a shared payload pool, unknown backing is copied once into an
+    /// admitted allocation. `prepare_owned` transfers known backing without copying.
     pub async fn prepare(
         &self,
         upload: Upload,
@@ -584,7 +586,22 @@ impl Service {
         producer: &Producer,
         sequence: u64,
     ) -> Result<PreparedAppend> {
-        self.prepare_received(upload, body, None, producer, sequence)
+        let pool = self.ingress.client.payload_memory_pool();
+        let reservation = crate::payload_memory::reserve(pool.as_deref(), body.len())?;
+        let (body, capacity) = if reservation.is_some() {
+            // A borrowed Bytes can retain a much larger parent. Only copy when
+            // shared admission requires ownership of the complete allocation.
+            let owned = body.to_vec();
+            drop(body);
+            let capacity = owned.capacity();
+            (
+                crate::payload_memory::retain(owned.into(), capacity, reservation)?,
+                Some(capacity),
+            )
+        } else {
+            (body, None)
+        };
+        self.prepare_received(upload, body, capacity, producer, sequence)
             .await
     }
 
@@ -598,7 +615,10 @@ impl Service {
         sequence: u64,
     ) -> Result<PreparedAppend> {
         let capacity = body.capacity();
-        self.prepare_received(upload, body.into(), Some(capacity), producer, sequence)
+        let pool = self.ingress.client.payload_memory_pool();
+        let reservation = crate::payload_memory::reserve(pool.as_deref(), capacity)?;
+        let body = crate::payload_memory::retain(body.into(), capacity, reservation)?;
+        self.prepare_received(upload, body, Some(capacity), producer, sequence)
             .await
     }
 

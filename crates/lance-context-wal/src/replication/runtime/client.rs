@@ -758,10 +758,18 @@ impl Client {
     /// Install caller-owned admission for fetched payload allocations before
     /// issuing payload requests. Metadata and local phase ceilings are separate.
     /// The hook is shared by this client's requests and cannot be replaced.
+    /// Ingestion owners also reuse it for retained upload backing; decoder
+    /// workspace and native Lance allocations require separate admission.
     pub fn install_payload_memory(&self, memory: Arc<dyn payload_memory::Pool>) -> Result<()> {
         self.payload_memory
             .set(memory)
             .map_err(|_| anyhow::anyhow!("WAL payload memory is already installed"))
+    }
+
+    /// Share the installed pool with ingestion allocations owned outside RPC
+    /// reception. Local phase limits remain separate from this shared pool.
+    pub fn payload_memory_pool(&self) -> Option<Arc<dyn payload_memory::Pool>> {
+        self.payload_memory.get().cloned()
     }
     /// Per-exchange append phases, including redirected, failed and cancelled
     /// exchanges. Admission waits for byte credit; connection includes pool

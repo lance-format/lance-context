@@ -41,6 +41,8 @@ pub mod bootstrap;
 pub mod http;
 #[cfg(feature = "materializer")]
 pub mod materializer;
+#[cfg(any(feature = "http", feature = "materializer"))]
+mod payload_memory;
 #[cfg(feature = "service")]
 pub mod preparation;
 mod producer_replacement;

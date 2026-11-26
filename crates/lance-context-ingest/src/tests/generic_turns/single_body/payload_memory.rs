@@ -262,6 +262,7 @@ async fn payload_memory_pressure_preserves_acked_replay_and_reader_charge() -> R
     let other = producer(&service, 2).await?;
     let duplicate = request(&service, &other, 1, payload).await?;
     let result = service.submit(&duplicate, DEADLINE).await?;
+    drop(duplicate);
     drained(&c, &service, result.index).await?;
     assert_eq!(counts.held.load(Ordering::SeqCst), bytes);
     assert_eq!(held.batch(), &input[0].slice(0, 1));
@@ -272,6 +273,95 @@ async fn payload_memory_pressure_preserves_acked_replay_and_reader_charge() -> R
     drop(service);
     assert_eq!(counts.held.load(Ordering::SeqCst), bytes);
     drop(held);
+    assert_eq!(counts.held.load(Ordering::SeqCst), 0);
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_upload_memory_survives_publication_and_detached_arrow_views() -> Result<()> {
+    let input = bodies()?;
+    let spec = TurnIngestionSpec::new(
+        input[0].schema(),
+        vec!["session_id".into(), "id".into()],
+        "session_id",
+    )?;
+    let root = tempfile::tempdir()?;
+    let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let storage = fixture::storage(root.path(), "full-body.lance").await?;
+    crate::bootstrap::provision_body_shard(
+        c.client.clone(),
+        annotation_publication::one_shard(),
+        binding(),
+        storage.clone(),
+        Identity {
+            owner: Uuid::new_v4(),
+            acquisition: Uuid::new_v4(),
+            manifest: Uuid::new_v4(),
+        },
+        &fixture::limits(),
+        Shard { bucket: 0 },
+        &spec,
+    )
+    .await?;
+    let counts = Arc::new(Counts::default());
+    c.client
+        .install_payload_memory(Arc::new(Admission(counts.clone())))?;
+    let (service, runtime) = owner_with_wait(&c, &storage, &spec, Duration::from_secs(60)).await?;
+    let (stop, task) = run_owner(runtime);
+    let lane = producer(&service, 1).await?;
+    let encode = |i| {
+        fixture::encoded(single_body::batch(
+            &spec,
+            &fixture::limits(),
+            Shard { bucket: 0 },
+            &input[i],
+        )?)
+    };
+    let body = encode(0)?;
+    let bytes = body.len();
+    let refused = request(&service, &lane, 1, body.clone()).await;
+    assert!(refused
+        .err()
+        .unwrap()
+        .is::<lance_context_wal::replication::runtime::client::payload_memory::Unavailable>());
+    assert_eq!(service.source_observation().records, 0);
+    assert_eq!(counts.held.load(Ordering::SeqCst), 0);
+    counts.allow.store(true, Ordering::SeqCst);
+    let owned = body.to_vec();
+    let pointer = owned.as_ptr();
+    drop(body);
+    let upload = service.reserve_upload(owned.len()).await?;
+    let prepared = service.prepare_owned(upload, owned, &lane, 1).await?;
+    assert_eq!(
+        prepared.body().as_ptr(),
+        pointer,
+        "known owned payload must not copy"
+    );
+    assert_eq!(counts.held.load(Ordering::SeqCst), bytes);
+    let receipt = service.submit(&prepared, DEADLINE).await?;
+    assert_eq!(receipt.result, MutationResult::Applied);
+    drop(prepared);
+    // Applying a locally registered payload shares its charge; it must not
+    // allocate/fetch another backing buffer just to apply the same request.
+    assert_eq!(counts.held.load(Ordering::SeqCst), bytes);
+    assert_eq!(counts.attempts.load(Ordering::SeqCst), 2);
+    let key = spec.row_key(&input[0], 0, 4096)?;
+    let read = service.get_full_body(&key, DEADLINE).await?.unwrap();
+    let detached = read.batch().clone();
+    drop(read);
+    let other = producer(&service, 2).await?;
+    let prepared = request(&service, &other, 1, encode(1)?).await?;
+    let receipt = service.submit(&prepared, DEADLINE).await?;
+    drop(prepared);
+    drained(&c, &service, receipt.index).await?;
+    assert_eq!(service.retained_body_frames(), (0, 0));
+    assert_eq!(detached, input[0].slice(0, 1));
+    assert_eq!(counts.held.load(Ordering::SeqCst), bytes);
+    stop.send(()).unwrap();
+    task.await??;
+    drop(service);
+    assert_eq!(counts.held.load(Ordering::SeqCst), bytes);
+    drop(detached);
     assert_eq!(counts.held.load(Ordering::SeqCst), 0);
     c.shutdown().await
 }
