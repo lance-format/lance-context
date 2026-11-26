@@ -119,6 +119,8 @@ managed_turn_replay spec input.arrow session_id session_id id > turn-spec.json
 managed_turn_replay validate replay.json input.arrow
 managed_turn_replay append replay.json input.arrow
 managed_turn_replay resume replay.json
+managed_turn_replay verify replay.json input.arrow replay.log owner.json
+managed_turn_replay slot owner.json GROUP SLOT
 ```
 
 `replay.json` supplies `layout`, `binding`, `spec`, staging `limits`, `shard`,
@@ -128,6 +130,9 @@ part of the binding, so a synthetic fixture does not establish a real input's
 schema contract. Provision the matching fresh table pair before replay.
 `validate` checks schema and business-key bounds without opening a journal or
 contacting the service; its output contains aggregate counts and lengths only.
+`slot` performs a read-only quorum query with the owner's existing trusted WAL
+configuration. Slots are allocated per Raft group across all table bindings;
+using the same slot number for two tables does not create independent producers.
 
 This entry runs one producer lane on one already partitioned shard. It uses the
 normal `DurableMutationClient`, accepts an IPC file of at most 128 MiB and bounds
@@ -143,6 +148,15 @@ which later file rows to skip. Each successful request reports the input batch,
 row interval, producer sequence and WAL index. The final JSON reports the exact
 selected body reference and covered cut. Preserve version numbers as `u64` or
 raw JSON: detached versions can exceed JavaScript's exact integer range.
+
+`verify` checks that the replay ACKs cover the entire input, then opens the exact
+selected body version and validates its native transaction and authorized URI.
+It compares schema/metadata and every value against the first input occurrence
+of each business key, rejecting missing or duplicate published keys. This bounded
+test expects a fresh destination containing only that input's unique keys. It
+prints only counts and snapshot identities. Its expected input is limited to
+128 MiB IPC, one million rows and 512 MiB of unique Arrow buffer allocations;
+these limits are verifier bounds, not a native scanner RSS quota.
 
 The reported times measure this sequential replay, including client journal
 sync, encoding, RPC and publication waiting. They are not a sustained capacity

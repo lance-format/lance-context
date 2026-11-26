@@ -22,6 +22,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "managed_turn_replay/verify.rs"]
+mod verify;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -89,6 +92,56 @@ fn encode(config: &Config, body: &RecordBatch) -> Result<Bytes> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("slot") {
+        ensure!(
+            args.len() == 4,
+            "usage: managed_turn_replay slot OWNER_CONFIG GROUP SLOT"
+        );
+        let owner =
+            lance_context_ingest::application::Config::read(std::path::Path::new(&args[1]))?;
+        let group = args[2].parse::<u64>()?;
+        let slot = args[3].parse::<u32>()?;
+        ensure!(
+            owner.layout.groups.contains_key(&group) && slot < owner.limits.producer_slots,
+            "unknown group or slot"
+        );
+        use lance_context_wal::replication::{
+            query,
+            runtime::client::{Reply, Request},
+        };
+        let reply = owner
+            .client()?
+            .request_routed(Request::Query {
+                group,
+                query: query::Query::ProducerSlot { slot },
+            })
+            .await?;
+        let Reply::Query(query::Outcome::Observed {
+            cut,
+            value: query::Value::ProducerSlot(Some(view)),
+        }) = reply.reply
+        else {
+            bail!("producer slot quorum query unavailable");
+        };
+        ensure!(
+            cut.cluster == owner.layout.cluster
+                && cut.layout == owner.layout.fingerprint()?
+                && cut.group == group
+                && cut.term > 0
+                && cut.applied >= cut.quorum_index,
+            "foreign producer slot observation"
+        );
+        println!("{}", serde_json::json!({"cut":cut, "slot":view}));
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("verify") {
+        ensure!(
+            args.len() == 5,
+            "usage: managed_turn_replay verify CONFIG ARROW_FILE REPLAY_LOG OWNER_CONFIG"
+        );
+        let config: Config = serde_json::from_slice(&std::fs::read(&args[1])?)?;
+        return verify::run(&config, &args[2], &args[3], &args[4]).await;
+    }
     if args.first().map(String::as_str) == Some("spec") {
         ensure!(
             args.len() >= 4,
@@ -301,6 +354,11 @@ async fn main() -> Result<()> {
             serde_json::json!({"event":"resumed","sequence":reply.completion.meta.sequence,"wal_index":through})
         );
     } else if let Some(reply) = client.last_completed(0).await? {
+        ensure!(
+            matches!(reply.completion.result, MutationResult::Applied),
+            "last completed mutation was rejected: {:?}",
+            reply.completion.result
+        );
         through = reply.completion.index;
     }
     let ack_seconds = start.elapsed().as_secs_f64();
