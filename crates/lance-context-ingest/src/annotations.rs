@@ -22,6 +22,7 @@ use tokio::sync::watch;
 mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
+mod lookup_observation;
 #[cfg(feature = "service")]
 pub mod metadata_upload;
 pub mod mixed;
@@ -36,6 +37,7 @@ mod status_filter;
 mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
+pub use lookup_observation::BodyLookupObservation;
 pub use shard::Shard;
 pub use window::SourceObservation;
 
@@ -93,6 +95,7 @@ struct Shared {
     ordered: tokio::sync::Mutex<()>,
     progress: watch::Sender<Progress>,
     reclamation: Mutex<runtime::reclamation::Observation>,
+    body_lookups: Mutex<BodyLookupObservation>,
     phases: Arc<crate::materializer::observation::Counters>,
 }
 
@@ -491,6 +494,7 @@ impl Service {
                 apply_attempts: std::sync::atomic::AtomicU64::new(0),
                 progress,
                 reclamation: Mutex::new(Default::default()),
+                body_lookups: Mutex::new(Default::default()),
                 phases: Arc::default(),
             }),
         };
@@ -1106,6 +1110,12 @@ impl Driver {
                     .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
                 return Ok(());
             }
+            service
+                .shared
+                .body_lookups
+                .lock()
+                .unwrap()
+                .record(self.lookup.bodies.as_ref().unwrap().keys.observation());
         }
         let _ordered = service.shared.ordered.lock().await;
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {

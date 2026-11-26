@@ -432,6 +432,7 @@ pub async fn serve_owner(
                 eprintln!("{}", serde_json::json!({"annotation": {
                     "observed_unix_ms": observed_unix_ms,
                     "table": table.binding.table,
+                    "bucket": service.bucket(),
                     "applied": view.applied, "materialized": view.materialized,
                     "active_entries": view.active_entries, "frozen_entries": view.frozen_entries,
                     "retained_bytes": view.retained_bytes, "source_records": source.records,
@@ -441,6 +442,7 @@ pub async fn serve_owner(
                     "metadata_uploads": metadata_uploads.observation(),
                     "http": owner.observation(),
                     "phases": service.phase_observation().as_slice(),
+                    "body_lookup": service.body_lookup_observation(),
                     "append_rpc": ingress.client.append_timings(),
                     "publisher_binding_rpc": ingress.client.publisher_binding_timings(),
                 }}));

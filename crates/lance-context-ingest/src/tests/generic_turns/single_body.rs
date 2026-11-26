@@ -169,12 +169,22 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
         &input[0].slice(0, 1)
     );
     let repeated = request(&service, &a, 2, encode_body(0)?).await?;
+    // Point reads do not perform ingestion's historical deduplication lookup.
+    assert_eq!(service.body_lookup_observation().completed_lookups, 0);
     let result = service.submit(&repeated, DEADLINE).await?;
     drained(&c, &service, result.index).await?;
     let selected = service.selected_full_body(DEADLINE).await?;
     let replayed = annotation_publication::read(&c, &body, Some(selected.manifest.version)).await?;
     assert_eq!(replayed.manifest().fragments, durable.manifest().fragments);
+    let lookup = service.body_lookup_observation();
+    assert_eq!(lookup.completed_lookups, 1);
+    assert_eq!(lookup.scans_started, 1);
+    assert_eq!(lookup.requested_keys, keys[0].len() as u64);
+    assert!(lookup.projected_rows >= keys[0].len() as u64);
+    assert!(lookup.projected_array_bytes > 0);
+    assert!(lookup.native_summaries <= lookup.completed_lookups);
     assert_eq!(service.submit(&repeated, DEADLINE).await?, result);
+    assert_eq!(service.body_lookup_observation().completed_lookups, 1);
     // More concurrent lanes than the frame budget can admit at once. Queued
     // decoded frames must leave capacity for their own historical existence
     // lookup, otherwise an all-duplicate burst can stop apply and publication.
