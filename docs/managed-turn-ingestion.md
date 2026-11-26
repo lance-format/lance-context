@@ -104,3 +104,58 @@ repeats it and adds two keys; the fourth adds two keys in another session.
 and `selected-body.json` for independent reader compatibility checks.
 
 These are correctness checks, not throughput or real-source acceptance results.
+
+## Turn-ID existence index
+
+Set `publication.turn_id_index` to maintain an index on the narrow table's
+canonical key column `id`. `index_type` selects the native structure:
+
+```json
+{ "turn_id_index": { "min_rows": 65536, "index_type": "zonemap" } }
+```
+
+- `btree` (default, unchanged): stable-row-ID BTree segments.
+- `zonemap`: per-fragment min/max zones over the canonical JSON key. A zone match
+  is only a candidate; the existing exact `id IN (...)` filter still decides
+  membership, so results are identical with or without the index.
+
+A table never mixes the two: maintenance refuses to add a segment of the other
+type, and changing `index_type` requires a fresh table binding.
+
+ZoneMap answers in the physical-address domain and cannot be remapped. When a
+small-file compaction rewrites covered fragments, the Rewrite commit withdraws
+those fragments from the ZoneMap's coverage (native Lance, stable row IDs only),
+reads of them fall back to an exact scan, and the next maintenance turn rebuilds
+coverage for the uncovered fragments only. Segments whose coverage was fully
+withdrawn are retired by that build. Compaction therefore never waits for, or is
+blocked by, the ZoneMap. This exemption applies only to ZoneMap segments named
+`lance_context_turn_id` on stable-row-ID tables; every other address-domain
+index still requires an eager remap.
+
+Build and merge use the existing bounds: at most 128 fragments and 1,048,576
+rows per build, four-way tiered merges of similarly sized segments through
+Lance's native `merge_existing_index_segments`, and the shared maintenance
+workspace. Segment count is not otherwise capped; the tiered merge keeps it
+logarithmic in the number of builds for similarly sized tails.
+
+### When ZoneMap helps
+
+Pruning depends on key order across fragments. Each publication batch is
+written in canonical-key order, but separate publications overlap in key
+range, so a lookup reads every fragment whose `[min, max]` range contains the
+key. A synthetic cold-session profile (`turn_id_zonemap_cold_lookup_profile`,
+ignored by default; 32 fragments x 16,384 rows; production predicate; native
+`ExecutionSummaryCounts`):
+
+| fragment layout | lookup window | no index | ZoneMap |
+|---|---|---|---|
+| key ranges disjoint per fragment | 20 keys in 4 sessions | 6.17 MB, 96 IOPS, 0.34 s | 0.40 MB, 12 IOPS, 0.05 s |
+| key ranges disjoint per fragment | 64 keys spread over table | 6.13 MB, 96 IOPS, 0.35 s | 2.91 MB, 78 IOPS, 0.27 s |
+| keys random across fragments | either | 6.8 MB, 96 IOPS, 0.33 s | same bytes and IOPS, 0.50 s |
+
+When fragments' key ranges overlap, ZoneMap prunes nothing and adds index
+load time. It is worth enabling only if the table's fragments have mostly
+disjoint key ranges. Compaction concatenates fragments without sorting by key,
+so it does not create that property. These are synthetic local measurements,
+not real-traffic or capacity results. Per-key zone hit counts are not exposed
+by native Lance and are not reported.
