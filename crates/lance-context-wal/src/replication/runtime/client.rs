@@ -19,7 +19,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -50,6 +50,7 @@ const MAX_APPEND_META: usize = 256;
 const PREFIX: usize = 24;
 
 pub(super) mod observation;
+pub mod payload_memory;
 pub mod timing;
 
 #[derive(Clone, Debug)]
@@ -245,12 +246,20 @@ pub enum Reply {
     AppendNotSubmittedPendingCapacity,
 }
 /// Holds receive credit through consumption of metadata and a fetched payload.
-/// Cloning body Bytes transfers shared ownership, so callers retaining clones
-/// must provide their own application memory budget before dropping this owner.
+/// Local receive credit follows this response. When installed, payload memory
+/// follows cloned body Bytes instead. Callers still need their application phase
+/// limits, and must supply memory admission if no payload hook is installed.
 pub struct Response {
     pub reply: Reply,
     pub body: Bytes,
+    body_capacity: usize,
     _credit: OwnedSemaphorePermit,
+}
+impl Response {
+    /// Capacity of the complete payload allocation owned by RPC reception.
+    pub fn body_capacity(&self) -> usize {
+        self.body_capacity
+    }
 }
 struct Budgets {
     data: Arc<Semaphore>,
@@ -310,16 +319,7 @@ fn decode_prefix(fixed: &[u8; PREFIX], max_body: usize) -> Result<(u64, usize, u
     Ok((id, meta, body))
 }
 async fn receive<R: AsyncRead + Unpin>(io: &mut R, bytes: usize) -> Result<Bytes> {
-    let mut body = BytesMut::with_capacity(bytes);
-    // Fill spare capacity without first zeroing the entire frame. Limit the
-    // reader so any extra capacity cannot consume bytes from the next frame.
-    let mut limited = io.take(bytes as u64);
-    while limited.limit() > 0 {
-        if limited.read_buf(&mut body).await? == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
-        }
-    }
-    Ok(body.freeze())
+    payload_memory::receive(io, bytes, None).await
 }
 async fn send<W: AsyncWrite + Unpin>(
     io: &mut W,
@@ -739,6 +739,7 @@ pub struct Client {
     connector: TlsConnector,
     options: Options,
     budgets: Budgets,
+    payload_memory: OnceLock<Arc<dyn payload_memory::Pool>>,
     cluster: uuid::Uuid,
     layout: [u8; 32],
     policy: [u8; 32],
@@ -754,6 +755,14 @@ pub struct Client {
     publisher_binding_timings: [timing::Counter; 4],
 }
 impl Client {
+    /// Install caller-owned admission for fetched payload allocations before
+    /// issuing payload requests. Metadata and local phase ceilings are separate.
+    /// The hook is shared by this client's requests and cannot be replaced.
+    pub fn install_payload_memory(&self, memory: Arc<dyn payload_memory::Pool>) -> Result<()> {
+        self.payload_memory
+            .set(memory)
+            .map_err(|_| anyhow::anyhow!("WAL payload memory is already installed"))
+    }
     /// Per-exchange append phases, including redirected, failed and cancelled
     /// exchanges. Admission waits for byte credit; connection includes pool
     /// waiting and any TLS handshake; send includes flush; response includes
@@ -834,6 +843,7 @@ impl Client {
             producer_slots: limits.producer_slots,
             connector: TlsConnector::from(tls),
             budgets: Budgets::new(&options),
+            payload_memory: OnceLock::new(),
             nodes: endpoints
                 .into_iter()
                 .map(|(id, endpoint)| {
@@ -1137,7 +1147,7 @@ impl Client {
             };
             drop(connection.take());
             progress.stage = "send";
-            let response: Result<(Reply, Bytes)> = async {
+            let response: Result<(Reply, Bytes, usize)> = async {
                 let sending = timings.map(|c| c[2].start());
                 let id = self
                     .next
@@ -1187,11 +1197,16 @@ impl Client {
                     _ => ensure!(body_len == 0 && !fetch, "unexpected response payload/type"),
                 }
                 progress.stage = "response_body";
-                let body = receive(&mut stream, body_len).await?;
-                Ok((reply, body))
+                let (body, capacity) = payload_memory::receive_with_capacity(
+                    &mut stream,
+                    body_len,
+                    self.payload_memory.get().map(Arc::as_ref),
+                )
+                .await?;
+                Ok((reply, body, capacity))
             }
             .await;
-            let (reply, body) = match response {
+            let (reply, body, body_capacity) = match response {
                 Ok(response) => response,
                 Err(error) if reconnect_read && disconnected(&error) => {
                     // Only a reused connection gets this one read-only recovery.
@@ -1217,6 +1232,7 @@ impl Client {
             return Ok(Response {
                 reply,
                 body,
+                body_capacity,
                 _credit: credit,
             });
         }
