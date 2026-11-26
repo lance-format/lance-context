@@ -1114,7 +1114,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                         "Inline bitpacking requires an 8, 16, 32, or 64-bit width and no leaf compression",
                     ));
                 }
-                Ok(Box::new(InlineBitpacking::from_description(description)))
+                Ok(Box::new(
+                    InlineBitpacking::from_description(description)
+                        .with_native_memory(self.native_memory.clone()),
+                ))
             }
             #[cfg(not(feature = "bitpacking"))]
             Compression::InlineBitpacking(_) => Err(Error::not_supported_source(
