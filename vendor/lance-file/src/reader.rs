@@ -1062,7 +1062,7 @@ impl FileReader {
             &tail_bytes,
             tail_offset,
             file_len,
-            scheduler.native_memory(),
+            &scheduler.native_memory(),
         )?;
 
         Ok(RawFileMetadataOpen::Current {
@@ -1131,13 +1131,13 @@ impl FileReader {
             &tail_bytes,
             tail_offset,
             file_len,
-            scheduler.native_memory(),
+            &scheduler.native_memory(),
         )?;
         let retained_column_metadata = Self::retained_column_metadata_from_tail(
             &footer,
             &tail_bytes,
             tail_offset,
-            scheduler.native_memory(),
+            &scheduler.native_memory(),
         )?;
 
         Ok(FileMetadataIndex {
