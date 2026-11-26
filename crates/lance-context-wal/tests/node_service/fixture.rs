@@ -19,7 +19,7 @@ use ring::{rand::SystemRandom, signature::Ed25519KeyPair};
 use std::{
     collections::BTreeSet,
     fs,
-    net::TcpListener,
+    net::{Ipv4Addr, TcpListener},
     path::PathBuf,
     process::{Child, Command, Stdio},
 };
@@ -35,6 +35,27 @@ pub struct Fixture {
     pub client: Arc<Client>,
     pub layout: Arc<Layout>,
     client_tls: Arc<rustls::ClientConfig>,
+    loopback: Ipv4Addr,
+}
+
+fn fixture_loopback() -> Ipv4Addr {
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(1);
+        let next = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            next <= u16::MAX as u32,
+            "fixture loopback addresses exhausted"
+        );
+        // The binaries cannot inherit these temporary port reservations. Give
+        // each concurrent fixture its own loopback address, separate from the
+        // 127.0.0.1 source ports used by client connections during node startup
+        // and restart. This prevents those sockets stealing a released port.
+        Ipv4Addr::new(127, 254, (next >> 8) as u8, next as u8)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ipv4Addr::LOCALHOST
 }
 impl Fixture {
     pub fn new() -> Result<Self> {
@@ -62,12 +83,13 @@ impl Fixture {
         let nodes: BTreeSet<_> = groups.values().flatten().copied().collect();
         let catalog_group = *groups.keys().next().unwrap();
         let root = tempfile::tempdir()?;
+        let loopback = fixture_loopback();
         let mut leases = Vec::new();
         let mut listens = BTreeMap::new();
         for &node in &nodes {
             let mut ports = Vec::new();
             for _ in 0..5 {
-                let listener = TcpListener::bind("127.0.0.1:0")?;
+                let listener = TcpListener::bind((loopback, 0))?;
                 ports.push(listener.local_addr()?);
                 leases.push(listener);
             }
@@ -260,6 +282,7 @@ impl Fixture {
             client,
             layout,
             client_tls,
+            loopback,
         })
     }
     pub fn rebind(&mut self) -> Result<()> {
@@ -282,7 +305,7 @@ impl Fixture {
         for (&node, config) in &mut self.configs {
             let mut ports = Vec::new();
             while ports.len() < 5 {
-                let lease = TcpListener::bind("127.0.0.1:0")?;
+                let lease = TcpListener::bind((self.loopback, 0))?;
                 let address = lease.local_addr()?;
                 if !old_addresses.contains(&address) {
                     ports.push(address);
