@@ -6,10 +6,22 @@ use crate::annotations::{
 use crate::materializer::{Acquisition, Options};
 use crate::tests::annotation_runtime::{drained, run_owner};
 
+#[cfg(unix)]
+mod process;
+
 async fn owner(
     c: &network::Cluster,
     storage: &Storage,
     spec: &TurnIngestionSpec,
+) -> Result<(Service, Runtime)> {
+    owner_with_wait(c, storage, spec, Duration::from_millis(20)).await
+}
+
+async fn owner_with_wait(
+    c: &network::Cluster,
+    storage: &Storage,
+    spec: &TurnIngestionSpec,
+    max_batch_wait: Duration,
 ) -> Result<(Service, Runtime)> {
     let view = annotation_publication::state(c).await?;
     Runtime::connect_body_shard(
@@ -26,7 +38,7 @@ async fn owner(
                 max_source_bytes: 1 << 20,
                 min_source_bytes: 1 << 20,
                 max_records: 2,
-                max_batch_wait: Duration::from_millis(20),
+                max_batch_wait,
                 ..Default::default()
             },
         },
