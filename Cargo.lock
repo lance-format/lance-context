@@ -4361,6 +4361,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lance",
+ "lance-index",
  "lance-io",
  "lance-table",
  "libc",
