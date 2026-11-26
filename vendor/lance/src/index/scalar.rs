@@ -17,7 +17,10 @@ pub(crate) mod rtree;
 pub(crate) mod zonemap;
 
 use super::frag_reuse::ResolvedRemapping;
-pub use inverted::{load_segment_details, load_segment_params, load_segments};
+pub use inverted::{
+    PreparedQueryIndex, load_segment_details, load_segment_params, load_segments,
+    prepare_query_index, query_index_metadata_ready,
+};
 
 pub use crate::index::scalar_logical::{LogicalScalarIndex, load_named_scalar_segments};
 

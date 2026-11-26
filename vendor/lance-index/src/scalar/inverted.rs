@@ -18,6 +18,7 @@ pub mod json;
 pub mod oracle;
 pub mod parser;
 pub mod query;
+pub mod rewrite;
 mod scorer;
 pub mod tokenizer;
 mod wand;
