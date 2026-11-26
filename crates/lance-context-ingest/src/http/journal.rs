@@ -51,10 +51,28 @@ impl std::fmt::Display for AppendResponseError {
 }
 impl std::error::Error for AppendResponseError {}
 
+/// HTTP status retained even when an intermediary supplies an empty, malformed,
+/// oversized or unreadable response. This is not a committed mutation result;
+/// the original durable intent remains pending. Callers must also inspect any
+/// available `AppendResponseError` before deciding whether to retry.
+#[derive(Debug)]
+pub struct UnresolvedResponseStatus {
+    pub status: u16,
+}
+impl std::fmt::Display for UnresolvedResponseStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unresolved response HTTP status {}", self.status)
+    }
+}
+impl std::error::Error for UnresolvedResponseStatus {}
+
 async fn unresolved_append(response: reqwest::Response) -> anyhow::Error {
     let status = response.status();
     let error =
-        anyhow::anyhow!("append outcome unresolved (HTTP {status}); retain original intent");
+        anyhow::anyhow!("append outcome unresolved (HTTP {status}); retain original intent")
+            .context(UnresolvedResponseStatus {
+                status: status.as_u16(),
+            });
     // Use the same bounded response reader as ACKs. An empty, malformed or
     // oversized intermediary response must not hide the original HTTP status.
     if let Ok(mut details) = bounded_json::<AppendResponseError>(response).await {

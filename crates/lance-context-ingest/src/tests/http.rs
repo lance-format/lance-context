@@ -203,6 +203,13 @@ async fn append_error_details_preserve_the_original_durable_intent() -> Result<(
     assert_eq!(details.code, "append_outcome_unknown");
     assert_eq!(details.operation_outcome, "unknown");
     assert_eq!(
+        error
+            .downcast_ref::<http::journal::UnresolvedResponseStatus>()
+            .unwrap()
+            .status,
+        503
+    );
+    assert_eq!(
         error.root_cause().to_string(),
         "append outcome unresolved (HTTP 503 Service Unavailable); retain original intent"
     );
@@ -217,6 +224,56 @@ async fn append_error_details_preserve_the_original_durable_intent() -> Result<(
     client.shutdown().await?;
     server.shutdown().await?;
     cluster.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn intermediary_error_bodies_preserve_typed_status_and_exact_pending_intent() -> Result<()> {
+    for response_body in [
+        "",
+        "<html>upstream unavailable</html>",
+        r#"{"error":"invalid label","operation_outcome":"unknown"}"#,
+    ] {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("rollouts.lance");
+        let cluster = network::Cluster::open_signed(root.path(), layout()).await?;
+        bootstrap(&cluster, &path, &binding()).await?;
+        let lost = Arc::new(LostAck {
+            response_body: Some(response_body),
+            ..Default::default()
+        });
+        let server = HttpServer::start(
+            connect(&cluster, binding()).await?,
+            Some(lost.clone()),
+            Default::default(),
+        )
+        .await?;
+        let client = writer(root.path(), &server, MergeMemoryBudget::new(64 << 20)).await?;
+        let error = client.append(0, data(0, 0)?).await.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<http::journal::UnresolvedResponseStatus>()
+                .context("intermediary status lost")?
+                .status,
+            503
+        );
+        assert!(error
+            .downcast_ref::<http::journal::AppendResponseError>()
+            .is_none());
+        assert!(client.last_accepted(0).await?.is_none());
+        assert!(client.stage(0, data(0, 1)?).await.is_err());
+        let original = lost
+            .accepted
+            .lock()
+            .unwrap()
+            .clone()
+            .context("missing real committed ACK")?;
+        assert_eq!(client.resume(0).await?.unwrap(), original);
+        assert!(client.resume(0).await?.is_none());
+        client.shutdown().await?;
+        server.shutdown().await?;
+        cluster.shutdown().await?;
+    }
+    Ok(())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lost_http_ack_recovers_shared_journal_across_gateway_and_wal_restart_then_publishes_lance(
