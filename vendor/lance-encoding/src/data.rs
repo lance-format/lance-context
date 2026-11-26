@@ -1184,6 +1184,7 @@ impl StructDataBlock {
 /// A data block for dictionary encoded data
 #[derive(Debug, Clone)]
 pub struct DictionaryDataBlock {
+    pub(crate) native_memory: NativeMemory,
     /// The indices buffer
     pub indices: FixedWidthDataBlock,
     /// The dictionary itself
@@ -1191,6 +1192,12 @@ pub struct DictionaryDataBlock {
 }
 
 impl DictionaryDataBlock {
+    /// Retain the caller for later dictionary expansion into plain values.
+    pub fn with_native_memory(mut self, memory: NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
+    }
+
     fn decode_helper<K: ArrowDictionaryKeyType>(self) -> Result<DataBlock> {
         // Handle empty batch - this can happen when decoding a range that contains
         // only empty/null lists, or when reading sparse data
@@ -1202,9 +1209,13 @@ impl DictionaryDataBlock {
         let estimated_size_bytes = self.dictionary.data_size()
             * (self.indices.num_values + self.dictionary.num_values() - 1)
             / self.dictionary.num_values();
-        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes)
+            .with_native_memory(self.native_memory.clone());
 
-        let indices = self.indices.data.borrow_to_typed_slice::<K::Native>();
+        let indices = self
+            .indices
+            .data
+            .borrow_to_typed_slice_with_native_memory::<K::Native>(&self.native_memory)?;
         let indices = indices.as_ref();
 
         let selections = indices.iter().map(|idx| {
@@ -1281,6 +1292,7 @@ impl DictionaryDataBlock {
 
     pub fn from_parts(indices: FixedWidthDataBlock, dictionary: DataBlock) -> Self {
         Self {
+            native_memory: None,
             indices,
             dictionary: Box::new(dictionary),
         }
@@ -1914,6 +1926,7 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
 
     let items = DataBlock::from(values);
     DataBlock::Dictionary(DictionaryDataBlock {
+        native_memory: None,
         indices: indices_block,
         dictionary: Box::new(items),
     })
@@ -3000,6 +3013,7 @@ mod tests {
             block_info: BlockInfo::new(),
         };
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            native_memory: None,
             indices: FixedWidthDataBlock {
                 data: LanceBuffer::reinterpret_vec(vec![0_i32, 1, 2]),
                 bits_per_value: 32,
@@ -3022,6 +3036,7 @@ mod tests {
     #[test]
     fn dictionary_rejects_indices_wider_than_declared_key_type() {
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            native_memory: None,
             indices: FixedWidthDataBlock {
                 data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 128]),
                 bits_per_value: 32,

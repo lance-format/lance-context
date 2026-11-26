@@ -156,6 +156,7 @@ impl PrimitivePageDecoder for DirectDictionaryPageDecoder {
             .unwrap();
         let dict = self.decoded_dict.clone();
         Ok(DataBlock::Dictionary(DictionaryDataBlock {
+            native_memory: None,
             indices,
             dictionary: Box::new(dict),
         }))
@@ -286,6 +287,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                 let indices = indices.into_data();
                 let values = new_null_array(value_type, 1);
                 DictionaryDataBlock {
+                    native_memory: None,
                     indices: FixedWidthDataBlock {
                         bits_per_value: key_type.byte_width() as u64 * 8,
                         data: LanceBuffer::from(indices.buffers()[0].clone()),
@@ -319,6 +321,7 @@ impl ArrayEncoder for AlreadyDictionaryEncoder {
                 .encode(*dict_data.dictionary, value_type, buffer_index)?;
 
         let encoded = DataBlock::Dictionary(DictionaryDataBlock {
+            native_memory: None,
             dictionary: Box::new(encoded_items.data),
             indices: encoded_indices.data.as_fixed_width().unwrap(),
         });
@@ -433,6 +436,7 @@ impl ArrayEncoder for DictionaryEncoder {
             .encode(items_data, &DataType::Utf8, buffer_index)?;
 
         let encoded_data = DataBlock::Dictionary(DictionaryDataBlock {
+            native_memory: None,
             indices: encoded_indices.data.as_fixed_width().unwrap(),
             dictionary: Box::new(encoded_items.data),
         });

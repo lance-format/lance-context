@@ -671,10 +671,10 @@ impl DecodePageTask for DecodeMiniBlockTask {
                     data
                 )));
             };
-            data = DataBlock::Dictionary(DictionaryDataBlock::from_parts(
-                indices,
-                dictionary.as_ref().clone(),
-            ));
+            data = DataBlock::Dictionary(
+                DictionaryDataBlock::from_parts(indices, dictionary.as_ref().clone())
+                    .with_native_memory(self.native_memory.clone()),
+            );
         }
 
         Ok(DecodedPage {
