@@ -13,6 +13,7 @@ mod binding_timing;
 mod closed_connection;
 mod deadline;
 mod observation;
+mod payload_memory;
 mod publication_window;
 mod receive;
 mod reconnect;
