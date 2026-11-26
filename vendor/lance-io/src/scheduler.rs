@@ -5,6 +5,7 @@ use bytes::Bytes;
 use futures::channel::oneshot;
 use futures::future::Either;
 use futures::{FutureExt, TryFutureExt};
+use lance_core::memory::{NativeMemory, reserve_read, retain_bytes};
 use object_store::path::Path;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
@@ -481,6 +482,7 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
 }
 
 struct IoTask {
+    native_memory: NativeMemory,
     reader: Arc<dyn Reader>,
     to_read: Range<u64>,
     when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
@@ -542,22 +544,24 @@ impl IoTask {
     async fn run(self) {
         let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
-        let bytes = if self.to_read.start == self.to_read.end {
-            Ok(Bytes::new())
-        } else {
-            let bytes_fut = self
-                .reader
-                .get_range(self.to_read.start as usize..self.to_read.end as usize);
+        let bytes = async {
+            if self.to_read.start == self.to_read.end {
+                return Ok(Bytes::new());
+            }
+            let reservation = reserve_read(&self.native_memory, num_bytes as usize).await?;
             IOPS_COUNTER.fetch_add(1, Ordering::Release);
-            let num_bytes = self.num_bytes();
-            bytes_fut
+            let bytes = self
+                .reader
+                .get_range(self.to_read.start as usize..self.to_read.end as usize)
                 .inspect(move |_| {
                     BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
                 })
                 .await
-                .map_err(Error::from)
-                .and_then(|bytes| validate_read_length(self.reader.path(), &self.to_read, bytes))
-        };
+                .map_err(Error::from)?;
+            let bytes = validate_read_length(self.reader.path(), &self.to_read, bytes)?;
+            Ok(retain_bytes(bytes, reservation))
+        }
+        .await;
         // Emit per-file I/O trace event only when tracing is enabled
         tracing::trace!(
             file = file_path,
@@ -804,6 +808,7 @@ enum IoQueueType {
 /// Note: The 2.X file readers already do this so this is only a concern if you are
 /// using the ScanScheduler directly.
 pub struct ScanScheduler {
+    native_memory: NativeMemory,
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: IoStats,
@@ -902,6 +907,15 @@ impl ScanScheduler {
     /// * object_store - the store to wrap
     /// * config - configuration settings for the scheduler
     pub fn new(object_store: Arc<ObjectStore>, config: SchedulerConfig) -> Arc<Self> {
+        Self::new_with_native_memory(object_store, config, None)
+    }
+
+    /// Native reservations outlive scheduler responses when callers borrow buffers.
+    pub fn new_with_native_memory(
+        object_store: Arc<ObjectStore>,
+        config: SchedulerConfig,
+        native_memory: NativeMemory,
+    ) -> Arc<Self> {
         let io_capacity = object_store.io_parallelism();
         let stats = IoStats::new();
         let use_lite = config
@@ -928,6 +942,7 @@ impl ScanScheduler {
             IoQueueType::Standard(io_queue)
         };
         Arc::new(Self {
+            native_memory,
             object_store,
             io_queue,
             stats,
@@ -1037,6 +1052,7 @@ impl ScanScheduler {
             let io_queue_clone = io_queue.clone();
             let num_bytes = iop.end - iop.start;
             let task = IoTask {
+                native_memory: self.native_memory.clone(),
                 reader: reader.clone(),
                 to_read: iop,
                 priority,
@@ -1091,6 +1107,7 @@ impl ScanScheduler {
                 let reader = reader.clone();
                 let queue = io_queue.clone();
                 let requested_range = task.clone();
+                let native_memory = self.native_memory.clone();
                 let run_fn = Box::new(move || {
                     // An empty range asks for no bytes, which IoTask::run
                     // answers without a request. Reaching a cloud store with
@@ -1103,15 +1120,28 @@ impl ScanScheduler {
                     // publish the same pair the same way: the requested
                     // length, on the error arm as well.
                     let num_bytes = requested_range.end - requested_range.start;
-                    IOPS_COUNTER.fetch_add(1, Ordering::Release);
-                    let bytes_fut = reader
-                        .get_range(requested_range.start as usize..requested_range.end as usize)
-                        .inspect(move |_| {
-                            BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
-                        });
+                    // Preserve eager submission for callers without native admission.
+                    let eager_read = native_memory.is_none().then(|| {
+                        IOPS_COUNTER.fetch_add(1, Ordering::Release);
+                        reader
+                            .get_range(requested_range.start as usize..requested_range.end as usize)
+                    });
                     async move {
-                        let bytes = bytes_fut.await.map_err(Error::from)?;
-                        validate_read_length(reader.path(), &requested_range, bytes)
+                        let reservation = reserve_read(&native_memory, num_bytes as usize).await?;
+                        let read = eager_read.unwrap_or_else(|| {
+                            IOPS_COUNTER.fetch_add(1, Ordering::Release);
+                            reader.get_range(
+                                requested_range.start as usize..requested_range.end as usize,
+                            )
+                        });
+                        let bytes = read
+                            .inspect(move |_| {
+                                BYTES_READ_COUNTER.fetch_add(num_bytes, Ordering::Release);
+                            })
+                            .await
+                            .map_err(Error::from)?;
+                        let bytes = validate_read_length(reader.path(), &requested_range, bytes)?;
+                        Ok(retain_bytes(bytes, reservation))
                     }
                     .boxed()
                 });
@@ -1297,6 +1327,7 @@ impl FileScheduler {
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
+        let native_memory = self.root.native_memory.clone();
         Either::Right(async move {
             let bytes_vec = bytes_vec_fut.await?;
 
@@ -1318,6 +1349,7 @@ impl FileScheduler {
                         // The original read was split into multiple requests, need to copy
                         // back into a single buffer
                         let orig_size = orig_range.end - orig_range.start;
+                        let reservation = reserve_read(&native_memory, orig_size as usize).await?;
                         let mut merged_bytes = Vec::with_capacity(orig_size as usize);
                         merged_bytes.extend_from_slice(&bytes_vec[updated_index].slice(start..));
                         let mut copy_offset = merged_bytes.len() as u64;
@@ -1334,7 +1366,7 @@ impl FileScheduler {
                             );
                             copy_offset += bytes_to_take;
                         }
-                        final_bytes.push(Bytes::from(merged_bytes));
+                        final_bytes.push(retain_bytes(Bytes::from(merged_bytes), reservation));
                     }
                     orig_index += 1;
                 } else {
@@ -1447,6 +1479,7 @@ mod tests {
 
     fn make_task(priority: u128, bypass_backpressure: bool) -> IoTask {
         IoTask {
+            native_memory: None,
             reader: Arc::new(TrackingReader {
                 get_range_count: Arc::new(AtomicU64::new(0)),
                 path: Path::parse("test").unwrap(),
@@ -2657,6 +2690,47 @@ mod tests {
         assert_eq!(bytes_dispatched.load(Ordering::Acquire), 30);
     }
 
+    #[derive(Debug, Default)]
+    struct TestNativeMemory(Arc<AtomicU64>);
+
+    #[derive(Debug)]
+    struct TestNativeReservation(Arc<AtomicU64>, usize);
+
+    impl lance_core::memory::NativeMemoryReservation for TestNativeReservation {
+        fn bytes(&self) -> usize {
+            self.1
+        }
+        fn set_backed_bytes(&mut self, _: usize) {}
+    }
+
+    impl Drop for TestNativeReservation {
+        fn drop(&mut self) {
+            self.0.fetch_sub(self.1 as u64, Ordering::SeqCst);
+        }
+    }
+
+    impl lance_core::memory::NativeMemoryPool for TestNativeMemory {
+        fn reserve(
+            &self,
+            kind: lance_core::memory::NativeMemoryKind,
+            bytes: usize,
+        ) -> futures::future::BoxFuture<
+            '_,
+            Result<Box<dyn lance_core::memory::NativeMemoryReservation>>,
+        > {
+            Box::pin(async move { self.try_reserve(kind, bytes) })
+        }
+
+        fn try_reserve(
+            &self,
+            _: lance_core::memory::NativeMemoryKind,
+            bytes: usize,
+        ) -> Result<Box<dyn lance_core::memory::NativeMemoryReservation>> {
+            self.0.fetch_add(bytes as u64, Ordering::SeqCst);
+            Ok(Box::new(TestNativeReservation(self.0.clone(), bytes)))
+        }
+    }
+
     // Against a 100-byte budget: submit fut1 (50 bytes, priority 0), drop it while
     // its read is still blocked in get_range, then submit fut2 (60 bytes, priority 1).
     // fut2's priority can't win the priority-bypass, so it needs 60 of the budget --
@@ -2674,12 +2748,14 @@ mod tests {
             DEFAULT_DOWNLOAD_RETRY_COUNT,
             None,
         ));
-        let scheduler = ScanScheduler::new(
+        let memory = Arc::new(TestNativeMemory::default());
+        let scheduler = ScanScheduler::new_with_native_memory(
             obj_store,
             SchedulerConfig {
                 io_buffer_size_bytes: 100,
                 use_lite_scheduler: Some(use_lite_scheduler),
             },
+            Some(memory.clone()),
         );
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
@@ -2705,6 +2781,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
+        assert_eq!(memory.0.load(Ordering::SeqCst), 50);
+
         // Step 2: drop the caller-side future while its `rx` is still pending.
         handle.abort();
         let _ = handle.await;
@@ -2726,7 +2804,14 @@ mod tests {
         let elapsed = start.elapsed();
         match outcome {
             Ok(res) => {
-                assert_eq!(res.unwrap().iter().map(|b| b.len()).sum::<usize>(), 60);
+                let result = res.unwrap();
+                assert_eq!(result.iter().map(|b| b.len()).sum::<usize>(), 60);
+                assert_eq!(memory.0.load(Ordering::SeqCst), 60);
+                let slice = result[0].slice(1..);
+                drop(result);
+                assert_eq!(memory.0.load(Ordering::SeqCst), 60);
+                drop(slice);
+                assert_eq!(memory.0.load(Ordering::SeqCst), 0);
                 (true, elapsed)
             }
             Err(_) => (false, elapsed),

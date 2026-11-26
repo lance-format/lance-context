@@ -52,6 +52,7 @@ struct DecodedMiniBlockChunk {
 /// the decoding of the block. (TODO: test this theory)
 #[derive(Debug)]
 struct DecodeMiniBlockTask {
+    native_memory: lance_core::memory::NativeMemory,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
@@ -588,7 +589,8 @@ impl DecodePageTask for DecodeMiniBlockTask {
                 .sum::<u64>()
                 * 2
         });
-        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes)
+            .with_native_memory(self.native_memory.clone());
 
         // We need to keep track of the offset into repbuf/defbuf that we are building up
         let mut level_offset = 0;
@@ -688,6 +690,7 @@ impl DecodePageTask for DecodeMiniBlockTask {
 /// [`PrimitiveStructuralEncoder`]: crate::encodings::logical::primitive::PrimitiveStructuralEncoder
 #[derive(Debug)]
 struct MiniBlockDecoder {
+    native_memory: lance_core::memory::NativeMemory,
     rep_decompressor: Option<Arc<dyn BlockDecompressor>>,
     def_decompressor: Option<Arc<dyn BlockDecompressor>>,
     value_decompressor: Arc<dyn MiniBlockDecompressor>,
@@ -733,6 +736,7 @@ impl StructuralPageDecoder for MiniBlockDecoder {
         let max_visible_level = max_visible_level(&self.def_meaning);
 
         Ok(Box::new(DecodeMiniBlockTask {
+            native_memory: self.native_memory.clone(),
             instructions: drain_instructions,
             def_decompressor: self.def_decompressor.clone(),
             rep_decompressor: self.rep_decompressor.clone(),
@@ -813,6 +817,7 @@ impl CachedPageData for MiniBlockCacheableState {
 /// `ChunkDrainInstructions`.
 #[derive(Debug)]
 pub struct MiniBlockScheduler {
+    native_memory: lance_core::memory::NativeMemory,
     // These come from the protobuf
     pub(super) buffer_offsets_and_sizes: Vec<(u64, u64)>,
     priority: u64,
@@ -905,6 +910,7 @@ impl MiniBlockScheduler {
         };
 
         Ok(Self {
+            native_memory: decompressors.native_memory(),
             buffer_offsets_and_sizes: buffer_offsets_and_sizes.to_vec(),
             rep_decompressor,
             def_decompressor,
@@ -1569,6 +1575,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .as_ref()
             .map(|dictionary| dictionary.clone());
         let def_meaning = self.def_meaning.clone();
+        let native_memory = self.native_memory.clone();
 
         let res = async move {
             let loaded_chunk_data = loaded_chunk_data.await?;
@@ -1577,6 +1584,7 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             }
 
             Ok(Box::new(MiniBlockDecoder {
+                native_memory,
                 rep_decompressor,
                 def_decompressor,
                 value_decompressor,
@@ -1663,6 +1671,7 @@ mod tests {
         chunk_data.resize(chunk_data.len() + expected_size as usize, 7);
 
         let task = DecodeMiniBlockTask {
+            native_memory: None,
             rep_decompressor: None,
             def_decompressor: None,
             value_decompressor: Arc::new(FixedWidthMiniBlockDecompressor),

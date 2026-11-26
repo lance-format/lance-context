@@ -22,6 +22,12 @@ use std::borrow::Cow;
 pub struct LanceBuffer(Buffer);
 
 impl LanceBuffer {
+    /// Attach admission to the backing allocation, including after conversion
+    /// to Arrow or zero-copy slicing.
+    pub fn with_reservation(self, reservation: lance_core::memory::NativeReservation) -> Self {
+        Self(lance_core::memory::retain_buffer(self.0, reservation))
+    }
+
     /// Convert into an Arrow buffer. Never copies data.
     pub fn into_buffer(self) -> Buffer {
         self.0
@@ -106,6 +112,45 @@ impl LanceBuffer {
                 ))
             }
         }
+    }
+
+    pub fn from_bytes_with_native_memory(
+        bytes: bytes::Bytes,
+        bytes_per_value: u64,
+        memory: &lance_core::memory::NativeMemory,
+    ) -> Result<Self> {
+        let reservation = if is_pwr_two(bytes_per_value)
+            && bytes.as_ptr().align_offset(bytes_per_value as usize) != 0
+        {
+            lance_core::memory::try_reserve(
+                memory,
+                lance_core::memory::NativeMemoryKind::Decode,
+                bytes.len(),
+            )?
+        } else {
+            None
+        };
+        Ok(Self::from_bytes(bytes, bytes_per_value).with_reservation(reservation))
+    }
+
+    pub fn borrow_to_typed_slice_with_native_memory<T: ArrowNativeType>(
+        &self,
+        memory: &lance_core::memory::NativeMemory,
+    ) -> Result<ScalarBuffer<T>> {
+        let reservation = if self.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
+            lance_core::memory::try_reserve(
+                memory,
+                lance_core::memory::NativeMemoryKind::Decode,
+                self.len(),
+            )?
+        } else {
+            None
+        };
+        let values = self.borrow_to_typed_slice::<T>();
+        Ok(ScalarBuffer::from(lance_core::memory::retain_buffer(
+            values.into_inner(),
+            reservation,
+        )))
     }
 
     /// Make an owned copy of the buffer (always does a copy of the data)

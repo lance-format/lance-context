@@ -590,6 +590,7 @@ impl MiniBlockCompressor for BinaryMiniBlockEncoder {
 
 #[derive(Debug)]
 pub struct BinaryMiniBlockDecompressor {
+    native_memory: lance_core::memory::NativeMemory,
     layout: BinaryMiniBlockLayout,
 }
 
@@ -606,6 +607,11 @@ enum BinaryMiniBlockLayout {
 }
 
 impl BinaryMiniBlockDecompressor {
+    pub fn with_native_memory(mut self, memory: lance_core::memory::NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
+    }
+
     pub fn new(bits_per_offset: u8) -> Result<Self> {
         if !matches!(bits_per_offset, 32 | 64) {
             return Err(Error::invalid_input(format!(
@@ -613,6 +619,7 @@ impl BinaryMiniBlockDecompressor {
             )));
         }
         Ok(Self {
+            native_memory: None,
             layout: BinaryMiniBlockLayout::Legacy { bits_per_offset },
         })
     }
@@ -643,6 +650,7 @@ impl BinaryMiniBlockDecompressor {
         let offsets = create_fixed_width_block_decompressor(offsets, bits_per_offset)?;
         let offsets_have_payload = offsets.requires_payload();
         Ok(Self {
+            native_memory: None,
             layout: BinaryMiniBlockLayout::Generic {
                 bits_per_offset: bits_per_offset as u8,
                 offsets,
@@ -874,7 +882,8 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
         };
 
         if bits_per_offset == 64 {
-            let offsets_buffer = data.borrow_to_typed_slice::<u64>();
+            let offsets_buffer =
+                data.borrow_to_typed_slice_with_native_memory::<u64>(&self.native_memory)?;
             let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
             let first = offsets[0];
@@ -883,6 +892,11 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
             let mut previous = first;
             let mut is_monotonic = true;
+            let offsets_reservation = lance_core::memory::try_reserve(
+                &self.native_memory,
+                lance_core::memory::NativeMemoryKind::Decode,
+                num_offsets * bytes_per_offset,
+            )?;
             let result_offsets = offsets
                 .iter()
                 .map(|&offset| {
@@ -896,15 +910,23 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 return Err(chunk_offset_violation_error(offsets, data.len()));
             }
 
+            let values_reservation = lance_core::memory::try_reserve(
+                &self.native_memory,
+                lance_core::memory::NativeMemoryKind::Decode,
+                (last - first) as usize,
+            )?;
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
-                offsets: LanceBuffer::reinterpret_vec(result_offsets),
+                data: LanceBuffer::from(data[first as usize..last as usize].to_vec())
+                    .with_reservation(values_reservation),
+                offsets: LanceBuffer::reinterpret_vec(result_offsets)
+                    .with_reservation(offsets_reservation),
                 bits_per_offset: 64,
                 num_values,
                 block_info: BlockInfo::new(),
             }))
         } else {
-            let offsets_buffer = data.borrow_to_typed_slice::<u32>();
+            let offsets_buffer =
+                data.borrow_to_typed_slice_with_native_memory::<u32>(&self.native_memory)?;
             let offsets = &offsets_buffer.as_ref()[..num_offsets];
 
             let first = offsets[0];
@@ -913,6 +935,11 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
             }
             let mut previous = first;
             let mut is_monotonic = true;
+            let offsets_reservation = lance_core::memory::try_reserve(
+                &self.native_memory,
+                lance_core::memory::NativeMemoryKind::Decode,
+                num_offsets * bytes_per_offset,
+            )?;
             let result_offsets = offsets
                 .iter()
                 .map(|&offset| {
@@ -926,9 +953,16 @@ impl MiniBlockDecompressor for BinaryMiniBlockDecompressor {
                 return Err(chunk_offset_violation_error(offsets, data.len()));
             }
 
+            let values_reservation = lance_core::memory::try_reserve(
+                &self.native_memory,
+                lance_core::memory::NativeMemoryKind::Decode,
+                (last - first) as usize,
+            )?;
             Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                data: LanceBuffer::from(data[first as usize..last as usize].to_vec()),
-                offsets: LanceBuffer::reinterpret_vec(result_offsets),
+                data: LanceBuffer::from(data[first as usize..last as usize].to_vec())
+                    .with_reservation(values_reservation),
+                offsets: LanceBuffer::reinterpret_vec(result_offsets)
+                    .with_reservation(offsets_reservation),
                 bits_per_offset: 32,
                 num_values,
                 block_info: BlockInfo::new(),

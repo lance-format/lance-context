@@ -77,6 +77,7 @@ pub struct Session {
     spill_store: Arc<dyn SpillStore>,
 
     runtime_env: Option<Arc<RuntimeEnv>>,
+    native_memory: lance_core::memory::NativeMemory,
 }
 
 impl DeepSizeOf for Session {
@@ -142,6 +143,7 @@ impl Session {
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
             runtime_env: None,
+            native_memory: None,
         }
     }
 
@@ -164,6 +166,7 @@ impl Session {
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
             runtime_env: None,
+            native_memory: None,
         }
     }
 
@@ -190,6 +193,17 @@ impl Session {
     /// state that overflows memory (e.g. index builders).
     pub fn spill_store(&self) -> &dyn SpillStore {
         &*self.spill_store
+    }
+
+    /// Share native read, decoder and index admission with the caller.
+    /// Reservations remain attached to borrowed buffers after cache eviction.
+    pub fn with_native_memory(mut self, memory: Arc<dyn lance_core::memory::NativeMemoryPool>) -> Self {
+        self.native_memory = Some(memory);
+        self
+    }
+
+    pub fn native_memory(&self) -> lance_core::memory::NativeMemory {
+        self.native_memory.clone()
     }
 
     /// Share DataFusion execution resources across this session's scans and merges.
@@ -255,6 +269,7 @@ impl Session {
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
             runtime_env: None,
+            native_memory: None,
         }
     }
 

@@ -604,7 +604,7 @@ impl FilteredReadStream {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
         let base_schedulers =
-            base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
+            base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options).with_native_memory(dataset.session().native_memory()));
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -756,7 +756,7 @@ impl FilteredReadStream {
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
-        ScanScheduler::new(obj_store, scheduler_config)
+        ScanScheduler::new_with_native_memory(obj_store, scheduler_config, dataset.session().native_memory())
     }
 
     /// Create the per-base scheduler cache for a read, sized like the scan
@@ -3117,7 +3117,8 @@ impl RowStreamRead {
     ) -> Self {
         let scan_scheduler =
             FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
-        let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options);
+        let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options)
+            .with_native_memory(dataset.session().native_memory());
         Self {
             dataset,
             source,
