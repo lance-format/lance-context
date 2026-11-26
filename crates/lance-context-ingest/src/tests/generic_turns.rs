@@ -16,6 +16,9 @@ use std::collections::HashMap;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
+#[cfg(all(feature = "http-client", feature = "service"))]
+mod http;
+
 fn bodies() -> Result<Vec<RecordBatch>> {
     // An operator may repeat this exact product-path test with externally
     // generated Arrow files, without putting private fixtures in the repository.
