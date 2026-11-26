@@ -14,6 +14,11 @@ use std::{collections::HashSet, mem::size_of};
 
 const SPEC_KEY: &str = "lance-context.turn-ingestion-spec.v1";
 
+#[cfg(feature = "materializer")]
+mod lookup;
+#[cfg(feature = "materializer")]
+pub use lookup::{TurnLookup, TurnLookupObservation};
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Persisted {
