@@ -7,6 +7,7 @@ use super::*;
 /// Holding this handle consumes one existing reader permit and pins local GC.
 pub struct ImmutableBase {
     base: Arc<views::Base>,
+    covered: Option<(Arc<()>, u64)>,
     _reader: OwnedSemaphorePermit,
 }
 
@@ -56,6 +57,7 @@ impl AnnotationStaging {
         let reader = reserve(&self.readers, 1)?;
         Ok(ImmutableBase {
             base: self.state.read().await.base.clone(),
+            covered: None,
             _reader: reader,
         })
     }
@@ -69,6 +71,9 @@ impl AnnotationStaging {
     /// Mark keys already present in active/frozen while capturing the same
     /// protected base. The caller owns and budgets this bounded key map.
     /// False still requires a historical lookup; it does not mean absent.
+    /// Results for exactly these keys may survive verified publications up to
+    /// the captured applied cut. The caller must preserve each marked hit when
+    /// supplying registrations; this does not certify any additional key.
     pub async fn try_capture_immutable_base_with_staged(
         &self,
         keys: &mut BTreeMap<String, bool>,
@@ -89,6 +94,9 @@ impl AnnotationStaging {
             }
         };
         let state = self.state.read().await;
+        let covered = keys
+            .as_ref()
+            .map(|_| (state.immutable_publications.clone(), state.applied));
         if let Some(keys) = keys {
             for (key, present) in keys {
                 *present = state.active.contains_key(key)
@@ -100,14 +108,17 @@ impl AnnotationStaging {
         }
         Ok(Some(ImmutableBase {
             base: state.base.clone(),
+            covered,
             _reader: reader,
         }))
     }
 
     /// Apply one already quorum-committed request. Active/frozen keys are
     /// rechecked under the mutation gate, so concurrent lanes and replay keep
-    /// the first source row. `None` means the queried base changed: refresh the
-    /// lookup and retry the SAME request, without advancing its WAL position.
+    /// the first source row. A staged-covered lookup also includes every key
+    /// published through its captured applied cut. It survives only verified
+    /// publications on this instance's lineage up to that cut. `None` requires
+    /// a fresh lookup for the SAME request, without advancing its WAL position.
     /// Backpressure also leaves the entire request unapplied.
     pub async fn register_immutable_committed(
         &self,
@@ -120,7 +131,10 @@ impl AnnotationStaging {
         let _mutation = self.mutation.lock().await;
         let mut state = self.state.write().await;
         check_order(&state, after, through)?;
-        if !Arc::ptr_eq(&state.base, &lookup.base) {
+        let covered_publication = lookup.covered.as_ref().is_some_and(|(lineage, through)| {
+            Arc::ptr_eq(lineage, &state.immutable_publications) && state.materialized <= *through
+        });
+        if !Arc::ptr_eq(&state.base, &lookup.base) && !covered_publication {
             return Ok(None);
         }
         let pending = self.immutable_pending(&state, through, rows)?;
