@@ -110,6 +110,7 @@ consumer workspace must supply and qualify its own matching patches.
 cargo build --locked -p lance-context-ingest --features service,http-client \
   --example managed_turn_replay
 managed_turn_replay spec input.arrow session_id session_id id > turn-spec.json
+managed_turn_replay validate replay.json input.arrow
 managed_turn_replay append replay.json input.arrow
 managed_turn_replay resume replay.json
 ```
@@ -119,6 +120,8 @@ the persisted producer `open` tuple, `endpoint`, `bearer_token_file` and
 `journal_directory`. Generate `spec` from the actual input: schema metadata is
 part of the binding, so a synthetic fixture does not establish a real input's
 schema contract. Provision the matching fresh table pair before replay.
+`validate` checks schema and business-key bounds without opening a journal or
+contacting the service; its output contains aggregate counts and lengths only.
 
 This entry runs one producer lane on one already partitioned shard. It uses the
 normal `DurableMutationClient`, accepts an IPC file of at most 128 MiB and bounds

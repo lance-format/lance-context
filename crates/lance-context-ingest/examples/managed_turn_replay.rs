@@ -3,7 +3,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use arrow_array::{
     builder::{ListBuilder, StringBuilder},
-    new_null_array, RecordBatch, StringArray, UInt8Array,
+    new_null_array, Array, RecordBatch, StringArray, UInt8Array,
 };
 use arrow_schema::{DataType, Field};
 use bytes::Bytes;
@@ -113,6 +113,63 @@ async fn main() -> Result<()> {
         config.binding.max_record_bytes <= 8 << 20 && config.binding.max_rows <= 8192,
         "this bounded replay entry supports at most8MiB/8192rows per request"
     );
+    if args[0] == "validate" && args.len() == 3 {
+        let file = std::fs::File::open(&args[2])?;
+        ensure!(file.metadata()?.len() <= 128 << 20, "input exceeds128MiB");
+        let reader = arrow_ipc::reader::FileReader::try_new(file, None)?;
+        ensure!(
+            reader.schema() == *config.spec.body_schema(),
+            "foreign input schema"
+        );
+        let mut rows = 0usize;
+        let mut batches = 0usize;
+        let mut invalid_components = 0usize;
+        let mut oversized_keys = 0usize;
+        let mut max_key_bytes = 0usize;
+        for batch in reader {
+            let batch = batch?;
+            batches += 1;
+            rows += batch.num_rows();
+            let columns = config
+                .spec
+                .primary_key()
+                .iter()
+                .map(|name| {
+                    batch
+                        .column_by_name(name)
+                        .context("missing key column")?
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .context("key is not UTF8")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for row in 0..batch.num_rows() {
+                let values = columns
+                    .iter()
+                    .map(|a| {
+                        if a.is_null(row) || a.value(row).is_empty() {
+                            invalid_components += 1;
+                        }
+                        a.value(row)
+                    })
+                    .collect::<Vec<_>>();
+                let length = serde_json::to_string(&values)?.len();
+                max_key_bytes = max_key_bytes.max(length);
+                oversized_keys += usize::from(length > config.limits.value_bytes);
+            }
+        }
+        println!(
+            "{}",
+            serde_json::json!({"event":"validated","rows":rows,"batches":batches,
+            "null_or_empty_key_components":invalid_components,"oversized_keys":oversized_keys,
+            "max_encoded_key_bytes":max_key_bytes,"key_limit_bytes":config.limits.value_bytes})
+        );
+        ensure!(
+            invalid_components == 0 && oversized_keys == 0,
+            "invalid business keys"
+        );
+        return Ok(());
+    }
     let append = match args[0].as_str() {
         "append" if args.len() == 3 => true,
         "resume" if args.len() == 2 => false,
