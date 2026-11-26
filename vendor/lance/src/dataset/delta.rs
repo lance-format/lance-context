@@ -419,6 +419,7 @@ impl DatasetDelta {
             candidates,
             live,
             LanceExecutionOptions {
+                runtime_env: begin.session.runtime_env(),
                 use_spilling: true,
                 ..Default::default()
             },

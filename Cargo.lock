@@ -4423,8 +4423,6 @@ dependencies = [
 [[package]]
 name = "lance-datafusion"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2df1f26d0a01b1103d587bd46226979b5a03b1117f63d6fb0503a496708a6e38"
 dependencies = [
  "arrow",
  "arrow-array",
