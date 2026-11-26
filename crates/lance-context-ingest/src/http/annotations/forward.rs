@@ -98,6 +98,10 @@ impl Forwarder {
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
             .route(
+                "/api/v1/annotations/{table}/selected-body",
+                post(selected_body),
+            )
+            .route(
                 "/api/v1/annotations/{table}/filter-status",
                 post(filter_status),
             )
@@ -295,4 +299,7 @@ async fn close(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) ->
 }
 async fn filter_status(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::FilterStatus).await
+}
+async fn selected_body(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
+    g.dispatch(t, r, Operation::SelectedBody).await
 }

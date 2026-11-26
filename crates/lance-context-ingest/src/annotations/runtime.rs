@@ -103,6 +103,10 @@ impl Runtime {
     /// Only this runtime may prepare/publish files. The ordinary constructor
     /// keeps physical collection disabled.
     pub fn with_exclusive_reclamation(mut self, options: reclamation::Options) -> Result<Self> {
+        ensure!(
+            self.publisher.service.ingress.turn_spec.is_none(),
+            "generic turn readers are not yet integrated with exclusive physical reclamation"
+        );
         if let Some(body) = &self.publisher.service.shared.body {
             let narrow = self.publisher.storage.base.as_ref();
             let body = body.base.as_ref();
@@ -147,6 +151,7 @@ impl Runtime {
             configuration,
             acquisition,
             None,
+            None,
         )
         .await
     }
@@ -170,6 +175,7 @@ impl Runtime {
             Some(body),
             configuration,
             acquisition,
+            None,
             None,
         )
         .await
@@ -197,6 +203,36 @@ impl Runtime {
             configuration,
             acquisition,
             Some(shard),
+            None,
+        )
+        .await
+    }
+
+    /// Own a fresh generic body/narrow pair. The exact schema and composite
+    /// identity must match its durable bootstrap; existing rollout bindings are
+    /// never reinterpreted. Equal session keys route to one physical bucket.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_turn_shard(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        storage: Storage,
+        body: Storage,
+        configuration: Configuration,
+        acquisition: materializer::Acquisition,
+        shard: Shard,
+        spec: &crate::turn_ingestion::TurnIngestionSpec,
+    ) -> Result<(Service, Self)> {
+        Self::connect_mode(
+            client,
+            layout,
+            binding,
+            storage,
+            Some(body),
+            configuration,
+            acquisition,
+            Some(shard),
+            Some(spec),
         )
         .await
     }
@@ -211,6 +247,7 @@ impl Runtime {
         configuration: Configuration,
         acquisition: materializer::Acquisition,
         shard: Option<Shard>,
+        spec: Option<&crate::turn_ingestion::TurnIngestionSpec>,
     ) -> Result<(Service, Self)> {
         let c = configuration;
         ensure!(
@@ -243,6 +280,7 @@ impl Runtime {
             &c.apply_budget,
             body.is_some(),
             shard,
+            spec,
         )
         .await?;
         let connect = || {

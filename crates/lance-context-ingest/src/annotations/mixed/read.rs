@@ -17,7 +17,8 @@ pub struct Turn {
 }
 
 impl Turn {
-    /// The body's score already reflects the current narrow annotation.
+    /// Generic bodies preserve their original fields. Legacy rollout bodies
+    /// expose the current annotation score in their existing score column.
     pub fn body(&self) -> &RecordBatch {
         &self.body
     }
@@ -78,7 +79,23 @@ impl Service {
             )
             .await?;
             let mut scan = body.scan();
-            scan.filter(&format!("id = '{}'", turn.replace('\'', "''")))?;
+            let filter = if let Some(spec) = &self.ingress.turn_spec {
+                spec.primary_key()
+                    .iter()
+                    .zip(spec.key_values(turn)?)
+                    .map(|(name, value)| {
+                        format!(
+                            "`{}` = '{}'",
+                            name.replace('`', "``"),
+                            value.replace('\'', "''")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            } else {
+                format!("id = '{}'", turn.replace('\'', "''"))
+            };
+            scan.filter(&filter)?;
             scan.limit(Some(2), None)?;
             scan.batch_size(128)
                 .batch_readahead(1)
@@ -104,8 +121,10 @@ impl Service {
             )
         };
         let mut columns = batch.columns().to_vec();
-        columns[batch.schema().index_of("score")?] =
-            Arc::new(arrow_array::Float32Array::from(vec![annotation.score]));
+        if self.ingress.turn_spec.is_none() {
+            columns[batch.schema().index_of("score")?] =
+                Arc::new(arrow_array::Float32Array::from(vec![annotation.score]));
+        }
         let body = RecordBatch::try_new(batch.schema(), columns)?;
         Ok(Some(Turn {
             annotation,

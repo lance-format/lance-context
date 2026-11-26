@@ -19,7 +19,7 @@ pub async fn provision(
     limits: Limits,
 ) -> Result<Storage> {
     provision_mode(
-        client, layout, binding, narrow, body, identity, limits, None,
+        client, layout, binding, narrow, body, identity, limits, None, None,
     )
     .await
 }
@@ -45,6 +45,35 @@ pub async fn provision_shard(
         identity,
         limits,
         Some(shard),
+        None,
+    )
+    .await
+}
+
+/// Provision a fresh managed pair with the caller's immutable body schema,
+/// composite business key and session routing. Existing tables are not migrated.
+#[allow(clippy::too_many_arguments)]
+pub async fn provision_turn_shard(
+    client: Arc<Client>,
+    layout: Arc<Layout>,
+    binding: TableBinding,
+    narrow: Storage,
+    body: Storage,
+    identity: Identity,
+    limits: Limits,
+    shard: crate::annotations::Shard,
+    spec: &crate::turn_ingestion::TurnIngestionSpec,
+) -> Result<Storage> {
+    provision_mode(
+        client,
+        layout,
+        binding,
+        narrow,
+        body,
+        identity,
+        limits,
+        Some(shard),
+        Some(spec),
     )
     .await
 }
@@ -59,6 +88,7 @@ async fn provision_mode(
     identity: Identity,
     limits: Limits,
     shard: Option<crate::annotations::Shard>,
+    spec: Option<&crate::turn_ingestion::TurnIngestionSpec>,
 ) -> Result<Storage> {
     ensure!(
         shard.is_some() || layout.buckets.len() == 1,
@@ -72,7 +102,11 @@ async fn provision_mode(
         table: binding.table,
         destination: binding.destination.clone(),
         incarnation: binding.incarnation,
-        contract: if let Some(shard) = shard {
+        contract: if let Some(spec) = spec {
+            shard
+                .context("generic turns need an explicit shard")?
+                .turn_contract(&binding, spec, &limits)?
+        } else if let Some(shard) = shard {
             shard.contract(&binding, &limits, true)?
         } else {
             Service::mixed_contract(&binding, &limits)?
@@ -139,8 +173,14 @@ async fn provision_mode(
         let reference = BodySnapshot::read(&selected)
             .await?
             .context("mixed body reference missing")?;
-        crate::annotations::mixed::load_body(&body, &reference, &scope.incarnation.to_string())
-            .await?;
+        crate::annotations::mixed::load_body_with_schema(
+            &body,
+            &reference,
+            &scope.incarnation.to_string(),
+            spec.map(|s| s.body_schema().as_ref())
+                .unwrap_or(&rollout_schema()),
+        )
+        .await?;
         return Ok(narrow);
     }
     let acquired = commit(
@@ -158,7 +198,8 @@ async fn provision_mode(
     let Applied::Publisher(p::Reply::Acquired(authority)) = acquired else {
         bail!("mixed bootstrap acquisition rejected: {acquired:?}");
     };
-    let selected = create_pair_for_shard(&narrow, &body, &scope, &identity, group, bucket).await?;
+    let selected =
+        create_pair_for_shard(&narrow, &body, &scope, &identity, group, bucket, spec).await?;
     let transaction = selected
         .read_transaction()
         .await?
@@ -208,7 +249,7 @@ pub(crate) async fn create_pair(
     identity: &Identity,
     group: u64,
 ) -> Result<Dataset> {
-    create_pair_for_shard(narrow, body, scope, identity, group, 0).await
+    create_pair_for_shard(narrow, body, scope, identity, group, 0, None).await
 }
 
 async fn create_pair_for_shard(
@@ -218,10 +259,16 @@ async fn create_pair_for_shard(
     identity: &Identity,
     group: u64,
     bucket: u32,
+    spec: Option<&crate::turn_ingestion::TurnIngestionSpec>,
 ) -> Result<Dataset> {
     let marker = serde_json::to_string(&(scope, identity, &narrow.uri, &body.uri))?;
     let properties = HashMap::from([(GENESIS.to_owned(), marker.clone())]);
-    let body_base = empty(body, Arc::new(rollout_schema()), properties.clone()).await?;
+    let body_base = empty(
+        body,
+        spec.map_or_else(|| Arc::new(rollout_schema()), |s| s.body_schema().clone()),
+        properties.clone(),
+    )
+    .await?;
     let reference = BodySnapshot::capture(scope.incarnation.to_string(), &body_base).await?;
     ensure!(
         reference.uri == body.uri,
@@ -242,6 +289,10 @@ async fn create_pair_for_shard(
         properties.clone(),
     ));
     let mut properties = properties;
+    let schema = match spec {
+        Some(spec) => spec.bind_schema(&schema)?,
+        None => schema,
+    };
     properties.insert(
         BODY_SNAPSHOT_PROPERTY.into(),
         serde_json::to_string(&reference)?,

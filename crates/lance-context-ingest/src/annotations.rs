@@ -78,6 +78,7 @@ pub enum ApplyBackpressure {
 }
 
 struct Shared {
+    narrow: Storage,
     body: Option<Storage>,
     local_payloads: local_payload::Registry,
     frames: Mutex<mixed::frames::Window>,
@@ -159,8 +160,18 @@ impl Service {
     }
 
     fn validate_turn(&self, turn: &str) -> Result<()> {
+        let routing = self
+            .ingress
+            .turn_spec
+            .as_ref()
+            .map(|spec| spec.routing_key(turn))
+            .transpose()?;
         if let Some(shard) = self.shard {
-            shard.validate_turn(&self.ingress.layout, &self.ingress.scope.contract, turn)?;
+            shard.validate_turn(
+                &self.ingress.layout,
+                &self.ingress.scope.contract,
+                routing.as_deref().unwrap_or(turn),
+            )?;
         }
         Ok(())
     }
@@ -297,6 +308,7 @@ impl Service {
             apply_budget,
             false,
             None,
+            None,
         )
         .await
     }
@@ -311,6 +323,7 @@ impl Service {
         apply_budget: &Arc<MergeMemoryBudget>,
         mixed: bool,
         shard: Option<Shard>,
+        spec: Option<&crate::turn_ingestion::TurnIngestionSpec>,
     ) -> Result<Ingress> {
         ensure!(
             shard.is_some() || layout.buckets.len() == 1,
@@ -319,14 +332,22 @@ impl Service {
         if let Some(shard) = shard {
             layout.group_for_bucket(shard.bucket)?;
         }
-        let schema = if let Some(shard) = shard {
+        ensure!(
+            spec.is_none() || (mixed && shard.is_some()),
+            "generic turns require an explicit mixed shard"
+        );
+        let schema = if let Some(spec) = spec {
+            shard.unwrap().turn_schema(spec, limits)?
+        } else if let Some(shard) = shard {
             shard.wire_schema(limits, mixed)?
         } else if mixed {
             mixed::wire::schema(limits)
         } else {
             wire::schema(limits)
         };
-        let contract = if let Some(shard) = shard {
+        let contract = if let Some(spec) = spec {
+            shard.unwrap().turn_contract(&binding, spec, limits)?
+        } else if let Some(shard) = shard {
             shard.contract(&binding, limits, mixed)?
         } else if mixed {
             Self::mixed_contract(&binding, limits)?
@@ -364,6 +385,17 @@ impl Service {
         let shard = Shard::from_ingress(&ingress)?;
         let bucket = shard.map_or(0, |shard| shard.bucket);
         let (base, snapshot) = checkpoint::open(&ingress, storage, body.as_ref(), bucket).await?;
+        let narrow_schema: arrow_schema::Schema = base.schema().into();
+        let stored_spec = crate::turn_ingestion::TurnIngestionSpec::from_schema(&narrow_schema)?;
+        ensure!(
+            stored_spec.as_ref().map(|s| s.fingerprint()).transpose()?
+                == ingress
+                    .turn_spec
+                    .as_ref()
+                    .map(|s| s.fingerprint())
+                    .transpose()?,
+            "selected narrow table has a foreign ingestion specification"
+        );
         ensure!(
             body.is_some() == (ingress.scope.contract.policy == WritePolicy::TurnIngestion),
             "body storage differs from the ingestion contract"
@@ -395,6 +427,7 @@ impl Service {
             limits,
             apply_budget,
             shared: Arc::new(Shared {
+                narrow: storage.clone(),
                 body,
                 local_payloads: local_payload::Registry::default(),
                 frames: Mutex::new(mixed::frames::Window::default()),
@@ -581,6 +614,7 @@ impl Service {
         let shard = self.shard;
         let layout = self.ingress.layout.clone();
         let bucket = self.bucket();
+        let spec = self.ingress.turn_spec.clone();
         tokio::task::spawn_blocking(move || {
             let decoded = if mixed {
                 mixed::wire::decode(
@@ -597,7 +631,7 @@ impl Service {
                     value_bytes,
                 )?)
             };
-            decoded.validate_shard(shard, &layout, &upload.scope.contract)?;
+            decoded.validate_shard(shard, &layout, &upload.scope.contract, spec.as_deref())?;
             let rows = decoded.rows() as u32;
             let annotation_kind = Some(match &decoded {
                 mixed::Decoded::Creates { .. } => WriteKind::Create,
@@ -1088,12 +1122,13 @@ impl Driver {
             // credit. The retained body frame keeps every shared IPC allocation.
             drop(rows);
             if result == MutationResult::Applied {
-                service.shared.frames.lock().unwrap().record(
+                service.shared.frames.lock().unwrap().record_with_spec(
                     pending.index,
                     bodies,
                     pending._reservation,
                     pending.meta.body_bytes as usize,
                     pending.input_allocation,
+                    ingress.turn_spec.clone(),
                 );
             }
         }
