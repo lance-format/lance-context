@@ -182,22 +182,29 @@ impl Service {
     }
 
     pub(super) async fn lookup_bodies(&self, keys: &[&str]) -> Result<Option<Lookup>> {
-        let base = self.shared.staging.capture_immutable_base().await?;
-        let spec = self
-            .ingress
-            .turn_spec
-            .as_ref()
-            .context("missing body spec")?;
-        Ok(spec
-            .lookup_existing(
-                base.dataset().clone(),
-                keys,
-                self.lookup_budget
+        self.shared
+            .phases
+            .measure(Phase::AnnotationRegistrationLookup, async {
+                let Some(base) = self.shared.staging.try_capture_immutable_base().await? else {
+                    return Ok(None);
+                };
+                let spec = self
+                    .ingress
+                    .turn_spec
                     .as_ref()
-                    .context("missing body lookup budget")?,
-            )
-            .await?
-            .map(|keys| Lookup { base, keys }))
+                    .context("missing body spec")?;
+                Ok(spec
+                    .lookup_existing(
+                        base.dataset().clone(),
+                        keys,
+                        self.lookup_budget
+                            .as_ref()
+                            .context("missing body lookup budget")?,
+                    )
+                    .await?
+                    .map(|keys| Lookup { base, keys }))
+            })
+            .await
     }
 
     pub(super) async fn apply_bodies(

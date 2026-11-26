@@ -60,6 +60,23 @@ impl AnnotationStaging {
         })
     }
 
+    /// Capture without waiting for reader capacity. `None` means existing
+    /// readers hold every permit; callers must retain their unapplied request.
+    pub async fn try_capture_immutable_base(&self) -> Result<Option<ImmutableBase>> {
+        self.require_immutable()?;
+        let reader = match self.readers.clone().try_acquire_owned() {
+            Ok(reader) => reader,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(None),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(invalid("annotation staging reader admission closed"));
+            }
+        };
+        Ok(Some(ImmutableBase {
+            base: self.state.read().await.base.clone(),
+            _reader: reader,
+        }))
+    }
+
     /// Apply one already quorum-committed request. Active/frozen keys are
     /// rechecked under the mutation gate, so concurrent lanes and replay keep
     /// the first source row. `None` means the queried base changed: refresh the
