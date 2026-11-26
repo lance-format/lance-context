@@ -358,8 +358,15 @@ where
 }
 
 fn fenced(config: &crate::config::MasterConfig, target: &str) -> bool {
-    config.append.managed(config, target)
-        || config.merge_rollout.owned(target)
+    if config.managed_store_kind.as_deref().is_some_and(|kind| {
+        target
+            .strip_prefix(kind)
+            .is_some_and(|tail| tail.starts_with(':'))
+    }) {
+        // An exact append selector must not enroll the other registered tables.
+        return config.append.managed(config, target);
+    }
+    config.merge_rollout.owned(target)
         || (config.maintenance.fence_legacy_maintenance && !target.starts_with("datagen:"))
 }
 
@@ -899,6 +906,29 @@ mod tests {
         assert!(!fenced(&enabled, "datagen:legacy"));
         assert!(!enabled.merge_rollout.owned("new-hot-table"));
         assert!(!enabled.merge_rollout.owned("generic:new-hot-table"));
+    }
+
+    #[test]
+    fn registered_maintenance_follows_the_append_target_selector() {
+        for kind in ["datagen", "events"] {
+            let selected = format!("{kind}:selected");
+            let other = format!("{kind}:other");
+            let mut config = MasterConfig::parse_from([
+                "master",
+                "--managed-store-kind",
+                kind,
+                "--rollout-append-local",
+                "--rollout-append-targets",
+                &selected,
+                "--fence-legacy-maintenance",
+            ]);
+            assert!(fenced(&config, &selected));
+            assert!(!fenced(&config, &other));
+            config.append.rollout_append_targets = vec!["*".into()];
+            assert!(fenced(&config, &other));
+            config.append.rollout_append_targets.clear();
+            assert!(!fenced(&config, &selected));
+        }
     }
 
     async fn fixture() -> (tempfile::TempDir, Arc<MasterState>) {

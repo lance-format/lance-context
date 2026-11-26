@@ -27,9 +27,12 @@ blobs.
 
 ## Master configuration
 
-Opt in with `MANAGED_IMMUTABLE_APPEND=true` and a `MANAGED_STORE_KIND`. The Master
-resolves the registered URI and reads its persisted schema/primary-key metadata;
-it never infers a rollout path for that application. Also configure:
+Set `MANAGED_STORE_KIND` and use the existing `ROLLOUT_APPEND_TARGETS` selector:
+`*` selects all tables in that registry, or use exact `kind:name` targets.
+Together with `ROLLOUT_APPEND_LOCAL=true`, this selects the shared local append
+executor; registration alone does not imply immutable append. The Master resolves
+the registered URI and reads its persisted schema/primary-key metadata; it never
+infers a rollout path for that application. Also configure:
 
 - `ROLLOUT_APPEND_LOCAL=true` and `FENCE_LEGACY_MAINTENANCE=true`.
 - `CATCHUP_SHARDS` with stable current and historical Worker identities.
@@ -37,6 +40,12 @@ it never infers a rollout path for that application. Also configure:
 - A positive `MERGE_WAL_CONCURRENCY`. Registered tables use this ordinary queue
   pool; set `ROLLOUT_APPEND_LOCAL_TASK_CONCURRENCY=0` when no rollout targets use
   the separate resident-only pool.
+
+Selected registered targets use `ReplayPolicy::AllowDuplicates`; their readers
+must deduplicate immutable identities. Existing rollout entry points retain
+`ReplayPolicy::CheckBase`. Exact selectors leave other registered targets on
+their existing Worker merge path. New Worker-only applications that have removed
+that path must select every table, normally with `ROLLOUT_APPEND_TARGETS=*`.
 
 Registered-store statistics scans discover pending WAL; bounded append passes
 request continuation through the existing queue. Compaction and indexing retain

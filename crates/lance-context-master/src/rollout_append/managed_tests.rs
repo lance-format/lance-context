@@ -7,6 +7,39 @@ use lance_context_api::TaskKind;
 use lance_context_core::{StorageBase, StorageBaseOptions};
 use lance_context_merge::{Execution, MaintenanceKind};
 
+#[test]
+fn registered_append_uses_existing_target_and_local_selectors() {
+    for kind in ["datagen", "events"] {
+        let selected = format!("{kind}:selected");
+        let other = format!("{kind}:other");
+        let mut config = MasterConfig::parse_from(["test", "--managed-store-kind", kind]);
+        config.catchup.shards = vec!["a".into()];
+        config.validate_registered_store().unwrap();
+        assert!(!crate::local_merge::selected(&config, &selected));
+        config.append.rollout_append_targets = vec![selected.clone()];
+        assert!(!crate::local_merge::selected(&config, &selected));
+        config.append.rollout_append_local = true;
+        assert!(config.append.validate_local(&config).is_err());
+        config.maintenance.fence_legacy_maintenance = true;
+        config.validate_registered_store().unwrap();
+        config.append.validate_local(&config).unwrap();
+        assert!(crate::local_merge::selected(&config, &selected));
+        assert!(!crate::local_merge::selected(&config, &other));
+        config.append.rollout_append_targets = vec!["*".into()];
+        config.append.validate_local(&config).unwrap();
+        assert!(crate::local_merge::selected(&config, &other));
+        assert!(!crate::local_merge::selected(&config, "unrelated:table"));
+        assert!(!crate::local_merge::selected(&config, "generic:table"));
+        assert!(!crate::local_merge::selected(
+            &config,
+            &format!("{kind}:../bad")
+        ));
+        config.append.rollout_append_targets.clear();
+        assert!(config.validate_registered_store().is_err());
+        assert!(!crate::local_merge::selected(&config, &selected));
+    }
+}
+
 fn config(dir: &tempfile::TempDir) -> MasterConfig {
     let mut config = MasterConfig::parse_from([
         "test",
@@ -20,7 +53,7 @@ fn config(dir: &tempfile::TempDir) -> MasterConfig {
         &format!("/managed-append/{}", lance_context_core::generate_id()),
     ]);
     config.worker_endpoints.clear();
-    config.append.managed_immutable_append = true;
+    config.append.rollout_append_targets = vec!["*".into()];
     config.append.rollout_append_local = true;
     config.append.rollout_append_local_task_concurrency = 0;
     config.append.rollout_append_max_bytes = 1 << 20;
@@ -64,7 +97,7 @@ async fn registered_shards_merge_through_the_existing_local_executor() {
     assert!(crate::local_merge::selected(&config, "events:table"));
     assert!(!crate::local_merge::selected(&config, "other:table"));
     let mut disabled = config.clone();
-    disabled.append.managed_immutable_append = false;
+    disabled.append.rollout_append_targets.clear();
     assert!(!crate::local_merge::selected(&disabled, "events:table"));
     assert!(disabled.validate_registered_store().is_err());
     let state = MasterState::new(config).await.unwrap();

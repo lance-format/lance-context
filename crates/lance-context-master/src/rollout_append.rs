@@ -48,12 +48,8 @@ fn collect_stage(
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct AppendConfig {
-    /// Run immutable registered-store merges through the existing local append
-    /// executor. Requires worker base maintenance to be disabled and drained.
-    /// Physical ingest/replay duplicates are allowed; application readers deduplicate.
-    #[arg(long, env = "MANAGED_IMMUTABLE_APPEND", default_value_t = false)]
-    pub managed_immutable_append: bool,
-    /// Opt-in immutable rollout targets. '*' selects all owned rollouts.
+    /// Opt-in immutable append targets. '*' selects owned rollouts and tables
+    /// in MANAGED_STORE_KIND; exact registered targets use 'kind:name'.
     #[arg(long, env = "ROLLOUT_APPEND_TARGETS", value_delimiter = ',')]
     pub rollout_append_targets: Vec<String>,
     /// Concurrent staging RPCs per table. Uses the workers' shared merge slots/budget.
@@ -94,7 +90,6 @@ pub struct AppendConfig {
 impl Default for AppendConfig {
     fn default() -> Self {
         Self {
-            managed_immutable_append: false,
             rollout_append_targets: Vec::new(),
             rollout_append_concurrency: 4,
             rollout_append_max_generations: 64,
@@ -108,7 +103,7 @@ impl Default for AppendConfig {
 }
 impl AppendConfig {
     pub(crate) fn managed(&self, config: &crate::config::MasterConfig, target: &str) -> bool {
-        self.managed_immutable_append
+        self.local(target)
             && config.managed_store_kind.as_deref().is_some_and(|kind| {
                 target
                     .strip_prefix(kind)
@@ -117,17 +112,22 @@ impl AppendConfig {
             })
     }
 
+    pub(crate) fn has_managed_targets(&self, config: &crate::config::MasterConfig) -> bool {
+        config.managed_store_kind.is_some()
+            && self.rollout_append_local
+            && self
+                .rollout_append_targets
+                .iter()
+                .any(|target| target == "*" || self.managed(config, target))
+    }
+
     pub(crate) fn local(&self, target: &str) -> bool {
         self.rollout_append_local && self.enabled(target)
     }
 
     pub(crate) fn validate_local(&self, config: &crate::config::MasterConfig) -> Result<()> {
-        if self.managed_immutable_append
-            && (config.managed_store_kind.is_none()
-                || !self.rollout_append_local
-                || !config.maintenance.fence_legacy_maintenance)
-        {
-            return Err("managed immutable append requires a registered kind, local append and fenced maintenance".into());
+        if self.has_managed_targets(config) && !config.maintenance.fence_legacy_maintenance {
+            return Err("registered local append requires fenced maintenance".into());
         }
         if !self.rollout_append_local {
             return Ok(());
@@ -141,7 +141,7 @@ impl AppendConfig {
                 "resident local append cannot be combined with Kubernetes catch-up mode".into(),
             );
         }
-        if (self.rollout_append_targets.is_empty() && !self.managed_immutable_append)
+        if self.rollout_append_targets.is_empty()
             || config.catchup.shards.is_empty()
             || config.catchup.shards.len() > 256
             || config.catchup.shards.iter().any(|s| s.is_empty())
@@ -154,11 +154,11 @@ impl AppendConfig {
         for target in &self.rollout_append_targets {
             if target != "*"
                 && (target.starts_with("generic:")
-                    || !config.merge_rollout.owned(target)
+                    || !(config.merge_rollout.owned(target) || self.managed(config, target))
                     || config.merge_rollout.draining(target))
             {
                 return Err(format!(
-                    "local append requires a non-draining owned rollout: {target}"
+                    "local append requires a non-draining owned rollout or registered target: {target}"
                 ));
             }
         }
