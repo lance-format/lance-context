@@ -5,7 +5,6 @@ pub(super) mod frames;
 mod prepare;
 mod read;
 pub mod wire;
-pub(super) use prepare::BodyWriteFailed;
 pub use read::Turn;
 
 /// A catalog-selected, exact body snapshot and its covered WAL prefix. This is

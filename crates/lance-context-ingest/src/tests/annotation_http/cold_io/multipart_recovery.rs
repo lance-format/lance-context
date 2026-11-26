@@ -1,7 +1,11 @@
 //! Recover a mixed cut after the real multipart object is written but its reply is lost.
 use super::*;
 use crate::{
-    annotations::{mixed, runtime::Configuration, runtime::Runtime, Service},
+    annotations::{
+        mixed,
+        runtime::{Configuration, PublicationWriteFailed, Runtime},
+        Service,
+    },
     materializer::{Acquisition, Options, Storage},
     tests::{annotations::request, mixed_annotations as fixture},
 };
@@ -118,7 +122,7 @@ async fn exercise() -> Result<()> {
     let base = annotation_publication::read(&c, &narrow, None).await?;
     let (a, runtime) = owner(&c, &narrow, &body).await?;
     let (_, _, recovery_cut) = runtime.http_binding();
-    let (stop, task) = annotation_runtime::run_owner(runtime);
+    let (_stop, task) = annotation_runtime::run_owner(runtime);
     let mut failed_upload = gates.lose_put_reply();
 
     let ids = (0..ROWS)
@@ -184,20 +188,9 @@ async fn exercise() -> Result<()> {
     assert_eq!(plan.plan.sources[&10].records.len(), 1);
     assert_eq!(plan.plan.sources[&10].records[0].0, acknowledged[0].1.index);
 
-    failed_upload.release();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while !a
-            .phase_observation()
-            .iter()
-            .any(|phase| phase.phase == "annotation_body_write" && phase.failed == 1)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
-    // The object exists but no native commit was attempted. Keep acknowledged
-    // values readable until an explicit fenced restart resolves the old cut.
-    assert!(!task.is_finished(), "lost upload reply stopped owned reads");
+    // While the real upload is paused, owned reads still expose the applied
+    // values even though the later committed request cannot yet apply.
+    assert!(!task.is_finished(), "paused upload stopped owned reads");
     for row in 0..ROWS {
         let current = a
             .get_owned(
@@ -206,7 +199,7 @@ async fn exercise() -> Result<()> {
                 Duration::from_secs(1),
             )
             .await?
-            .context("acknowledged annotation missing after upload error")?;
+            .context("acknowledged annotation missing during paused upload")?;
         assert_eq!(
             current.status.as_deref(),
             Some(if row == 0 { "reviewed" } else { "pending" })
@@ -217,13 +210,26 @@ async fn exercise() -> Result<()> {
             std::collections::BTreeSet::from(["imported".into()])
         );
     }
+    // A lost completion reply leaves an unpublished object. Report the
+    // failure to the supervisor; the retained cut and WAL drive recovery.
+    failed_upload.release();
+    let error = tokio::time::timeout(Duration::from_secs(30), task)
+        .await??
+        .expect_err("failed publication must notify its supervisor");
+    assert!(error.is::<PublicationWriteFailed>(), "{error:#}");
+    assert_eq!(
+        error.root_cause().to_string(),
+        "injected lost native PUT reply"
+    );
+    assert!(a
+        .phase_observation()
+        .iter()
+        .any(|phase| phase.phase == "annotation_body_write" && phase.failed == 1));
     assert!(a
         .phase_observation()
         .iter()
         .all(|phase| phase.phase != "annotation_body_commit" || phase.started == 0));
     assert_eq!(gates.multipart_completions.load(Ordering::SeqCst), 1);
-    stop.send(()).unwrap();
-    task.await??;
     let stopped = annotation_publication::state(&c).await?;
     assert_eq!(stopped.progress.pending.as_ref(), Some(&plan));
     assert!(stopped.progress.prepared.is_none());
