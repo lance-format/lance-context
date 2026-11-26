@@ -130,6 +130,7 @@ async fn full_body_compaction_preserves_bodies_row_ids_and_request_results() -> 
     }
     let (last, completed) = last.unwrap();
     let selected = service.selected_full_body(DEADLINE).await?;
+    assert_eq!(selected.rows, Some(6));
     let old = annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
     assert_eq!(old.manifest().fragments.len(), 3);
     let ids = row_ids(&old).await?;
@@ -145,6 +146,7 @@ async fn full_body_compaction_preserves_bodies_row_ids_and_request_results() -> 
             let current =
                 annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
             if current.manifest().fragments.len() == 1 {
+                assert_eq!(selected.rows, Some(6));
                 return Ok::<_, anyhow::Error>(current);
             }
             tokio::select! {

@@ -172,6 +172,14 @@ async fn exercise() -> Result<()> {
     };
     let expected = distinct(&[0, 1, 3])?;
     assert_eq!(durable.count_rows(None).await?, expected);
+    assert_eq!(selected.rows, Some(expected as u64));
+    assert_eq!(direct.rows, selected.rows);
+    let mut legacy = serde_json::to_value(&selected)?;
+    legacy.as_object_mut().unwrap().remove("rows");
+    assert_eq!(
+        serde_json::from_value::<single_body::SelectedBody>(legacy)?.rows,
+        None
+    );
     // Each key returns the body from the first body that created it.
     let mut first = std::collections::BTreeMap::new();
     for i in [0, 1, 3] {

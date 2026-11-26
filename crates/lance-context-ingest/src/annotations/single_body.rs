@@ -169,6 +169,10 @@ pub struct SelectedBody {
     pub through: u64,
     pub uri: String,
     pub manifest: lance_context_wal::replication::publication::ManifestRecord,
+    /// Live rows in this exact selected dataset, excluding staging. Unavailable
+    /// when its manifest lacks trusted, complete row counts; never scans data.
+    #[serde(default)]
+    pub rows: Option<u64>,
 }
 
 pub(super) struct Lookup {
@@ -316,6 +320,7 @@ impl Service {
                 through: snapshot.through,
                 uri: base.uri().to_owned(),
                 manifest: manifest.as_ref().clone(),
+                rows: read::selected_rows(base.manifest()),
             })
         })
         .await

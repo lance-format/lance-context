@@ -59,6 +59,7 @@ async fn exercise() -> Result<()> {
     }
     assert_eq!(service.body_lookup_observation().scans_started, 1);
     assert_eq!(service.body_lookup_observation().staged_keys, 2);
+    assert_eq!(service.selected_full_body(DEADLINE).await?.rows, Some(0));
 
     // Pause a real data-object upload after freezing, then apply both an
     // all-duplicate frame and a mixed frame while the selected base is old.
@@ -75,6 +76,7 @@ async fn exercise() -> Result<()> {
     assert_eq!(result.result, MutationResult::Applied);
     assert_eq!(service.body_lookup_observation().scans_started, 2);
     assert_eq!(service.body_lookup_observation().staged_keys, 6);
+    assert_eq!(service.selected_full_body(DEADLINE).await?.rows, Some(0));
     for (row, original) in [
         (0, &input[0]),
         (1, &input[0]),
@@ -95,6 +97,7 @@ async fn exercise() -> Result<()> {
     drained(&c, &service, result.index).await?;
     assert_eq!(service.retained_body_frames(), (0, 0));
     let selected = service.selected_full_body(DEADLINE).await?;
+    assert_eq!(selected.rows, Some(4));
     let durable =
         annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
     assert_eq!(durable.count_rows(None).await?, 4);
