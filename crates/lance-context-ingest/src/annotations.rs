@@ -1097,6 +1097,18 @@ impl Driver {
             }
             self.lookup.bodies = service.lookup_bodies(&keys).await?;
             if self.lookup.bodies.is_none() && !self.lookahead.is_empty() {
+                // A head-only query must also release future decoded inputs.
+                // Otherwise they can keep native admission full when no
+                // applied prefix exists for the publisher to drain. Restore
+                // their already validated metadata in order before dropping
+                // bodies/reservations; neither the page cut nor ACK advances.
+                let page = self
+                    .source_page
+                    .as_mut()
+                    .context("lookahead lost its committed source page")?;
+                while let Some(record) = self.lookahead.pop_back() {
+                    page.entries.insert(0, (record.index, record.meta));
+                }
                 let mixed::Decoded::Creates { rows, .. } = &pending.decoded else {
                     unreachable!()
                 };
