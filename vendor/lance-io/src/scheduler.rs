@@ -1240,6 +1240,11 @@ fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
 }
 
 impl FileScheduler {
+    /// Allocation owner shared with this file's physical reads.
+    pub fn native_memory(&self) -> NativeMemory {
+        self.root.native_memory.clone()
+    }
+
     /// Submit a batch of I/O requests to the reader
     ///
     /// The requests will be queued in a FIFO manner and, when all requests
