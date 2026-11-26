@@ -306,11 +306,63 @@ impl PlainPostingList {
     }
 }
 
+/// The packed state slab and its lazily initialized arrays share this owner.
+/// Admission covers the maximum retained heads; backing is reported only as
+/// each slot initializes. Posting views keep this owner after cache eviction.
+#[derive(Debug)]
+pub(super) struct PackedFirstDocsStates {
+    states: Vec<OnceLock<Box<[u32]>>>,
+    reservation: std::sync::Mutex<lance_core::memory::NativeReservation>,
+    backed: std::sync::atomic::AtomicUsize,
+}
+
+impl PackedFirstDocsStates {
+    pub(super) fn new(
+        slots: usize,
+        blocks: usize,
+        memory: &lance_core::memory::NativeMemory,
+    ) -> Result<Self> {
+        let slab_bytes = slots * std::mem::size_of::<OnceLock<Box<[u32]>>>();
+        let mut reservation = lance_core::memory::try_reserve(
+            memory,
+            lance_core::memory::NativeMemoryKind::Index,
+            slab_bytes + blocks * std::mem::size_of::<u32>(),
+        )?;
+        if let Some(reservation) = &mut reservation {
+            reservation.set_backed_bytes(0);
+        }
+        let states = (0..slots).map(|_| OnceLock::new()).collect();
+        if let Some(reservation) = &mut reservation {
+            reservation.set_backed_bytes(slab_bytes);
+        }
+        Ok(Self {
+            states,
+            reservation: std::sync::Mutex::new(reservation),
+            backed: std::sync::atomic::AtomicUsize::new(slab_bytes),
+        })
+    }
+
+    fn get_or_init(&self, slot: usize, initialize: impl FnOnce() -> Box<[u32]>) -> &[u32] {
+        self.states[slot].get_or_init(|| {
+            let values = initialize();
+            let mut reservation = self.reservation.lock().unwrap();
+            let backed = self
+                .backed
+                .fetch_add(std::mem::size_of_val(values.as_ref()), Ordering::Relaxed)
+                + std::mem::size_of_val(values.as_ref());
+            if let Some(reservation) = reservation.as_mut() {
+                reservation.set_backed_bytes(backed);
+            }
+            values
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) enum FirstDocsState {
     Standalone(Arc<OnceLock<Box<[u32]>>>),
     Packed {
-        states: Arc<[OnceLock<Box<[u32]>>]>,
+        states: Arc<PackedFirstDocsStates>,
         slot: usize,
     },
 }
@@ -323,12 +375,15 @@ impl FirstDocsState {
     fn state(&self) -> &OnceLock<Box<[u32]>> {
         match self {
             Self::Standalone(state) => state,
-            Self::Packed { states, slot } => &states[*slot],
+            Self::Packed { states, slot } => &states.states[*slot],
         }
     }
 
     fn get_or_init(&self, initialize: impl FnOnce() -> Box<[u32]>) -> &[u32] {
-        self.state().get_or_init(initialize)
+        match self {
+            Self::Standalone(state) => state.get_or_init(initialize),
+            Self::Packed { states, slot } => states.get_or_init(*slot, initialize),
+        }
     }
 
     fn capacity_bytes(
@@ -432,11 +487,11 @@ impl CompressedPostingList {
         posting_tail_codec: PostingTailCodec,
         block_size: usize,
         impacts: Option<ImpactSkipData>,
-        first_docs_states: Arc<[OnceLock<Box<[u32]>>]>,
+        first_docs_states: Arc<PackedFirstDocsStates>,
         slot: usize,
     ) -> Self {
         debug_assert!(block_size.is_power_of_two());
-        debug_assert!(slot < first_docs_states.len());
+        debug_assert!(slot < first_docs_states.states.len());
         Self {
             max_score,
             length,

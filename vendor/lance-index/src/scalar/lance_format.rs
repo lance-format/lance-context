@@ -282,7 +282,7 @@ impl IndexReader for V1IndexReader {
 }
 
 /// Newtype wrapper to allow implementing IndexReader for CurrentFileReader (a foreign type)
-struct CurrentIndexReader(CurrentFileReader);
+struct CurrentIndexReader(CurrentFileReader, lance_core::memory::NativeMemory);
 
 impl CurrentIndexReader {
     /// Row range covered by batch `offset`, clamped to the end of the file.
@@ -296,6 +296,10 @@ impl CurrentIndexReader {
 
 #[async_trait]
 impl IndexReader for CurrentIndexReader {
+    fn native_memory(&self) -> lance_core::memory::NativeMemory {
+        self.1.clone()
+    }
+
     async fn read_record_batch(&self, offset: u64, batch_size: u64) -> Result<RecordBatch> {
         let (start, end) = self.batch_bounds(offset, batch_size);
         self.read_range(start..end, None).await
@@ -639,7 +643,10 @@ impl IndexStore for LanceIndexStore {
                 options,
             )
             .await?;
-            return Ok(Arc::new(CurrentIndexReader(reader)));
+            return Ok(Arc::new(CurrentIndexReader(
+                reader,
+                self.native_memory.clone(),
+            )));
         }
 
         match versions::open_self_described_reader(
@@ -665,7 +672,10 @@ impl IndexStore for LanceIndexStore {
                 self.metadata_cache
                     .insert_with_key(&metadata_key, reader.metadata().clone())
                     .await;
-                Ok(Arc::new(CurrentIndexReader(reader)))
+                Ok(Arc::new(CurrentIndexReader(
+                    reader,
+                    self.native_memory.clone(),
+                )))
             }
         }
     }

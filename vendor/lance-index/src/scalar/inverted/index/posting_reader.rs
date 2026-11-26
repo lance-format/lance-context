@@ -25,6 +25,13 @@ pub(super) enum PostingReader {
 }
 
 impl PostingReader {
+    pub(super) fn native_memory(&self) -> lance_core::memory::NativeMemory {
+        match self {
+            Self::Opened { reader, .. } => reader.native_memory(),
+            Self::Deferred { store, .. } => store.native_memory(),
+        }
+    }
+
     fn with_store(&self, store: Arc<dyn IndexStore>, path: String) -> Self {
         let metadata = match self {
             Self::Opened { reader, metadata } => metadata
@@ -818,10 +825,11 @@ impl PostingListReader {
             .await?
             .read_range(start as usize..end as usize, Some(&columns))
             .await?;
-        PostingListGroup::new_packed_with_block_size(
-            batch.shrink_to_fit()?,
+        PostingListGroup::new_packed_with_native_memory(
+            super::allocation::compact_posting_batch(&batch, &self.reader.native_memory())?,
             self.posting_tail_codec,
             self.block_size,
+            &self.reader.native_memory(),
         )
     }
 

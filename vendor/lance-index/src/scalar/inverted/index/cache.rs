@@ -356,7 +356,7 @@ pub(in super::super) struct PackedPostingListGroup {
     // The impact column position, read only when a slot first decodes its
     // skip data, and those per-slot states.
     impacts: Option<(usize, Arc<[OnceLock<ImpactSkipData>]>)>,
-    pub(super) first_docs_states: Arc<[OnceLock<Box<[u32]>>]>,
+    pub(super) first_docs_states: Arc<super::posting_list::PackedFirstDocsStates>,
     pub(super) first_docs_state_capacity_bytes: usize,
     pub(super) impact_state_capacity_bytes: usize,
 }
@@ -436,6 +436,15 @@ impl PostingListGroup {
         posting_tail_codec: PostingTailCodec,
         block_size: usize,
     ) -> Result<Self> {
+        Self::new_packed_with_native_memory(batch, posting_tail_codec, block_size, &None)
+    }
+
+    pub(super) fn new_packed_with_native_memory(
+        batch: RecordBatch,
+        posting_tail_codec: PostingTailCodec,
+        block_size: usize,
+        memory: &lance_core::memory::NativeMemory,
+    ) -> Result<Self> {
         validate_block_size(block_size)?;
         if let Some(encoded_block_size) = batch.schema_ref().metadata().get(POSTING_BLOCK_SIZE_KEY)
         {
@@ -471,15 +480,16 @@ impl PostingListGroup {
         let total_posting_blocks = (0..batch.num_rows())
             .map(|slot| postings.value_length(slot) as usize)
             .sum::<usize>();
-        let first_docs_states: Arc<[OnceLock<Box<[u32]>>]> = (0..batch.num_rows())
-            .map(|_| OnceLock::new())
-            .collect::<Vec<_>>()
-            .into();
+        let first_docs_states = Arc::new(super::posting_list::PackedFirstDocsStates::new(
+            batch.num_rows(),
+            total_posting_blocks,
+            memory,
+        )?);
         // Reserve the compact per-slot state slab and the block-head arrays it
         // can lazily retain, so warming these derived values cannot grow the
         // cache beyond its admission charge.
-        let first_docs_state_capacity_bytes = first_docs_states
-            .len()
+        let first_docs_state_capacity_bytes = batch
+            .num_rows()
             .saturating_mul(std::mem::size_of::<OnceLock<Box<[u32]>>>())
             .saturating_add(total_posting_blocks.saturating_mul(std::mem::size_of::<u32>()));
         let (impacts, impact_state_capacity_bytes) = if let Some(impact_column) =

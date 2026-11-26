@@ -176,6 +176,11 @@ pub trait IndexWriter: Send {
 /// Trait for reading an index (or parts of an index) from storage
 #[async_trait]
 pub trait IndexReader: Send + Sync {
+    /// Allocation owner used for values derived from this reader.
+    fn native_memory(&self) -> lance_core::memory::NativeMemory {
+        None
+    }
+
     /// Read the n-th record batch from the file
     async fn read_record_batch(&self, n: u64, batch_size: u64) -> Result<RecordBatch>;
     /// Read several record batches, returning one batch per entry of

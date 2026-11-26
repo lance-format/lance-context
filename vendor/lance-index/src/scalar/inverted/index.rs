@@ -99,6 +99,7 @@ use crate::{
 use crate::{prefilter::PreFilter, scalar::inverted::iter::take_fst_keys};
 use std::str::FromStr;
 
+mod allocation;
 mod cache;
 mod doc_set;
 mod flat_search;

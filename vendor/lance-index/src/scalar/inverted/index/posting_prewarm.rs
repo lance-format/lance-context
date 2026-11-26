@@ -412,6 +412,7 @@ impl PostingListReader {
             }
         };
 
+        let native_memory = self.reader.native_memory();
         let chunk = spawn_blocking(move || {
             let chunk_batch = if position_codec.is_some() {
                 // Position prewarm previously cached self-contained posting lists.
@@ -431,7 +432,7 @@ impl PostingListReader {
                 let end_usize = end as usize;
                 let local_start = start_usize - tok_start;
                 let group_len = end_usize - start_usize;
-                let group_batch = chunk_batch.slice(local_start, group_len).shrink_to_fit()?;
+                let group_batch = super::allocation::compact_posting_batch(&chunk_batch.slice(local_start, group_len), &native_memory)?;
                 let group_batch = if let Some(codec) = position_codec {
                     let payload = group_batch.column_by_name(COMPRESSED_POSITION_COL)
                         .and_then(|column| column.as_binary_opt::<i64>())
@@ -457,10 +458,11 @@ impl PostingListReader {
                     let posting_columns = (0..group_batch.num_columns()).filter(|column| !position_columns.contains(column)).collect::<Vec<_>>();
                     group_batch.project(&posting_columns)?
                 } else { group_batch };
-                let group = PostingListGroup::new_packed_with_block_size(
+                let group = PostingListGroup::new_packed_with_native_memory(
                     group_batch,
                     posting_tail_codec,
                     block_size,
+                    &native_memory,
                 )?;
                 if let Some(num_docs) = num_docs {
                     for token_id in start..end {
