@@ -123,7 +123,11 @@ fn is_preparation_conflict(error: &str) -> bool {
             }
             message
         });
-    let message = match message.split_once(", crates/lance-context-core/src/store_base.rs:") {
+    let message = match message
+        .split_once(", crates/lance-context-core/src/store_base.rs:")
+        .or_else(|| {
+            message.split_once(", crates/lance-context-core/src/store_base/index_maintenance.rs:")
+        }) {
         Some((message, location)) => {
             let Some((line, column)) = location.split_once(':') else {
                 return false;
@@ -586,6 +590,22 @@ mod tests {
     }
 
     const STALE_INDEX: &str = "Invalid user input: index metadata changed; reprepare, crates/lance-context-core/src/store_base.rs:1529:24";
+
+    #[test]
+    fn relocated_index_conflicts_retry_without_error_codes() {
+        for message in [
+            "index dataset or schema changed; reprepare",
+            "index source fragment changed; reprepare",
+            "index metadata changed; reprepare",
+        ] {
+            let error = format!(
+                "Invalid user input: {message}, crates/lance-context-core/src/store_base/index_maintenance.rs:60:24"
+            );
+            let failure = ShardFailure::advance("table", "master:index_id", None, &error, 1000);
+            assert_eq!(failure.class, FailureClass::Retryable, "{error}");
+            assert_eq!(failure.next_retry_ms, 3000, "{error}");
+        }
+    }
 
     #[test]
     fn optimistic_preparation_conflicts_keep_the_bounded_retry_budget() {
