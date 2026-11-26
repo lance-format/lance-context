@@ -325,14 +325,25 @@ impl Owner {
                     if query.bucket != self.service.bucket() {
                         return Err(Failure::bad("foreign_selected_body_shard"));
                     }
-                    let selected = self
-                        .service
-                        .selected_body(options.body_total_timeout)
-                        .await
-                        .map_err(|_| {
-                            Failure::unavailable("selected_body_unavailable", "not_submitted")
-                        })?;
-                    Json(selected).into_response()
+                    if self.service.is_single_body() {
+                        let selected = self
+                            .service
+                            .selected_full_body(options.body_total_timeout)
+                            .await
+                            .map_err(|_| {
+                                Failure::unavailable("selected_body_unavailable", "not_submitted")
+                            })?;
+                        Json(selected).into_response()
+                    } else {
+                        let selected = self
+                            .service
+                            .selected_body(options.body_total_timeout)
+                            .await
+                            .map_err(|_| {
+                                Failure::unavailable("selected_body_unavailable", "not_submitted")
+                            })?;
+                        Json(selected).into_response()
+                    }
                 }
                 Operation::Close => {
                     let close: CloseRequest = serde_json::from_slice(&bytes)

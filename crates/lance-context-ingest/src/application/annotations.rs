@@ -44,6 +44,20 @@ pub async fn provision(config: &Config) -> Result<()> {
         Arc::new(lance::session::Session::default()),
     )
     .await?;
+    if let Some(spec) = a.turns.as_ref().filter(|_| a.body.is_none()) {
+        return bootstrap::provision_body_shard(
+            config.client()?,
+            Arc::new(config.layout.clone()),
+            table.binding.clone(),
+            storage,
+            table.bootstrap.clone(),
+            &a.staging,
+            a.shard.context("full body shard missing")?,
+            spec,
+        )
+        .await
+        .map(|_| ());
+    }
     if let Some(body) = &a.body {
         let body = Storage::resolve(
             body.uri.clone(),
@@ -135,6 +149,18 @@ async fn connect(config: &Config) -> Result<Ingress> {
     let budget = MergeMemoryBudget::new(config.ingress_memory_bytes);
     if let Some(shard) = options.shard {
         if let Some(spec) = &options.turns {
+            if options.body.is_none() {
+                return annotations::single_body::connect_ingress(
+                    client,
+                    layout,
+                    binding,
+                    &options.staging,
+                    budget,
+                    shard,
+                    spec,
+                )
+                .await;
+            }
             return annotations::mixed::connect_turn_ingress(
                 client,
                 layout,
@@ -193,7 +219,18 @@ async fn connect_routes(config: &Config) -> Result<Vec<(Ingress, String)>> {
         } else {
             (&client, &layout)
         };
-        let ingress = if let Some(spec) = &a.turns {
+        let ingress = if let Some(spec) = a.turns.as_ref().filter(|_| a.body.is_none()) {
+            annotations::single_body::connect_ingress(
+                client.clone(),
+                layout.clone(),
+                route.binding.clone(),
+                &a.staging,
+                budget.clone(),
+                route.shard,
+                spec,
+            )
+            .await?
+        } else if let Some(spec) = &a.turns {
             annotations::mixed::connect_turn_ingress(
                 client.clone(),
                 layout.clone(),
@@ -346,6 +383,12 @@ pub async fn serve_owner(
                     storage, body, configuration, acquisition,
                 ).await?
             }
+        } else if let Some(spec) = &a.turns {
+            runtime::Runtime::connect_body_shard(
+                ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),
+                storage, configuration, acquisition,
+                a.shard.context("full body shard missing")?, spec,
+            ).await?
         } else {
             runtime::Runtime::connect(
                 ingress.client.clone(), ingress.layout.clone(), table.binding.clone(),

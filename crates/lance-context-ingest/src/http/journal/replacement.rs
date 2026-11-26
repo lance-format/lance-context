@@ -31,13 +31,55 @@ pub struct ProducerControlClient {
 impl ProducerControlClient {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mut base: reqwest::Url,
+        base: reqwest::Url,
         client: reqwest::Client,
         timeout: Duration,
         layout: &Layout,
         binding: &TableBinding,
         spec: &TurnIngestionSpec,
         limits: &Limits,
+        shard: Shard,
+    ) -> Result<Self> {
+        Self::with_contract(
+            base,
+            client,
+            timeout,
+            layout,
+            binding,
+            shard.turn_contract(binding, spec, limits)?,
+            shard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_full_body(
+        base: reqwest::Url,
+        client: reqwest::Client,
+        timeout: Duration,
+        layout: &Layout,
+        binding: &TableBinding,
+        spec: &TurnIngestionSpec,
+        limits: &Limits,
+        shard: Shard,
+    ) -> Result<Self> {
+        Self::with_contract(
+            base,
+            client,
+            timeout,
+            layout,
+            binding,
+            crate::annotations::single_body::contract(binding, spec, limits, shard)?,
+            shard,
+        )
+    }
+
+    fn with_contract(
+        mut base: reqwest::Url,
+        client: reqwest::Client,
+        timeout: Duration,
+        layout: &Layout,
+        binding: &TableBinding,
+        contract: IngestContract,
         shard: Shard,
     ) -> Result<Self> {
         ensure!(
@@ -55,7 +97,7 @@ impl ProducerControlClient {
             table: binding.table,
             destination: binding.destination.clone(),
             incarnation: binding.incarnation,
-            contract: shard.turn_contract(binding, spec, limits)?,
+            contract,
         };
         let scope = receipt::scope_hash(&scope)?;
         base.path_segments_mut()
