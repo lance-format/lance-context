@@ -2,11 +2,23 @@ use super::*;
 use lance_context_wal::replication::runtime::client::payload_memory::{Pool, Reservation};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-#[derive(Default)]
 struct Counts {
     allow: AtomicBool,
     attempts: AtomicUsize,
     held: AtomicUsize,
+    limit: AtomicUsize,
+    peak: AtomicUsize,
+}
+impl Default for Counts {
+    fn default() -> Self {
+        Self {
+            allow: AtomicBool::new(false),
+            attempts: AtomicUsize::new(0),
+            held: AtomicUsize::new(0),
+            limit: AtomicUsize::new(usize::MAX),
+            peak: AtomicUsize::new(0),
+        }
+    }
 }
 struct Admission(Arc<Counts>);
 struct Charge(Arc<Counts>, usize);
@@ -16,9 +28,133 @@ impl Pool for Admission {
         if !self.0.allow.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        self.0.held.fetch_add(bytes, Ordering::SeqCst);
+        let Ok(held) = self
+            .0
+            .held
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+                held.checked_add(bytes)
+                    .filter(|n| *n <= self.0.limit.load(Ordering::SeqCst))
+            })
+        else {
+            return Ok(None);
+        };
+        self.0.peak.fetch_max(held + bytes, Ordering::SeqCst);
         Ok(Some(Box::new(Charge(self.0.clone(), bytes))))
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_payload_pressure_flushes_below_batch_target() -> Result<()> {
+    let input = bodies()?;
+    let spec = TurnIngestionSpec::new(
+        input[0].schema(),
+        vec!["session_id".into(), "id".into()],
+        "session_id",
+    )?;
+    let root = tempfile::tempdir()?;
+    let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let storage = fixture::storage(root.path(), "full-body.lance").await?;
+    crate::bootstrap::provision_body_shard(
+        c.client.clone(),
+        annotation_publication::one_shard(),
+        binding(),
+        storage.clone(),
+        Identity {
+            owner: Uuid::new_v4(),
+            acquisition: Uuid::new_v4(),
+            manifest: Uuid::new_v4(),
+        },
+        &fixture::limits(),
+        Shard { bucket: 0 },
+        &spec,
+    )
+    .await?;
+    let (service, runtime) = owner(&c, &storage, &spec).await?;
+    let mut backlog = Vec::new();
+    for (i, body) in input.iter().enumerate() {
+        let lane = producer(&service, i as u32 + 1).await?;
+        let payload = fixture::encoded(single_body::batch(
+            &spec,
+            &fixture::limits(),
+            Shard { bucket: 0 },
+            body,
+        )?)?;
+        let prepared = request(&service, &lane, 1, payload).await?;
+        // Quorum acceptance alone is not a successful applied mutation ACK.
+        // Queue durable source records without local payload sharing, as when
+        // recovering writes submitted by a different ingress.
+        let response = c
+            .client
+            .request_routed(Request::Append {
+                group: 10,
+                batch: prepared.batch.clone(),
+            })
+            .await?;
+        let Reply::Commit(Outcome::Committed(Applied::Accepted { index })) = response.reply else {
+            bail!("backlog append failed");
+        };
+        backlog.push((prepared, index));
+    }
+    drop(runtime);
+    drop(service);
+    let capacity = backlog.iter().map(|(p, _)| p.body().len()).max().unwrap();
+    assert!(capacity < backlog[0].0.body().len() + backlog[1].0.body().len());
+    let counts = Arc::new(Counts::default());
+    counts.allow.store(true, Ordering::SeqCst);
+    counts.limit.store(capacity, Ordering::SeqCst);
+    c.client
+        .install_payload_memory(Arc::new(Admission(counts.clone())))?;
+    let (service, mut runtime) =
+        owner_with_wait(&c, &storage, &spec, Duration::from_secs(60)).await?;
+    tokio::time::timeout(DEADLINE, async {
+        while service.apply_backpressure()
+            != Some(crate::annotations::ApplyBackpressure::ApplyMemory)
+        {
+            runtime.apply_once_for_test().await?;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    assert_eq!(service.observation().await.0.applied, backlog[0].1);
+    assert_eq!(service.source_observation().records, 1);
+    assert!(service.source_observation().bytes < 1 << 20);
+    // The publisher has not run, so its 60-second batching timer has not even
+    // started. Memory pressure must publish this single below-target record.
+    tokio::time::timeout(Duration::from_secs(5), runtime.publish_once_for_test()).await??;
+    assert_eq!(service.observation().await.0.materialized, backlog[0].1);
+    assert_eq!(counts.held.load(Ordering::SeqCst), 0);
+    drop(runtime);
+    drop(service);
+
+    // Rebuild the remaining suffix under the same bounded pool. Use the normal
+    // short tail timer for its final below-target publication.
+    let (service, runtime) = owner(&c, &storage, &spec).await?;
+    let (stop, task) = run_owner(runtime);
+    drained(&c, &service, backlog.last().unwrap().1).await?;
+    assert_eq!(counts.held.load(Ordering::SeqCst), 0);
+    assert!(counts.peak.load(Ordering::SeqCst) <= capacity);
+    for (prepared, index) in &backlog {
+        let result = service.submit(prepared, DEADLINE).await?;
+        assert_eq!(result.index, *index);
+        assert_eq!(result.result, MutationResult::Applied);
+    }
+    let key = spec.row_key(&input[0], 0, 4096)?;
+    assert_eq!(
+        service
+            .get_full_body(&key, DEADLINE)
+            .await?
+            .unwrap()
+            .batch(),
+        &input[0].slice(0, 1)
+    );
+    let selected = service.selected_full_body(DEADLINE).await?;
+    let durable =
+        annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
+    assert_eq!(durable.count_rows(None).await?, 6);
+    assert_eq!(service.retained_body_frames(), (0, 0));
+    stop.send(()).unwrap();
+    task.await??;
+    c.shutdown().await
 }
 impl Reservation for Charge {
     fn bytes(&self) -> usize {

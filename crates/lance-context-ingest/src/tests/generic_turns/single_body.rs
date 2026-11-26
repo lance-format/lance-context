@@ -13,7 +13,7 @@ mod payload_memory;
 mod process;
 mod upload_failure;
 
-async fn owner(
+pub(super) async fn owner(
     c: &network::Cluster,
     storage: &Storage,
     spec: &TurnIngestionSpec,
