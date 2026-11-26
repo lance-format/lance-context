@@ -321,7 +321,7 @@ impl MasterConfig {
             return Err(lance::Error::invalid_input("invalid managed store kind"));
         }
         let prefix = format!("{kind}:");
-        if self
+        let native_maintenance = self
             .merge_rollout
             .owned_targets
             .iter()
@@ -331,10 +331,10 @@ impl MasterConfig {
             .any(|target| target == "*" || target.starts_with(&prefix))
             || self.merge_rollout.fence_legacy
             || self.maintenance.fence_legacy_maintenance
-            || self.local_merge.master_local_merge_auto
-        {
+            || self.local_merge.master_local_merge_auto;
+        if native_maintenance && !self.append.has_managed_targets(self) {
             return Err(lance::Error::invalid_input(
-                "registered stores require worker-owned legacy maintenance",
+                "registered native maintenance requires local append targets; otherwise keep worker-owned legacy maintenance",
             ));
         }
         Ok(())
@@ -379,7 +379,7 @@ mod tests {
             let config = MasterConfig::parse_from(args);
             assert!(matches!(crate::state::MasterState::new(config).await,
                 Err(lance::Error::InvalidInput { source, .. })
-                if source.to_string() == "registered stores require worker-owned legacy maintenance"));
+                if source.to_string().contains("registered native maintenance requires local append targets")));
         }
     }
 
