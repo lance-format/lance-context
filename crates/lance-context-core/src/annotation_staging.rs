@@ -139,6 +139,8 @@ struct State {
     // Local to this staging instance. Verified frozen publications preserve
     // this lineage; maintenance starts a new one. It is not a durable epoch.
     immutable_publications: Arc<()>,
+    immutable_lookup_reused: u64,
+    immutable_lookup_invalidated: u64,
     views: views::Registry,
     applied: u64,
     materialized: u64,
@@ -182,6 +184,14 @@ pub struct InstalledBase {
 pub struct Observation {
     pub applied: u64,
     pub materialized: u64,
+    /// Completed registrations that consumed a lookup despite a changed base.
+    /// Excludes unchanged bases and backpressure; counts batches, not rows.
+    /// Process-local and reset when this staging instance is reconstructed.
+    pub immutable_lookup_reused: u64,
+    /// Registration attempts requiring a fresh lookup after a base change.
+    /// Includes plain captures, uncovered publications and foreign lineages.
+    /// Process-local; a rejected attempt does not advance the applied cut.
+    pub immutable_lookup_invalidated: u64,
     /// Locally installed base, captured with materialized under one state lock.
     /// May lag a committed/selected publication. Not a selection or GC proof.
     pub installed_base: InstalledBase,
@@ -289,6 +299,8 @@ impl AnnotationStaging {
             mutation: Mutex::new(()),
             state: RwLock::new(State {
                 immutable_publications: Arc::new(()),
+                immutable_lookup_reused: 0,
+                immutable_lookup_invalidated: 0,
                 base,
                 views,
                 applied: materialized,
@@ -687,6 +699,8 @@ impl AnnotationStaging {
         Observation {
             applied: state.applied,
             materialized: state.materialized,
+            immutable_lookup_reused: state.immutable_lookup_reused,
+            immutable_lookup_invalidated: state.immutable_lookup_invalidated,
             installed_base: InstalledBase {
                 source: self.scope.clone(),
                 version: state.base.version_id(),
