@@ -8,23 +8,6 @@ use lance_context_core::annotation_staging::BodySnapshot;
 use lance_file::writer::FileWriterOptions;
 use std::collections::BTreeMap;
 
-/// No detached commit or managed publication has been attempted for this write.
-/// Keep its frozen generation readable; a fenced restart can rebuild the cut.
-#[derive(Debug)]
-pub(crate) struct BodyWriteFailed(lance::Error);
-
-impl std::fmt::Display for BodyWriteFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "uncommitted body upload failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for BodyWriteFailed {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
-
 impl FrozenCheckpoint {
     /// The detached body snapshot is private until the managed narrow manifest
     /// selects its exact identity. Retain the original preparation across an
@@ -129,13 +112,7 @@ impl FrozenCheckpoint {
                                             .execute_uncommitted(batches),
                                     )
                                     .await
-                                    .map_err(|error| {
-                                        if matches!(error, lance::Error::IO { .. }) {
-                                            anyhow::Error::new(BodyWriteFailed(error))
-                                        } else {
-                                            error.into()
-                                        }
-                                    })?;
+                                    .map_err(runtime::publication_write_error)?;
                                 ensure!(
                                     matches!(transaction.operation, Operation::Append { .. }),
                                     "body preparation is not append-only"

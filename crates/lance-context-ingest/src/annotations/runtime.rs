@@ -11,6 +11,37 @@ mod body_compaction;
 mod compaction;
 pub mod reclamation;
 
+/// Native body preparation failed before managed publication. An owning task
+/// must close its admission and recover through a newly fenced runtime using
+/// the retained WAL and publication plan. This does not retry the client intent
+/// or assert that the underlying storage failure is transient.
+#[derive(Debug)]
+pub struct PublicationWriteFailed(lance::Error);
+
+impl std::fmt::Display for PublicationWriteFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "uncommitted body upload failed; fenced recovery required: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for PublicationWriteFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(super) fn publication_write_error(error: lance::Error) -> anyhow::Error {
+    if matches!(error, lance::Error::IO { .. }) {
+        anyhow::Error::new(PublicationWriteFailed(error))
+    } else {
+        error.into()
+    }
+}
+
 pub struct Configuration {
     pub limits: Limits,
     pub upload_budget: Arc<MergeMemoryBudget>,
@@ -384,9 +415,10 @@ impl Runtime {
     /// A structured uncertain Pin or Confirm holds its frozen batch while
     /// resolving that exact selected operation; bounded apply and point reads
     /// stay live under their existing budgets.
-    /// An I/O failure writing an uncommitted body pauses publication while the
-    /// bounded applier and owned point reads remain live. It does not retry the
-    /// upload. A fenced restart reconciles the retained plan and replays its cut.
+    /// An I/O failure writing an uncommitted body exits the runtime with
+    /// `PublicationWriteFailed`. The owning task closes its
+    /// admission and performs fenced recovery from the retained plan and WAL.
+    /// The runtime does not retry the upload or replay a client intent.
     /// Other failures still require restart to reconcile preparation/selection.
     /// An in-flight sealed DELETE retains one bounded page while publication
     /// continues. Failed outcomes pause new publication until that sealed page
@@ -397,11 +429,16 @@ impl Runtime {
     /// One admitted native annotation index writer can outlive cancellation, retaining
     /// its workspace until completion. It cannot publish a manifest itself.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
+        use futures::FutureExt;
+        // These are task-lifetime allocations. Erase the two large loop types
+        // so embedding hosts do not inherit their recursive future layouts.
+        let driver = self.driver.run(std::future::pending()).boxed();
+        let publisher = self.publisher.run().boxed();
         tokio::pin!(shutdown);
         tokio::select! {
             _ = &mut shutdown => Ok(()),
-            result = self.driver.run(std::future::pending()) => result,
-            result = self.publisher.run() => result,
+            result = driver => result.context("annotation apply driver stopped"),
+            result = publisher => result.context("annotation publisher stopped"),
         }
     }
 }
@@ -450,14 +487,6 @@ impl Publisher {
                     // the next iteration captures fresh catalog authority.
                     tokio::time::sleep(Duration::from_millis(5)).await;
                     continue;
-                }
-                if error.is::<mixed::BodyWriteFailed>() {
-                    // This upload never reached a native commit. Retain the
-                    // frozen generation and WAL instead of dropping the whole
-                    // owner. Existing apply/source limits bound later writes.
-                    // Do not create another file or resubmit a business request.
-                    eprintln!("annotation publication paused until fenced restart: {error:#}");
-                    return std::future::pending().await;
                 }
                 return Err(error);
             }
