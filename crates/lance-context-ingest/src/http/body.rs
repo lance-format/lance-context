@@ -45,10 +45,36 @@ pub(super) async fn read_exact_accounted(
     length: usize,
     options: &Options,
 ) -> HttpResult<(Bytes, Option<usize>)> {
+    read_exact_admitted(request, length, options, None).await
+}
+
+pub(super) async fn read_exact_admitted(
+    request: Request,
+    length: usize,
+    options: &Options,
+    mut reservation: Option<
+        Box<dyn lance_context_wal::replication::runtime::client::payload_memory::Reservation>,
+    >,
+) -> HttpResult<(Bytes, Option<usize>)> {
     let deadline = Instant::now() + options.body_total_timeout;
     let mut body = request.into_body();
     let mut first: Option<Bytes> = None;
-    let mut combined: Option<BytesMut> = None;
+    // Hyper frames may retain an unknown-size connection allocation. With a
+    // shared pool, receive into one owned allocation whose capacity we know.
+    // Fragmented uploads already require this single coalescing copy.
+    let mut combined = if let Some(reservation) = &mut reservation {
+        if reservation.bytes() < length {
+            return Err(Failure::bad("undersized_upload_admission"));
+        }
+        let buffer = BytesMut::with_capacity(length);
+        if buffer.capacity() > reservation.bytes() {
+            return Err(Failure::bad("upload_allocation_exceeds_admission"));
+        }
+        reservation.set_backed_bytes(buffer.capacity());
+        Some(buffer)
+    } else {
+        None
+    };
     let mut received = 0usize;
     loop {
         let frame = timeout_at(
@@ -85,12 +111,15 @@ pub(super) async fn read_exact_accounted(
     if received != length {
         return Err(Failure::bad("body_length_mismatch"));
     }
-    // A single HTTP frame retains its existing buffer. Fragmented bodies are
-    // coalesced once; subsequent validation and WAL transport share these Bytes.
+    // Without a shared pool, a single frame keeps its existing buffer. Owned
+    // reception and fragmented bodies coalesce once; validation, WAL transport
+    // and local application then share the same retained Bytes.
     Ok(match combined {
         Some(buffer) => {
             let capacity = buffer.capacity();
-            (buffer.freeze(), Some(capacity))
+            let body = crate::payload_memory::retain(buffer.freeze(), capacity, reservation)
+                .map_err(|_| Failure::bad("upload_allocation_exceeds_admission"))?;
+            (body, Some(capacity))
         }
         // HTTP frames can be slices of a larger connection buffer. Keep the
         // zero-copy path, but do not claim their length is the allocation size.
@@ -101,6 +130,80 @@ pub(super) async fn read_exact_accounted(
 #[cfg(all(test, feature = "materializer"))]
 mod tests {
     use super::*;
+    use lance_context_wal::replication::runtime::client::payload_memory::Reservation;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Charge(Arc<AtomicUsize>, usize);
+    impl Reservation for Charge {
+        fn bytes(&self) -> usize {
+            self.1
+        }
+        fn set_backed_bytes(&mut self, bytes: usize) {
+            assert!(bytes <= self.1);
+        }
+    }
+    impl Drop for Charge {
+        fn drop(&mut self) {
+            self.0.fetch_sub(self.1, Ordering::SeqCst);
+        }
+    }
+    fn charge(held: &Arc<AtomicUsize>, bytes: usize) -> Option<Box<dyn Reservation>> {
+        held.fetch_add(bytes, Ordering::SeqCst);
+        Some(Box::new(Charge(held.clone(), bytes)))
+    }
+
+    #[tokio::test]
+    async fn admitted_http_backing_follows_slices_and_releases_cancelled_reception() {
+        let held = Arc::new(AtomicUsize::new(0));
+        let parent = Bytes::from(vec![7; 8192]);
+        let (body, capacity) = read_exact_admitted(
+            Request::new(axum::body::Body::from(parent.slice(4096..5120))),
+            1024,
+            &Options::default(),
+            charge(&held, 1024),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("valid admitted frame"));
+        assert_eq!(capacity, Some(1024));
+        assert_eq!(held.load(Ordering::SeqCst), 1024);
+        assert_ne!(body.as_ptr(), parent.slice(4096..).as_ptr());
+        let slice = body.slice(2..10);
+        drop(body);
+        drop(parent);
+        assert_eq!(held.load(Ordering::SeqCst), 1024);
+        assert_eq!(slice.as_ref(), &[7; 8]);
+        drop(slice);
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+
+        let (send, mut receive) = tokio::sync::mpsc::channel::<Bytes>(1);
+        send.send(Bytes::from_static(&[7; 64])).await.unwrap();
+        let stream = async_stream::stream! {
+            while let Some(bytes) = receive.recv().await {
+                yield Ok::<_, std::io::Error>(bytes);
+            }
+        };
+        let options = Options::default();
+        let pending = read_exact_admitted(
+            Request::new(axum::body::Body::from_stream(stream)),
+            1024,
+            &options,
+            charge(&held, 1024),
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(20), pending)
+            .await
+            .is_err());
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        drop(send);
+        let truncated = read_exact_admitted(
+            Request::new(axum::body::Body::from(Bytes::from_static(&[7; 64]))),
+            1024,
+            &Options::default(),
+            charge(&held, 1024),
+        )
+        .await;
+        assert!(truncated.is_err());
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn receive_keeps_shared_frames_unknown_and_counts_coalesced_allocations() {
