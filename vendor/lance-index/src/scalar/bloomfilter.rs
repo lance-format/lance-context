@@ -44,6 +44,7 @@ use lance_core::Error;
 use lance_core::Result;
 use lance_core::cache::LanceCache;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::memory::{NativeMemory, NativeMemoryKind, NativeReservation, try_reserve};
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -67,15 +68,15 @@ struct BloomFilterStatistics {
     // Whether this zone contains any null values
     has_null: bool,
     // The actual bloom filter (SBBF) for efficient querying
-    bloom_filter: Sbbf,
+    bloom_filter: Arc<Sbbf>,
+    _native_reservation: Arc<NativeReservation>,
 }
 
 impl DeepSizeOf for BloomFilterStatistics {
     fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
-        // Estimate the size of the bloom filter
-        // We could try to get the actual size from the Sbbf if it has a method for that,
-        // but for now we'll estimate based on the number of bytes it serializes to
-        self.bloom_filter.to_bytes().len()
+        // The serialized filter length equals its fixed-width block backing.
+        // Inspect the size without allocating a temporary serialized copy.
+        self.bloom_filter.size_bytes()
     }
 }
 
@@ -87,7 +88,8 @@ impl AsRef<ZoneBound> for BloomFilterStatistics {
 
 #[derive(Debug, Clone)]
 pub struct BloomFilterIndex {
-    zones: Vec<BloomFilterStatistics>,
+    zones: Arc<Vec<BloomFilterStatistics>>,
+    _zones_reservation: Arc<NativeReservation>,
     // Number of items in the filter
     number_of_items: u64,
     // Probability of false positives, fraction between 0 and 1
@@ -165,6 +167,12 @@ impl BloomFilterIndex {
         let read_batch_size =
             Self::read_batch_size(number_of_items, probability, max_array_length)?;
 
+        let native_memory = store.native_memory();
+        let zones_reservation = try_reserve(
+            &native_memory,
+            NativeMemoryKind::Index,
+            index_file.num_rows() * std::mem::size_of::<BloomFilterStatistics>(),
+        )?;
         let mut zones = Vec::with_capacity(index_file.num_rows());
         for start in (0..index_file.num_rows()).step_by(read_batch_size) {
             let end = (start + read_batch_size).min(index_file.num_rows());
@@ -172,12 +180,23 @@ impl BloomFilterIndex {
                 .read_range_stream(start..end, None, 4096, 2)
                 .await?;
             while let Some(batch) = bloom_data.try_next().await? {
-                zones.extend(Self::try_from_serialized(batch, max_array_length)?);
+                // The batch staging vector coexists with the final zone slab.
+                let _staging = try_reserve(
+                    &native_memory,
+                    NativeMemoryKind::Index,
+                    batch.num_rows() * std::mem::size_of::<BloomFilterStatistics>(),
+                )?;
+                zones.extend(Self::try_from_serialized(
+                    batch,
+                    max_array_length,
+                    &native_memory,
+                )?);
             }
         }
 
         Ok(Arc::new(Self {
-            zones,
+            zones: Arc::new(zones),
+            _zones_reservation: Arc::new(zones_reservation),
             number_of_items,
             probability,
             null_rows,
@@ -211,6 +230,7 @@ impl BloomFilterIndex {
     fn try_from_serialized(
         data: RecordBatch,
         max_array_length: usize,
+        native_memory: &NativeMemory,
     ) -> Result<Vec<BloomFilterStatistics>> {
         if data.num_rows() == 0 {
             return Ok(Vec::new());
@@ -280,12 +300,16 @@ impl BloomFilterIndex {
 
         for i in 0..num_blocks {
             let bloom_filter_bytes = if bloom_filter_data_col.is_valid(i) {
-                bloom_filter_data_col.value(i).to_vec()
+                bloom_filter_data_col.value(i)
             } else {
-                Vec::new()
+                &[]
             };
-
-            let bloom_filter = Sbbf::new(&bloom_filter_bytes).map_err(|e| {
+            let reservation = try_reserve(
+                native_memory,
+                NativeMemoryKind::Index,
+                bloom_filter_bytes.len(),
+            )?;
+            let bloom_filter = Sbbf::new(bloom_filter_bytes).map_err(|e| {
                 Error::invalid_input(format!("Failed to deserialize bloom filter: {:?}", e))
             })?;
 
@@ -296,7 +320,8 @@ impl BloomFilterIndex {
                     length: zone_length_col.value(i) as usize,
                 },
                 has_null: has_null_col.value(i),
-                bloom_filter,
+                bloom_filter: Arc::new(bloom_filter),
+                _native_reservation: Arc::new(reservation),
             });
         }
 
@@ -489,7 +514,7 @@ impl Index for BloomFilterIndex {
         let mut frag_ids = RoaringBitmap::new();
 
         // Loop through zones and add unique fragment IDs to the bitmap
-        for block in &self.zones {
+        for block in self.zones.iter() {
             frag_ids.insert(block.bound.fragment_id as u32);
         }
 
@@ -653,6 +678,7 @@ fn remap_zone(
                 },
                 has_null: zone.has_null,
                 bloom_filter: zone.bloom_filter.clone(),
+                _native_reservation: zone._native_reservation.clone(),
             });
             run_start = Some(row_id);
         }
@@ -667,6 +693,7 @@ fn remap_zone(
             },
             has_null: zone.has_null,
             bloom_filter: zone.bloom_filter.clone(),
+            _native_reservation: zone._native_reservation.clone(),
         });
     }
     zones
@@ -1363,7 +1390,8 @@ impl ZoneProcessor for BloomFilterProcessor {
         Ok(BloomFilterStatistics {
             bound,
             has_null,
-            bloom_filter: bloom_filter.clone(),
+            bloom_filter: Arc::new(bloom_filter.clone()),
+            _native_reservation: Arc::new(None),
         })
     }
 
@@ -2686,7 +2714,8 @@ mod tests {
 
         // One filter fits, two together do not.
         let max_array_length = filter_bytes.len();
-        let error = BloomFilterIndex::try_from_serialized(batch, max_array_length).unwrap_err();
+        let error =
+            BloomFilterIndex::try_from_serialized(batch, max_array_length, &None).unwrap_err();
         assert!(
             matches!(error, Error::InvalidInput { .. }),
             "unexpected error variant: {error:?}"

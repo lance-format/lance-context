@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::sync::LazyLock;
 
+use arrow_array::cast::AsArray;
 use arrow_array::{
-    ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
+    Array, ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
@@ -47,6 +48,7 @@ use async_trait::async_trait;
 use lance_core::Error;
 use lance_core::Result;
 use lance_core::deepsize::DeepSizeOf;
+use lance_core::memory::{NativeMemoryKind, NativeReservation, try_reserve};
 use roaring::RoaringBitmap;
 
 use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
@@ -110,6 +112,7 @@ impl AsRef<ZoneBound> for ZoneMapStatistics {
 /// 3           | 20  | 23  | 4
 pub struct ZoneMapIndex {
     zones: Vec<ZoneMapStatistics>,
+    _native_reservation: NativeReservation,
     data_type: DataType,
     // The maximum rows per zone provided by user
     rows_per_zone: u64,
@@ -639,6 +642,7 @@ impl ZoneMapIndex {
         if data.num_rows() == 0 {
             return Ok(Self {
                 zones: Vec::new(),
+                _native_reservation: None,
                 data_type,
                 rows_per_zone,
                 use_seeds,
@@ -651,6 +655,15 @@ impl ZoneMapIndex {
         }
 
         let num_zones = data.num_rows();
+        // ScalarValue copies string/binary bounds out of the Arrow arrays.
+        // Admit those copies and the zone slab before either allocation.
+        let native_reservation = try_reserve(
+            &store.native_memory(),
+            NativeMemoryKind::Index,
+            num_zones * std::mem::size_of::<ZoneMapStatistics>()
+                + scalar_bound_bytes(min_col.as_ref())
+                + scalar_bound_bytes(max_col.as_ref()),
+        )?;
         let mut zones = Vec::with_capacity(num_zones);
 
         for i in 0..num_zones {
@@ -682,6 +695,7 @@ impl ZoneMapIndex {
 
         Ok(Self {
             zones,
+            _native_reservation: native_reservation,
             data_type,
             rows_per_zone,
             use_seeds,
@@ -691,6 +705,46 @@ impl ZoneMapIndex {
             index_cache: WeakLanceCache::from(index_cache),
             null_rows,
         })
+    }
+}
+
+// Heap copies made by ScalarValue::try_from_array for flat byte bounds.
+// Nested bounds use null scalars; dictionary wrappers remain separately unaccounted.
+fn scalar_bound_bytes(array: &dyn Array) -> usize {
+    match array.data_type() {
+        DataType::Utf8 => array
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::len)
+            .sum(),
+        DataType::LargeUtf8 => array
+            .as_string::<i64>()
+            .iter()
+            .flatten()
+            .map(str::len)
+            .sum(),
+        DataType::Utf8View => array.as_string_view().iter().flatten().map(str::len).sum(),
+        DataType::Binary => array
+            .as_binary::<i32>()
+            .iter()
+            .flatten()
+            .map(<[u8]>::len)
+            .sum(),
+        DataType::LargeBinary => array
+            .as_binary::<i64>()
+            .iter()
+            .flatten()
+            .map(<[u8]>::len)
+            .sum(),
+        DataType::BinaryView => array
+            .as_binary_view()
+            .iter()
+            .flatten()
+            .map(<[u8]>::len)
+            .sum(),
+        DataType::FixedSizeBinary(width) => (array.len() - array.null_count()) * *width as usize,
+        _ => 0,
     }
 }
 
@@ -3788,6 +3842,7 @@ mod tests {
 
         let index = ZoneMapIndex {
             zones,
+            _native_reservation: None,
             data_type: DataType::Utf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
@@ -3863,6 +3918,7 @@ mod tests {
 
         let index = ZoneMapIndex {
             zones,
+            _native_reservation: None,
             data_type: DataType::Utf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
@@ -3933,6 +3989,7 @@ mod tests {
 
         let index = ZoneMapIndex {
             zones,
+            _native_reservation: None,
             data_type: DataType::LargeUtf8,
             rows_per_zone: ROWS_PER_ZONE_DEFAULT,
             use_seeds: false,
