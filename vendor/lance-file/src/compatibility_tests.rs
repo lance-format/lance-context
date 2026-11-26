@@ -451,6 +451,115 @@ async fn v2_0_embedded_writer_and_reader_are_wire_compatible() {
 }
 
 #[tokio::test]
+async fn v2_2_strategy_wrapper_preserves_compressed_nested_wire_and_roundtrip() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use lance_encoding::compression_config::{CompressionFieldParams, CompressionParams};
+    use lance_encoding::encoder::{
+        ColumnIndexSequence, FieldEncoder, FieldEncodingContext, FieldEncodingStrategy,
+    };
+
+    #[derive(Debug)]
+    struct ObservedStrategy {
+        inner: Arc<dyn FieldEncodingStrategy>,
+        fields: Arc<AtomicUsize>,
+    }
+
+    impl FieldEncodingStrategy for ObservedStrategy {
+        fn create_field_encoder(
+            &self,
+            field: &lance_core::datatypes::Field,
+            column_index: &mut ColumnIndexSequence,
+            context: &FieldEncodingContext<'_>,
+        ) -> lance_core::Result<Box<dyn FieldEncoder>> {
+            self.fields.fetch_add(1, Ordering::Relaxed);
+            // Observe top-level fields once; retain the selected v2.2 strategy
+            // and inherited compression metadata for every nested child.
+            self.inner.create_field_encoder(
+                field,
+                column_index,
+                &FieldEncodingContext {
+                    strategy: self.inner.as_ref(),
+                    options: context.options,
+                    root_field_metadata: context.root_field_metadata,
+                },
+            )
+        }
+    }
+
+    let batch = compatibility_fixture_batch();
+    let mut schema = LanceSchema::try_from(batch.schema().as_ref()).unwrap();
+    schema.set_dictionary(&batch).unwrap();
+    for compression in ["none", "zstd"] {
+        let mut params = CompressionParams::default();
+        params.columns.insert(
+            "items".into(),
+            CompressionFieldParams {
+                compression: Some(compression.into()),
+                ..Default::default()
+            },
+        );
+        let mut files = Vec::new();
+        let fields = Arc::new(AtomicUsize::new(0));
+        let wraps = AtomicUsize::new(0);
+        for wrapped in [false, true] {
+            let fs = FsFixture::default();
+            let output = fs.object_store.create(&fs.tmp_path).await.unwrap();
+            let options = FileWriterOptions {
+                data_cache_bytes: Some(1),
+                max_page_bytes: Some(1024),
+                ..Default::default()
+            };
+            let mut writer = if wrapped {
+                versions::v2_2::Writer::try_new_with_encoding_strategy_wrapper(
+                    output,
+                    schema.clone(),
+                    options,
+                    params.clone(),
+                    |inner| {
+                        wraps.fetch_add(1, Ordering::Relaxed);
+                        Arc::new(ObservedStrategy {
+                            inner,
+                            fields: fields.clone(),
+                        })
+                    },
+                )
+            } else {
+                versions::v2_2::Writer::try_new_with_compression(
+                    output,
+                    schema.clone(),
+                    options,
+                    params.clone(),
+                )
+            }
+            .unwrap();
+            for offset in (0..batch.num_rows()).step_by(1024) {
+                writer
+                    .write_batch(&batch.slice(offset, (batch.num_rows() - offset).min(1024)))
+                    .await
+                    .unwrap();
+            }
+            let summary = writer.finish().await.unwrap();
+            assert_eq!(summary.num_rows, batch.num_rows() as u64);
+            files.push(
+                fs.object_store
+                    .open(&fs.tmp_path)
+                    .await
+                    .unwrap()
+                    .get_range(0..summary.size_bytes as usize)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(wraps.load(Ordering::Relaxed), 1);
+        assert_eq!(fields.load(Ordering::Relaxed), schema.fields.len());
+        assert_wire_bytes_equal(&files[1], &files[0]);
+        assert_eq!(footer_version(&files[1]), (2, 2));
+        assert_current_reader_roundtrip(&files[1], ConcreteFileVersion::V2_2, &batch).await;
+    }
+}
+
+#[tokio::test]
 async fn v2_3_output_is_deterministic_within_the_current_revision() {
     // Blob v1 remains covered by the stable fixtures; 2.3 uses Blob v2 descriptors.
     let batch = compatibility_fixture_batch()

@@ -8,7 +8,7 @@ use bytes::{BufMut, Bytes};
 use lance_core::{Result, datatypes::Schema};
 use lance_encoding::{
     compression_config::CompressionParams,
-    encoder::{BatchEncoder, EncodedBatch},
+    encoder::{BatchEncoder, EncodedBatch, FieldEncodingStrategy},
 };
 use lance_io::{object_store::ObjectStore, traits::Writer as ObjectWriter};
 use object_store::path::Path;
@@ -57,6 +57,25 @@ impl Writer {
         Ok(writer)
     }
 
+    /// Create a v2.2 writer while wrapping its selected root encoding strategy.
+    ///
+    /// The wrapper receives the complete v2.2 strategy with `compression`
+    /// applied. It must delegate encoding decisions to that strategy, retaining
+    /// the v2.2 grammar. This supports instrumentation and allocation ownership
+    /// around field encoders without selecting a different file format.
+    /// The wrapper is called once during construction, before any data is written.
+    pub fn try_new_with_encoding_strategy_wrapper(
+        object_writer: Box<dyn ObjectWriter>,
+        schema: Schema,
+        options: FileWriterOptions,
+        compression: CompressionParams,
+        wrap: impl FnOnce(Arc<dyn FieldEncodingStrategy>) -> Arc<dyn FieldEncodingStrategy>,
+    ) -> Result<Self> {
+        let mut writer = Self::new_lazy_with_compression(object_writer, options, compression);
+        writer.initialize_with_strategy_wrapper(schema, wrap)?;
+        Ok(writer)
+    }
+
     /// Create a v2.2 writer whose schema is inferred from the first batch.
     pub fn new_lazy(object_writer: Box<dyn ObjectWriter>, options: FileWriterOptions) -> Self {
         Self::new_lazy_with_compression(object_writer, options, Default::default())
@@ -76,10 +95,18 @@ impl Writer {
     }
 
     fn initialize(&mut self, schema: Schema) -> Result<()> {
+        self.initialize_with_strategy_wrapper(schema, std::convert::identity)
+    }
+
+    fn initialize_with_strategy_wrapper(
+        &mut self,
+        schema: Schema,
+        wrap: impl FnOnce(Arc<dyn FieldEncodingStrategy>) -> Arc<dyn FieldEncodingStrategy>,
+    ) -> Result<()> {
         self.encoding.validate_options()?;
         let encoding_options = self.encoding.encoding_options(&schema);
         schema.validate()?;
-        let strategy = encoding_strategy(self.compression.clone());
+        let strategy = wrap(encoding_strategy(self.compression.clone()));
         let encoder = BatchEncoder::try_new(&schema, strategy.as_ref(), &encoding_options)?;
         self.encoding.initialize(schema, encoder, &mut self.sink);
         Ok(())

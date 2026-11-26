@@ -17,3 +17,11 @@ adaptive reads combining multiple files, whose independently reopened batch
 boundaries cannot safely be merged. Fragment open and metadata preparation retry
 before row assignment. Cancellation and retry deadlines belong to the callback's
 owning task; there is no scanner restart or built-in retry budget.
+
+The v2.2 writer also provides `try_new_with_encoding_strategy_wrapper` for
+applications that attach timing or allocation ownership to field encoders. Its
+one-shot callback receives the complete v2.2 root strategy with the requested
+compression settings. Wrappers must delegate encoding decisions to this root;
+the writer retains its original finish sequence and footer. Existing constructors
+are unchanged. The regression checks wrapped/unwrapped byte equality and normal
+reader roundtrips for nullable nested data with uncompressed and Zstd settings.
