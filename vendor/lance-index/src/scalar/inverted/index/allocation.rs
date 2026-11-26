@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use arrow::array::ArrayData;
+use arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_array::{Array, ArrayRef, LargeBinaryArray, ListArray, RecordBatch, make_array};
-use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow_data::ArrayData;
 use arrow_schema::DataType;
 use lance_arrow::{RecordBatchExt, deepcopy::deep_copy_array_sliced};
 use lance_core::Result;
