@@ -1,11 +1,13 @@
 //! Bounded composite-key probes against the full body dataset.
 use super::*;
 use futures::TryStreamExt;
-use lance::Dataset;
+use lance::{dataset::scanner::DatasetRecordBatchStream, Dataset};
 use lance_context_core::{MergeMemoryBudget, MergeReservation};
+use lance_datafusion::exec::{
+    collect_execution_metrics, execute_plan, ExecutionSummaryCounts, LanceExecutionOptions,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Mutex,
     time::Instant,
 };
 
@@ -14,8 +16,9 @@ const SCAN_BATCH_ROWS: usize = 2048;
 const ADMITTED_SCAN_READAHEAD: usize = 8;
 
 /// One admitted lookup window. Projection counters describe returned key
-/// batches; they are not physical object-store or HTTP bytes. Lance execution
-/// counters are optional because a cancelled scan may not report its summary.
+/// batches; they are not physical object-store or HTTP bytes. Native counters
+/// snapshot successful scans at lookup completion, including early exits.
+/// They exclude work finishing later; staging-only resolutions have no scan.
 #[derive(Clone, Debug, Default)]
 pub struct TurnLookupObservation {
     pub requested_keys: usize,
@@ -220,13 +223,19 @@ impl TurnIngestionSpec {
         scan.batch_size(SCAN_BATCH_ROWS)
             .batch_readahead(readahead)
             .fragment_readahead(readahead);
-        let summary = Arc::new(Mutex::new(None));
-        let observed = summary.clone();
-        scan.scan_stats_callback(Arc::new(move |stats| {
-            *observed.lock().unwrap() = Some(stats.clone());
-        }));
         observation.scans_started = 1;
-        let mut stream = scan.try_into_stream().await?;
+        // Keep the scanner's plan so an all-hit early exit can report work
+        // without polling to EOF just to trigger its completion callback.
+        // Preserve Scanner::execution_options and the logical schema adapter.
+        let plan = scan.create_plan().await?;
+        let mut stream = DatasetRecordBatchStream::new(execute_plan(
+            plan.clone(),
+            LanceExecutionOptions {
+                runtime_env: base.session().runtime_env(),
+                batch_size: Some(SCAN_BATCH_ROWS),
+                ..Default::default()
+            },
+        )?);
         while let Some(batch) = stream.try_next().await? {
             observation.projected_rows = observation
                 .projected_rows
@@ -266,15 +275,18 @@ impl TurnIngestionSpec {
             }
         }
         drop(stream);
-        if let Some(stats) = summary.lock().unwrap().take() {
-            observation.lance_bytes_read = Some(stats.bytes_read);
-            observation.lance_requests = Some(stats.requests);
-            observation.lance_indices_loaded = Some(stats.indices_loaded);
-            observation.fragments_scanned = stats.all_counts.get("fragments_scanned").copied();
-            observation.ranges_scanned = stats.all_counts.get("ranges_scanned").copied();
-            observation.rows_scanned = stats.all_counts.get("rows_scanned").copied();
-            observation.task_wait_time_ns = stats.all_times.get("task_wait_time").copied();
-        }
+        // One snapshot for either completion path. Do not wait for cancelled
+        // background work: these are observed plan metrics, not all store I/O.
+        let mut stats = ExecutionSummaryCounts::default();
+        collect_execution_metrics(plan.as_ref(), &mut stats);
+        drop(plan);
+        observation.lance_bytes_read = Some(stats.bytes_read);
+        observation.lance_requests = Some(stats.requests);
+        observation.lance_indices_loaded = Some(stats.indices_loaded);
+        observation.fragments_scanned = stats.all_counts.get("fragments_scanned").copied();
+        observation.ranges_scanned = stats.all_counts.get("ranges_scanned").copied();
+        observation.rows_scanned = stats.all_counts.get("rows_scanned").copied();
+        observation.task_wait_time_ns = stats.all_times.get("task_wait_time").copied();
         observation.elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         Ok(TurnLookup {
             base,

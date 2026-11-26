@@ -35,8 +35,9 @@ pub struct BodyLookupObservation {
     pub projected_array_bytes: u64,
     pub elapsed_us: u64,
     pub max_elapsed_us: u64,
-    /// Number of completed lookups with a native scan summary. Bytes, requests
-    /// and indices totals cover these summaries; no summaries means unavailable.
+    /// Completed lookups with native plan metrics sampled at completion,
+    /// including all-hit early exits. Totals exclude later background work
+    /// and staging-only resolutions; they are not all object-store I/O.
     pub native_summaries: u64,
     pub lance_bytes_read: u64,
     pub lance_requests: u64,

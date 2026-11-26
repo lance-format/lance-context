@@ -105,6 +105,8 @@ async fn bounded_native_readahead_keeps_exact_keys_and_releases_admission() -> R
         .await?
         .unwrap();
     assert_eq!(hit.get(&keys[0]), Some(true));
+    assert!(hit.observation().lance_bytes_read.is_some());
+    assert!(hit.observation().lance_requests.is_some());
     drop(hit);
     drop(base);
     memory.released().await?;

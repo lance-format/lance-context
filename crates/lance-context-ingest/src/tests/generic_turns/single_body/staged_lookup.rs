@@ -116,6 +116,7 @@ async fn exercise() -> Result<()> {
     let result = service.submit(&repeated, DEADLINE).await?;
     let after = service.body_lookup_observation();
     assert_eq!(after.scans_started, before.scans_started + 1);
+    assert_eq!(after.native_summaries, before.native_summaries + 1);
     assert_eq!(after.staged_keys, before.staged_keys);
     // A materialized key is no longer a staged hit; the original body wins.
     let key = spec.row_key(&input[0], 0, 4096)?;
