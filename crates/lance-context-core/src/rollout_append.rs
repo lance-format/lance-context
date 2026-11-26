@@ -37,9 +37,10 @@ pub const MAX_STAGE_BYTES: usize = 256 * 1024 * 1024;
 /// watermarks protect merge retries in both modes, not arbitrary ingest retries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReplayPolicy {
-    /// Preserve rollout cutover/replay checks against existing base keys.
+    /// Check existing base keys only for initial cutover and replay generations.
+    /// Normal new generations append without base-key lookups.
     #[default]
-    CheckBase,
+    CheckBaseOnRecovery,
     /// Skip base-key checks. Readers must deduplicate immutable identities,
     /// including physical copies across shards, generations and writer restarts.
     AllowDuplicates,
@@ -62,7 +63,7 @@ impl AppendOptions {
         Self {
             schema,
             key_column: key_column.into(),
-            replay_policy: ReplayPolicy::CheckBase,
+            replay_policy: ReplayPolicy::CheckBaseOnRecovery,
             storage_options: None,
             session: None,
         }
@@ -864,8 +865,8 @@ pub async fn stage_with_options(
     options.validate(&dataset)?;
     let dataset_uri = dataset.uri().to_owned();
     let schema = options.schema.clone();
-    let check_base = options.replay_policy == ReplayPolicy::CheckBase;
-    let replay_ranges = if check_base {
+    let check_base_on_recovery = options.replay_policy == ReplayPolicy::CheckBaseOnRecovery;
+    let replay_ranges = if check_base_on_recovery {
         let key = format!("{CUTOVER_PREFIX}{}", plan.shard);
         if dataset.metadata().get(&key) != Some(&plan.legacy_through.to_string()) {
             return Err(Error::invalid_input(
@@ -915,7 +916,7 @@ pub async fn stage_with_options(
             }
             current.push(batch);
         }
-        let needs_lookup = check_base
+        let needs_lookup = check_base_on_recovery
             && replay_ranges
                 .as_ref()
                 .map_or(generation.number <= plan.legacy_through, |ranges| {

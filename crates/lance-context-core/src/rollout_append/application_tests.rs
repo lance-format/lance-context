@@ -51,7 +51,10 @@ async fn parts(
 
 #[tokio::test]
 async fn application_schema_and_key_share_rollout_staging_with_explicit_replay_policy() {
-    for policy in [ReplayPolicy::CheckBase, ReplayPolicy::AllowDuplicates] {
+    for policy in [
+        ReplayPolicy::CheckBaseOnRecovery,
+        ReplayPolicy::AllowDuplicates,
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let uri = dir.path().to_str().unwrap();
         let mut a = writer(uri, "a").await;
@@ -76,7 +79,7 @@ async fn application_schema_and_key_share_rollout_staging_with_explicit_replay_p
                 .count_rows(None)
                 .await
                 .unwrap(),
-            if policy == ReplayPolicy::CheckBase {
+            if policy == ReplayPolicy::CheckBaseOnRecovery {
                 1
             } else {
                 2

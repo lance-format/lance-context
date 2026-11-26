@@ -43,7 +43,9 @@ infers a rollout path for that application. Also configure:
 
 Selected registered targets use `ReplayPolicy::AllowDuplicates`; their readers
 must deduplicate immutable identities. Existing rollout entry points retain
-`ReplayPolicy::CheckBase`. Exact selectors leave other registered targets on
+`ReplayPolicy::CheckBaseOnRecovery`: only initial cutover and replay generations
+check existing base keys; normal new generations append without base lookups.
+Exact selectors leave other registered targets on
 their existing Worker merge path. New Worker-only applications that have removed
 that path must select every table, normally with `ROLLOUT_APPEND_TARGETS=*`.
 
