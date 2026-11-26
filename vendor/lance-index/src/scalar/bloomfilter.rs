@@ -481,6 +481,78 @@ impl BloomFilterIndex {
             }
         }
     }
+    /// Whether this snapshot can search and remap without asynchronous I/O.
+    pub fn can_search_in_memory(&self) -> bool {
+        self.batch_remapper.is_none()
+    }
+
+    fn search_prepared_unmapped(
+        &self,
+        prepared: &super::PreparedUtf8BloomQuery,
+        metrics: &dyn MetricsCollector,
+        keep_zone: impl Fn(u64, u64, usize) -> bool,
+    ) -> Result<SearchResult> {
+        let mut compared = 0;
+        let mut rows = RowAddrTreeMap::new();
+        for block in self.zones.iter() {
+            if self.frag_reuse_index.is_none()
+                && !keep_zone(
+                    block.bound.fragment_id,
+                    block.bound.start,
+                    block.bound.length,
+                )
+            {
+                continue;
+            }
+            compared += 1;
+            if (prepared.has_null && block.has_null)
+                || prepared
+                    .hashes
+                    .iter()
+                    .any(|hash| block.bloom_filter.check_hash(*hash))
+            {
+                let start = (block.bound.fragment_id << 32) + block.bound.start;
+                rows.insert_range(start..start + block.bound.length as u64);
+            }
+        }
+        metrics.record_comparisons(compared);
+        Ok(SearchResult::at_most(rows))
+    }
+
+    /// Search prepared membership hashes with synchronous fragment remapping.
+    pub fn search_prepared_in_memory(
+        &self,
+        prepared: &super::PreparedUtf8BloomQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        self.search_prepared_in_memory_with_zone_filter(prepared, metrics, |_, _, _| true)
+    }
+
+    /// Prune physical zones only without remapping; intersect with the caller's
+    /// same-snapshot bound after remapping in every case.
+    pub fn search_prepared_in_memory_with_zone_filter(
+        &self,
+        prepared: &super::PreparedUtf8BloomQuery,
+        metrics: &dyn MetricsCollector,
+        keep_zone: impl Fn(u64, u64, usize) -> bool,
+    ) -> Result<SearchResult> {
+        let result = self.search_prepared_unmapped(prepared, metrics, keep_zone)?;
+        if self.batch_remapper.is_some() {
+            return Err(Error::invalid_input(
+                "batch row remapping requires async search",
+            ));
+        }
+        let Some(remapper) = &self.frag_reuse_index else {
+            return Ok(result);
+        };
+        let selected = remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows());
+        let nulls = remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows());
+        Ok(match result {
+            SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
+            SearchResult::AtMost(_) => SearchResult::at_most(selected).with_nulls(nulls),
+            SearchResult::AtLeast(_) => SearchResult::at_least(selected).with_nulls(nulls),
+        })
+    }
 }
 
 #[async_trait]
@@ -529,15 +601,28 @@ impl ScalarIndex for BloomFilterIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
-        let result = if let BloomFilterQuery::IsNull() = query
-            && let Some(null_rows) = &self.null_rows
+        let result = if let Some(prepared) = query
+            .as_any()
+            .downcast_ref::<super::PreparedUtf8BloomQuery>()
         {
-            SearchResult::exact(null_rows.clone())
+            self.search_prepared_unmapped(prepared, metrics, |_, _, _| true)?
+        } else if let Some(prepared) = query
+            .as_any()
+            .downcast_ref::<BloomFilterQuery>()
+            .and_then(super::PreparedUtf8BloomQuery::try_new)
+        {
+            self.search_prepared_unmapped(&prepared, metrics, |_, _, _| true)?
         } else {
-            search_zones(&self.zones, metrics, |block| {
-                self.evaluate_block_against_query(block, query)
-            })?
+            let query = query.as_any().downcast_ref::<BloomFilterQuery>().unwrap();
+            if let BloomFilterQuery::IsNull() = query
+                && let Some(null_rows) = &self.null_rows
+            {
+                SearchResult::exact(null_rows.clone())
+            } else {
+                search_zones(&self.zones, metrics, |block| {
+                    self.evaluate_block_against_query(block, query)
+                })?
+            }
         };
 
         let (selected, nulls) = if let Some(remapper) = &self.frag_reuse_index {
@@ -1501,6 +1586,19 @@ impl BasicTrainer for BloomFilterIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for BloomFilterIndexPlugin {
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: super::registry::ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        super::registry::single_flight_store_bound_open(index_store, cache, load, |_| async {
+            Ok(None)
+        })
+        .await
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -2114,6 +2212,97 @@ mod tests {
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..200);
         assert_eq!(result, SearchResult::at_most(expected));
+    }
+
+    #[tokio::test]
+    async fn prepared_utf8_membership_matches_scalar_evaluation() {
+        use crate::scalar::{AnyQuery, PreparedUtf8BloomQuery, zoned::search_zones};
+
+        let directory = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            directory.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+        let data = RecordBatch::try_from_iter([(
+            VALUE_COLUMN_NAME,
+            Arc::new(arrow_array::StringArray::from(vec![
+                Some("alpha"),
+                None,
+                Some("beta"),
+                Some("界"),
+                Some("é"),
+                Some("omega"),
+            ])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            data.schema(),
+            stream::once(std::future::ready(Ok(data))),
+        ));
+        BloomFilterIndexPlugin::train_bloomfilter_index(
+            add_row_addr(stream),
+            store.as_ref(),
+            Some(BloomFilterIndexBuilderParams::new(2, 0.01)),
+        )
+        .await
+        .unwrap();
+        let index = BloomFilterIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        assert!(index.can_search_in_memory());
+        for values in [
+            vec![],
+            vec![None],
+            vec![Some("alpha"), Some("alpha")],
+            vec![Some("é"), Some("界"), None],
+            vec![Some("absent")],
+        ] {
+            let query = BloomFilterQuery::IsIn(
+                values
+                    .into_iter()
+                    .map(|value| ScalarValue::Utf8(value.map(str::to_owned)))
+                    .collect(),
+            );
+            let prepared = PreparedUtf8BloomQuery::try_new(&query).unwrap();
+            assert!(query.dyn_eq(&prepared) && prepared.dyn_eq(&query));
+            assert_eq!(query.to_expr("key".into()), prepared.to_expr("key".into()));
+            let expected = search_zones(&index.zones, &NoOpMetricsCollector, |zone| {
+                index.evaluate_block_against_query(zone, &query)
+            })
+            .unwrap();
+            assert_eq!(
+                index
+                    .search(&prepared, &NoOpMetricsCollector)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                index
+                    .search_prepared_in_memory(&prepared, &NoOpMetricsCollector)
+                    .unwrap(),
+                expected
+            );
+            let pruned = index
+                .search_prepared_in_memory_with_zone_filter(
+                    &prepared,
+                    &NoOpMetricsCollector,
+                    |_, start, _| start == 2,
+                )
+                .unwrap();
+            let expected_pruned = search_zones(&index.zones, &NoOpMetricsCollector, |zone| {
+                Ok(zone.bound.start == 2 && index.evaluate_block_against_query(zone, &query)?)
+            })
+            .unwrap();
+            assert_eq!(pruned, expected_pruned);
+        }
+        assert!(
+            PreparedUtf8BloomQuery::try_new(&BloomFilterQuery::IsIn(vec![ScalarValue::Int32(
+                Some(3)
+            )]))
+            .is_none()
+        );
     }
 
     #[tokio::test]

@@ -520,6 +520,142 @@ pub enum BloomFilterQuery {
     IsIn(Vec<ScalarValue>),
 }
 
+/// Sorted disjoint half-open UTF-8 intervals, shared by all ZoneMap segments.
+/// The caller budgets the owned endpoints once per query, not per segment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Utf8RangesQuery {
+    ranges: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for Utf8RangesQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Utf8RangesQuery")
+            .field("ranges", &self.ranges.len())
+            .finish()
+    }
+}
+
+impl Utf8RangesQuery {
+    pub fn new(mut ranges: Vec<(String, String)>) -> Result<Self> {
+        if ranges.is_empty() || ranges.iter().any(|(lower, upper)| lower >= upper) {
+            return Err(lance_core::Error::invalid_input("invalid UTF-8 intervals"));
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(String, String)> = Vec::with_capacity(ranges.len());
+        for (lower, upper) in ranges {
+            if let Some(previous) = merged.last_mut()
+                && lower <= previous.1
+            {
+                if upper > previous.1 {
+                    previous.1 = upper;
+                }
+            } else {
+                merged.push((lower, upper));
+            }
+        }
+        Ok(Self { ranges: merged })
+    }
+}
+
+impl AnyQuery for Utf8RangesQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn format(&self, col: &str) -> String {
+        format!("{col} IN {} UTF-8 intervals", self.ranges.len())
+    }
+    fn to_expr(&self, col: String) -> Expr {
+        let mut expressions = self
+            .ranges
+            .iter()
+            .map(|(lower, upper)| {
+                datafusion_expr::col(col.as_str())
+                    .gt_eq(datafusion_expr::lit(lower.clone()))
+                    .and(datafusion_expr::col(col.as_str()).lt(datafusion_expr::lit(upper.clone())))
+            })
+            .collect::<Vec<_>>();
+        while expressions.len() > 1 {
+            let mut next = Vec::with_capacity(expressions.len().div_ceil(2));
+            let mut pairs = expressions.into_iter();
+            while let Some(left) = pairs.next() {
+                next.push(match pairs.next() {
+                    Some(right) => left.or(right),
+                    None => left,
+                });
+            }
+            expressions = next;
+        }
+        expressions.pop().unwrap()
+    }
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .is_some_and(|other| self == other)
+    }
+}
+
+/// One query-owned UTF-8 hash vector shared by physical Bloom segments.
+/// Construction retains a copy of the original values for expression/equality
+/// semantics, plus eight bytes per non-null key. Callers budget both once per
+/// logical query; physical segments only borrow these buffers.
+#[derive(Debug, Clone)]
+pub struct PreparedUtf8BloomQuery {
+    query: BloomFilterQuery,
+    hashes: Vec<u64>,
+    has_null: bool,
+}
+
+impl PreparedUtf8BloomQuery {
+    /// Derive hashes internally; callers cannot supply unverified Bloom hashes.
+    /// Non-UTF8 or non-membership queries keep their ordinary search path.
+    pub fn try_new(query: &BloomFilterQuery) -> Option<Self> {
+        let BloomFilterQuery::IsIn(values) = query else {
+            return None;
+        };
+        if !values
+            .iter()
+            .all(|value| matches!(value, ScalarValue::Utf8(_)))
+        {
+            return None;
+        }
+        let mut hashes = Vec::with_capacity(values.len());
+        for value in values {
+            if let ScalarValue::Utf8(Some(value)) = value {
+                hashes.push(twox_hash::XxHash64::oneshot(0, value.as_bytes()));
+            }
+        }
+        Some(Self {
+            query: query.clone(),
+            hashes,
+            has_null: values
+                .iter()
+                .any(|value| matches!(value, ScalarValue::Utf8(None))),
+        })
+    }
+}
+
+impl AnyQuery for PreparedUtf8BloomQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn format(&self, col: &str) -> String {
+        self.query.format(col)
+    }
+    fn to_expr(&self, col: String) -> Expr {
+        self.query.to_expr(col)
+    }
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        if let Some(other) = other.as_any().downcast_ref::<Self>() {
+            self.query == other.query
+        } else if let Some(other) = other.as_any().downcast_ref::<BloomFilterQuery>() {
+            &self.query == other
+        } else {
+            false
+        }
+    }
+}
+
 impl AnyQuery for BloomFilterQuery {
     fn as_any(&self) -> &dyn Any {
         self
@@ -565,7 +701,10 @@ impl AnyQuery for BloomFilterQuery {
     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
         match other.as_any().downcast_ref::<Self>() {
             Some(o) => self == o,
-            None => false,
+            None => other
+                .as_any()
+                .downcast_ref::<PreparedUtf8BloomQuery>()
+                .is_some_and(|prepared| self == &prepared.query),
         }
     }
 }

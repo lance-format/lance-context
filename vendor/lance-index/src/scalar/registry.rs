@@ -526,7 +526,10 @@ impl StoreBoundScalarIndexCacheEntry {
         }
     }
 
-    fn index_for_store(&self, index_store: &Arc<dyn IndexStore>) -> Option<Arc<dyn ScalarIndex>> {
+    pub fn index_for_store(
+        &self,
+        index_store: &Arc<dyn IndexStore>,
+    ) -> Option<Arc<dyn ScalarIndex>> {
         let binding = self.binding.load();
         index_store
             .is_same_storage_binding(binding.index_store.as_ref())

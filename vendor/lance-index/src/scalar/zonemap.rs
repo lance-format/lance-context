@@ -708,6 +708,98 @@ impl ZoneMapIndex {
     }
 }
 
+impl ZoneMapIndex {
+    fn search_unmapped(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        if let Some(query) = query.as_any().downcast_ref::<super::Utf8RangesQuery>() {
+            if self.data_type != DataType::Utf8 {
+                return Err(lance_core::Error::invalid_input(
+                    "UTF-8 intervals need UTF-8 zones",
+                ));
+            }
+            // One binary search per zone; never one full zone pass per session.
+            return search_zones(&self.zones, metrics, |zone| {
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
+                }
+                if !Self::zone_has_finite_extrema(zone) {
+                    return Ok(false);
+                }
+                let (ScalarValue::Utf8(Some(min)), ScalarValue::Utf8(Some(max))) =
+                    (&zone.min, &zone.max)
+                else {
+                    return Err(lance_core::Error::invalid_input(
+                        "invalid UTF-8 zone extrema",
+                    ));
+                };
+                let first = query.ranges.partition_point(|(_, upper)| upper <= min);
+                Ok(query
+                    .ranges
+                    .get(first)
+                    .is_some_and(|(lower, _)| lower <= max))
+            });
+        }
+        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+        if let SargableQuery::IsNull() = query
+            && let Some(null_rows) = &self.null_rows
+        {
+            return Ok(SearchResult::exact(null_rows.clone()));
+        }
+        // Binary search the sorted membership keys once per zone.
+        if let SargableQuery::IsIn(values) = query
+            && self.data_type == DataType::Utf8
+            && values
+                .iter()
+                .all(|value| matches!(value, ScalarValue::Utf8(Some(_))))
+            && values.is_sorted()
+        {
+            return search_zones(&self.zones, metrics, |zone| {
+                if Self::zone_has_missing_extrema(zone) {
+                    return Ok(Self::zone_has_comparable_values(zone));
+                }
+                if !Self::zone_has_finite_extrema(zone) {
+                    return Ok(false);
+                }
+                let first = values.partition_point(|value| value < &zone.min);
+                Ok(values.get(first).is_some_and(|value| value <= &zone.max))
+            });
+        }
+        search_zones(&self.zones, metrics, |zone| {
+            self.evaluate_zone_against_query(zone, query)
+        })
+    }
+    /// Whether this snapshot can search and remap without asynchronous I/O.
+    pub fn can_search_in_memory(&self) -> bool {
+        self.batch_remapper.is_none()
+    }
+    /// Search decoded zones, preserving synchronous fragment-reuse translation.
+    pub fn search_in_memory(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let result = self.search_unmapped(query, metrics)?;
+        if self.batch_remapper.is_some() {
+            return Err(Error::invalid_input(
+                "batch row remapping requires async search",
+            ));
+        }
+        let Some(remapper) = &self.fri else {
+            return Ok(result);
+        };
+        let selected = remapper.remap_row_addrs_tree_map(result.row_addrs().selected_rows());
+        let nulls = remapper.remap_row_addrs_tree_map(result.row_addrs().null_rows());
+        Ok(match result {
+            SearchResult::Exact(_) => SearchResult::exact(selected).with_nulls(nulls),
+            SearchResult::AtMost(_) => SearchResult::at_most(selected).with_nulls(nulls),
+            SearchResult::AtLeast(_) => SearchResult::at_least(selected).with_nulls(nulls),
+        })
+    }
+}
+
 // Heap copies made by ScalarValue::try_from_array for flat byte bounds.
 // Nested bounds use null scalars; dictionary wrappers remain separately unaccounted.
 fn scalar_bound_bytes(array: &dyn Array) -> usize {
@@ -793,16 +885,7 @@ impl ScalarIndex for ZoneMapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
-        let result = if let SargableQuery::IsNull() = query
-            && let Some(null_rows) = &self.null_rows
-        {
-            SearchResult::exact(null_rows.clone())
-        } else {
-            search_zones(&self.zones, metrics, |zone| {
-                self.evaluate_zone_against_query(zone, query)
-            })?
-        };
+        let result = self.search_unmapped(query, metrics)?;
 
         let (selected, nulls) = if let Some(remapper) = &self.fri {
             // Legacy synchronous remapping path.
@@ -1612,6 +1695,19 @@ impl BasicTrainer for ZoneMapIndexPlugin {
 
 #[async_trait]
 impl ScalarIndexPlugin for ZoneMapIndexPlugin {
+    async fn get_or_insert_in_cache(
+        &self,
+        index_store: Arc<dyn IndexStore>,
+        _frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        cache: &LanceCache,
+        load: super::registry::ScalarIndexLoad<'_>,
+    ) -> Result<Arc<dyn ScalarIndex>> {
+        super::registry::single_flight_store_bound_open(index_store, cache, load, |_| async {
+            Ok(None)
+        })
+        .await
+    }
+
     fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
         Some(self)
     }
@@ -2500,6 +2596,34 @@ mod tests {
         assert_eq!(
             ZoneMapIndex::value_range_over([legacy.as_ref(), current.as_ref()]),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_utf8_batch_preserves_unknown_zone_bounds() {
+        let mut index = train_and_load::<Int64Type>(vec![vec![Some(1), Some(2)]]).await;
+        let mutable = Arc::get_mut(&mut index).unwrap();
+        mutable.data_type = DataType::Utf8;
+        for zone in &mut mutable.zones {
+            zone.min = ScalarValue::Utf8(None);
+            zone.max = ScalarValue::Utf8(None);
+        }
+        let exact = SargableQuery::Equals(ScalarValue::Utf8(Some("needle".into())));
+        let expected = index.search(&exact, &NoOpMetricsCollector).await.unwrap();
+        let membership = SargableQuery::IsIn(vec![ScalarValue::Utf8(Some("needle".into()))]);
+        assert_eq!(
+            index
+                .search_in_memory(&membership, &NoOpMetricsCollector)
+                .unwrap(),
+            expected
+        );
+        let ranges =
+            super::super::Utf8RangesQuery::new(vec![("needle".into(), "needlf".into())]).unwrap();
+        assert_eq!(
+            index
+                .search_in_memory(&ranges, &NoOpMetricsCollector)
+                .unwrap(),
+            expected
         );
     }
 
