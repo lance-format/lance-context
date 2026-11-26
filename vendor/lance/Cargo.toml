@@ -464,6 +464,7 @@ path = "../lance-encoding"
 version = "=14.0.2"
 
 [dependencies.lance-file]
+path = "../lance-file"
 version = "=14.0.2"
 
 [dependencies.lance-index]
@@ -765,3 +766,4 @@ object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = 
 lance-core = { path = "../lance-core" }
 lance-encoding = { path = "../lance-encoding" }
 lance-io = { path = "../lance-io" }
+lance-file = { path = "../lance-file" }
