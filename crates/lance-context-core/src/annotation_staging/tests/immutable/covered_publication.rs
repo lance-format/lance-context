@@ -136,7 +136,18 @@ async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows
 #[tokio::test]
 async fn covered_lookup_rejects_recovered_instance_and_native_maintenance() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let base = empty(&root.path().join("body.lance")).await?;
+    let batch = bodies(&[])?;
+    let base = Arc::new(
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            root.path().join("body.lance").to_str().unwrap(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await?,
+    );
     let staging = AnnotationStaging::new_immutable_body(base, scope(), 0, Limits::default())?;
     for (after, id) in [(0, "a"), (1, "b")] {
         let lookup = staging.capture_immutable_base().await?;
