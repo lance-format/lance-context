@@ -30,6 +30,7 @@ mod prefetch;
 pub(crate) mod read_io;
 pub mod runtime;
 mod shard;
+pub mod single_body;
 #[cfg(feature = "http")]
 mod status_filter;
 mod window;

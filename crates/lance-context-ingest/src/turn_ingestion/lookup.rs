@@ -107,8 +107,10 @@ impl TurnIngestionSpec {
             return Ok(None);
         }
         let started = Instant::now();
+        let actual = arrow_schema::Schema::from(base.schema());
         ensure!(
-            arrow_schema::Schema::from(base.schema()) == *self.body_schema,
+            actual == *self.body_schema
+                || actual == *crate::annotations::single_body::storage_schema(self)?,
             "body lookup schema differs from its ingestion specification"
         );
         ensure!(
