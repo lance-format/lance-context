@@ -64,6 +64,7 @@ async fn full_body_upload_failure_exits_and_fenced_recovery_drains_original_acke
         .await?
         .expect_err("failed body writer must notify its supervisor");
     assert!(error.is::<PublicationWriteFailed>(), "{error:#}");
+    assert_eq!(error.to_string(), "annotation publisher stopped");
     assert_eq!(held.batch(), &input[0].slice(0, 1));
     let failed = annotation_publication::state(&c).await?;
     assert_eq!(failed.manifests, before.manifests);

@@ -469,8 +469,8 @@ impl Runtime {
         tokio::pin!(shutdown);
         tokio::select! {
             _ = &mut shutdown => Ok(()),
-            result = driver => result,
-            result = publisher => result,
+            result = driver => result.context("annotation apply driver stopped"),
+            result = publisher => result.context("annotation publisher stopped"),
         }
     }
 }

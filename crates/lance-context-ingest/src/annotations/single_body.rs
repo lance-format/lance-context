@@ -193,7 +193,7 @@ impl Service {
                     .turn_spec
                     .as_ref()
                     .context("missing body spec")?;
-                Ok(spec
+                let keys = match spec
                     .lookup_existing(
                         base.dataset().clone(),
                         keys,
@@ -201,10 +201,31 @@ impl Service {
                             .as_ref()
                             .context("missing body lookup budget")?,
                     )
-                    .await?
-                    .map(|keys| Lookup { base, keys }))
+                    .await
+                {
+                    Ok(keys) => keys,
+                    Err(error)
+                        if error.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<lance::Error>()
+                                .is_some_and(lance::Error::is_backpressure)
+                        }) =>
+                    {
+                        // Only the read-only historical lookup is retried.
+                        // Its partial results, native scan and reader handle
+                        // are dropped; Driver retains the committed request
+                        // without advancing apply or treating keys as absent.
+                        // Existing ApplyMemory pressure lets the independent
+                        // publisher drain an already-applied prefix. The host
+                        // must still leave a release path for native capacity.
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(error),
+                };
+                Ok(keys.map(|keys| Lookup { base, keys }))
             })
             .await
+            .context("immutable body historical lookup failed")
     }
 
     pub(super) async fn apply_bodies(
