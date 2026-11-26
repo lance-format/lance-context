@@ -34,7 +34,7 @@ executor; registration alone does not imply immutable append. The Master resolve
 the registered URI and reads its persisted schema/primary-key metadata; it never
 infers a rollout path for that application. Also configure:
 
-- `ROLLOUT_APPEND_LOCAL=true` and `FENCE_LEGACY_MAINTENANCE=true`.
+- `ROLLOUT_APPEND_LOCAL=true` and `MASTER_FENCE_LEGACY_MAINTENANCE=true`.
 - `CATCHUP_SHARDS` with stable current and historical Worker identities.
 - The existing append concurrency, generation, byte, and shared-memory limits.
 - A positive `MERGE_WAL_CONCURRENCY`. Registered tables use this ordinary queue
