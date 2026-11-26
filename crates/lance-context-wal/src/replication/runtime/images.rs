@@ -16,6 +16,26 @@ pub(super) struct CheckpointWork {
     previous: Option<Arc<crate::replication::checkpoint::Image>>,
 }
 
+impl CheckpointWork {
+    fn finish(self: Box<Self>, result: Result<()>) {
+        let Self {
+            image,
+            previous,
+            reply,
+            ..
+        } = *self;
+        // A sibling group can receive the caller's next checkpoint as soon as
+        // the reply wakes it. Release physical-node admission before that wake.
+        drop(image);
+        drop(previous);
+        reply.finish(result);
+    }
+}
+
+#[cfg(all(test, feature = "peer-transport"))]
+#[path = "images/completion_test.rs"]
+mod completion_test;
+
 // Every queued result retains its original outgoing credit. The lane has as
 // many slots as the entire physical node's outgoing allowance, so it cannot
 // fill while another valid owner is trying to return its slot. Control-lane
@@ -94,8 +114,7 @@ impl Worker {
 
     pub(super) fn queue_checkpoint(&mut self, work: Box<CheckpointWork>) {
         if self.checkpoint.is_some() {
-            work.reply
-                .finish(Err(anyhow::anyhow!("checkpoint already queued")));
+            work.finish(Err(anyhow::anyhow!("checkpoint already queued")));
             return;
         }
         self.node
@@ -121,7 +140,7 @@ impl Worker {
             }
             let work = self.checkpoint.take().unwrap();
             let result = self.node.finish_async_checkpoint(&work.image);
-            after_poll.push(Box::new(move || work.reply.finish(result)));
+            after_poll.push(Box::new(move || work.finish(result)));
             return Ok(true);
         }
         if !self.node.groups[&self.group].persistence_idle() {
@@ -138,7 +157,7 @@ impl Worker {
                 }
                 Err(error) => {
                     let work = self.checkpoint.take().unwrap();
-                    after_poll.push(Box::new(move || work.reply.finish(Err(error))));
+                    after_poll.push(Box::new(move || work.finish(Err(error))));
                 }
             }
             self.node
