@@ -298,6 +298,17 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn response_idle_timeout_must_be_positive() {
+        use clap::Parser;
+        assert!(super::ServerConfig::try_parse_from([
+            "server",
+            "--http-shutdown-response-idle-secs",
+            "0"
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn key_index_policy_is_explicit_and_validated() {
         use clap::Parser;
         use lance_context_core::KeyIndexType;
