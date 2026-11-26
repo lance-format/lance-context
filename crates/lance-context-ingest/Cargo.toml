@@ -82,3 +82,7 @@ required-features = ["service", "lance-io-metrics"]
 [[example]]
 name = "annotation_result_probe"
 required-features = ["service"]
+
+[[example]]
+name = "managed_turn_replay"
+required-features = ["service", "http-client"]

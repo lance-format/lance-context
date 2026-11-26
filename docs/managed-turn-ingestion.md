@@ -98,3 +98,44 @@ repeats it and adds two keys; the fourth adds two keys in another session.
 and `selected-body.json` for independent reader compatibility checks.
 
 These are correctness checks, not throughput or real-source acceptance results.
+
+## Bounded Arrow-file replay
+
+Build the example inside this repository, using its root `Cargo.lock` and
+`[patch]` entries. Cargo does not inherit these patches when another workspace
+adds a git dependency on `lance-context-ingest`. An independently configured
+consumer workspace must supply and qualify its own matching patches.
+
+```sh
+cargo build --locked -p lance-context-ingest --features service,http-client \
+  --example managed_turn_replay
+managed_turn_replay spec input.arrow session_id session_id id > turn-spec.json
+managed_turn_replay append replay.json input.arrow
+managed_turn_replay resume replay.json
+```
+
+`replay.json` supplies `layout`, `binding`, `spec`, staging `limits`, `shard`,
+the persisted producer `open` tuple, `endpoint`, `bearer_token_file` and
+`journal_directory`. Generate `spec` from the actual input: schema metadata is
+part of the binding, so a synthetic fixture does not establish a real input's
+schema contract. Provision the matching fresh table pair before replay.
+
+This entry runs one producer lane on one already partitioned shard. It uses the
+normal `DurableMutationClient`, accepts an IPC file of at most 128 MiB and bounds
+each request to the configured limits (at most 8 MiB / 8192 rows). An oversized
+individual turn is rejected. It shares a 1 GiB memory budget with its journal.
+For wide schemas, the existing service-test configuration uses
+`RUST_MIN_STACK=16777216`.
+
+`append` requires a fresh journal directory. On an uncertain result, preserve
+that directory and producer tuple; `resume` resolves its pending intent and
+waits for its selected publication. It does not resume a source reader or infer
+which later file rows to skip. Each successful request reports the input batch,
+row interval, producer sequence and WAL index. The final JSON reports the exact
+selected body reference and covered cut. Preserve version numbers as `u64` or
+raw JSON: detached versions can exceed JavaScript's exact integer range.
+
+The reported times measure this sequential replay, including client journal
+sync, encoding, RPC and publication waiting. They are not a sustained capacity
+benchmark. The entry never advances an external source checkpoint, and its
+candidate-row count is not a count of newly inserted unique turns.
