@@ -8,6 +8,7 @@ use crate::tests::annotation_runtime::{drained, run_owner};
 
 mod compaction;
 mod credentials;
+mod native_memory;
 mod payload_memory;
 #[cfg(unix)]
 mod process;

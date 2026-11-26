@@ -4206,6 +4206,7 @@ dependencies = [
  "lance-context-core",
  "lance-context-metrics",
  "lance-context-wal",
+ "lance-core",
  "lance-datafusion",
  "lance-file",
  "lance-index",
