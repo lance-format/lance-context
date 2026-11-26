@@ -17,6 +17,8 @@ use std::collections::HashMap;
 const DEADLINE: Duration = Duration::from_secs(30);
 
 #[cfg(all(feature = "http-client", feature = "service"))]
+mod full_body_http;
+#[cfg(all(feature = "http-client", feature = "service"))]
 mod http;
 mod replacement;
 mod single_body;

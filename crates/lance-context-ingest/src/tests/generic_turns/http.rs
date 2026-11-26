@@ -72,13 +72,13 @@ async fn lose_reply(State(lost): State<Arc<LostReply>>, request: Request, next: 
     response
 }
 
-struct Server {
-    base: reqwest::Url,
+pub(super) struct Server {
+    pub(super) base: reqwest::Url,
     stop: oneshot::Sender<()>,
     task: JoinHandle<std::io::Result<()>>,
 }
 impl Server {
-    async fn start(router: Router) -> Result<Self> {
+    pub(super) async fn start(router: Router) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}/", listener.local_addr()?).parse()?;
         let (stop, stopped) = oneshot::channel();
@@ -91,14 +91,14 @@ impl Server {
         });
         Ok(Self { base, stop, task })
     }
-    async fn shutdown(self) -> Result<()> {
+    pub(super) async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(());
         self.task.await??;
         Ok(())
     }
 }
 
-fn keys() -> Result<ReceiptKeys> {
+pub(super) fn keys() -> Result<ReceiptKeys> {
     ReceiptKeys::new(1, [(1, [0x42; 32])])
 }
 
@@ -127,6 +127,53 @@ async fn client_with_open(
     spec: &TurnIngestionSpec,
     open: ProducerOpen,
 ) -> Result<DurableMutationClient> {
+    open_client(root, base, spec, open, false).await
+}
+
+pub(super) fn journal(root: &std::path::Path, base: reqwest::Url, open: ProducerOpen) -> Config {
+    Config {
+        directory: root.join("client-journal"),
+        opens: vec![open],
+        base,
+        request_timeout: DEADLINE,
+        journal: Settings {
+            state_bytes: 16 << 20,
+            queue_bytes: 8 << 20,
+            batch_bytes: 2 << 20,
+            file_bytes: 64 << 10,
+            log_bytes: 96 << 20,
+            ..Default::default()
+        },
+    }
+}
+
+pub(super) fn transport() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+pub(super) async fn open_client(
+    root: &std::path::Path,
+    base: reqwest::Url,
+    spec: &TurnIngestionSpec,
+    open: ProducerOpen,
+    full_body: bool,
+) -> Result<DurableMutationClient> {
+    if full_body {
+        return DurableMutationClient::open_full_body(
+            journal(root, base, open),
+            &annotation_publication::one_shard(),
+            binding(),
+            spec,
+            &fixture::limits(),
+            Shard { bucket: 0 },
+            transport()?,
+            MergeMemoryBudget::new(64 << 20),
+        )
+        .await;
+    }
     DurableMutationClient::open(
         Config {
             directory: root.join("client-journal"),
