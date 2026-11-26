@@ -61,7 +61,10 @@ async fn ready_annotations_publish_after_one_maintenance_then_idle_indexes_catch
                 min_source_bytes: 1,
                 max_records: 1,
                 max_batch_wait: Duration::from_secs(5),
-                turn_id_index: Some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+                turn_id_index: Some(crate::materializer::TurnIdIndex {
+                    min_rows: 1,
+                    ..Default::default()
+                }),
                 status_index: Some(crate::materializer::StatusIndex::default()),
                 ..Default::default()
             },

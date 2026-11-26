@@ -32,7 +32,7 @@ pub use read_policy::SourceReadPolicy;
 pub(crate) use session_index::scan_fragments as session_scan_fragments;
 pub use session_index::SessionIndex;
 pub use status_index::StatusIndex;
-pub use turn_id_index::TurnIdIndex;
+pub use turn_id_index::{TurnIdIndex, TurnIdIndexType};
 
 /// Resolve this from the authorized namespace, never from an append request.
 #[derive(Clone)]

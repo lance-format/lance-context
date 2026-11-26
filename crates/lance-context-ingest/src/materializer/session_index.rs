@@ -119,6 +119,14 @@ pub(super) enum Action {
         empty_sources: Vec<Uuid>,
     },
     Merge(Vec<IndexMetadata>),
+    /// Turn-ID ZoneMap segment over these uncovered fragments. Any listed
+    /// segments whose coverage a rewrite withdrew entirely are retired.
+    BuildZoneMap {
+        fragments: Vec<u32>,
+        empty_sources: Vec<Uuid>,
+    },
+    /// Native concatenation of turn-ID ZoneMap segments.
+    MergeZoneMap(Vec<IndexMetadata>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -130,6 +138,9 @@ struct Change {
 }
 
 pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: Key) -> Result<()> {
+    if matches!(key, Key::Turn) && is_zonemap(index) {
+        return validate_turn_zonemap(dataset, index);
+    }
     let field = dataset
         .schema()
         .field(key.column())
@@ -151,6 +162,43 @@ pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: K
                 .as_ref()
                 .is_some_and(|b| !b.is_empty() || matches!(key, Key::Status)),
         "incompatible managed session index metadata"
+    );
+    Ok(())
+}
+
+/// Exact native type of the details Lance writes for a ZoneMap segment.
+const ZONEMAP_DETAILS: &str = "lance.table.ZoneMapIndexDetails";
+
+pub(super) fn is_zonemap(index: &IndexMetadata) -> bool {
+    index.index_details.as_ref().is_some_and(|details| {
+        details
+            .type_url
+            .rsplit_once('/')
+            .is_some_and(|(_, name)| name == ZONEMAP_DETAILS)
+    })
+}
+
+/// A turn-ID ZoneMap answers in the address domain and is never remapped. A
+/// stable-row-ID rewrite withdraws its rewritten fragments, so a segment may
+/// legitimately cover nothing until its owner retires it.
+fn validate_turn_zonemap(dataset: &Dataset, index: &IndexMetadata) -> Result<()> {
+    let field = dataset
+        .schema()
+        .field(Key::Turn.column())
+        .context("missing id column")?;
+    ensure!(
+        index.name == Key::Turn.name()
+            && index.fields == vec![field.id]
+            && index.covering_fields.is_empty()
+            && !index.uuid.is_nil()
+            && index.base_id.is_none()
+            && index.index_version == 0
+            && index.dataset_version <= dataset.version().version
+            && dataset.manifest().uses_stable_row_ids()
+            && index.results_are_row_addrs()
+            && !index.supports_eager_remap()
+            && index.fragment_bitmap.is_some(),
+        "incompatible managed turn-ID ZoneMap metadata"
     );
     Ok(())
 }
@@ -241,14 +289,18 @@ pub(super) fn spawn_action(
     // Cancellation cannot release admission while a native index build still runs.
     tokio::spawn(async move {
         let _reservation = reservation;
-        let is_merge = matches!(&action, Action::Merge(_));
+        let is_merge = matches!(&action, Action::Merge(_) | Action::MergeZoneMap(_));
         let (coverage, removed): (BTreeSet<_>, Vec<_>) = match &action {
             Action::Build(ids) => (ids.iter().copied().collect(), Vec::new()),
             Action::BuildReplacingEmpty {
                 fragments,
                 empty_sources,
+            }
+            | Action::BuildZoneMap {
+                fragments,
+                empty_sources,
             } => (fragments.iter().copied().collect(), empty_sources.clone()),
-            Action::Merge(segments) => (
+            Action::Merge(segments) | Action::MergeZoneMap(segments) => (
                 segments
                     .iter()
                     .flat_map(|i| i.fragment_bitmap.as_ref().unwrap().iter())
@@ -303,6 +355,36 @@ pub(super) fn spawn_action(
                     } else {
                         Ok(dataset.merge_existing_index_segments(segments).await?)
                     }
+                }
+                Action::BuildZoneMap { fragments, .. } => {
+                    ensure!(
+                        matches!(key, Key::Turn),
+                        "ZoneMap is only managed for turn IDs"
+                    );
+                    // Zones are computed per fragment from the `id` column only;
+                    // no payload projection is read. Each segment owns its UUID.
+                    Ok(dataset
+                        .create_index_builder(
+                            &[key.column()],
+                            IndexType::ZoneMap,
+                            &ScalarIndexParams::for_builtin(
+                                lance_index::scalar::BuiltinIndexType::ZoneMap,
+                            ),
+                        )
+                        .name(key.name().to_owned())
+                        // Same as the BTree path: this writes one uncommitted
+                        // segment; the managed descriptor decides retirement.
+                        .replace(true)
+                        .fragments(fragments)
+                        .execute_uncommitted()
+                        .await?)
+                }
+                Action::MergeZoneMap(segments) => {
+                    ensure!(
+                        matches!(key, Key::Turn),
+                        "ZoneMap is only managed for turn IDs"
+                    );
+                    Ok(dataset.merge_existing_index_segments(segments).await?)
                 }
             }
         };
@@ -550,6 +632,10 @@ async fn decode_operation(
             "index publication mixes row domains"
         );
         ensure!(
+            is_zonemap(old) == is_zonemap(&index),
+            "index publication mixes BTree and ZoneMap segments"
+        );
+        ensure!(
             old.uuid != index.uuid,
             "index reused an existing segment identity"
         );
@@ -574,11 +660,19 @@ async fn decode_operation(
     if !remove.is_empty() && removed_coverage.is_empty() {
         // Updating the last indexed fragment retains an empty definition.
         // CreateIndex does not retire it implicitly: a fresh catch-up build
-        // may remove only proven-empty status sources at this exact snapshot.
-        ensure!(
-            matches!(key, Key::Status) && index.dataset_version == dataset.version().version,
-            "invalid empty status index replacement"
-        );
+        // may remove only proven-empty sources at this exact snapshot. For
+        // turn IDs this happens when a rewrite withdrew a whole ZoneMap segment.
+        if matches!(key, Key::Turn) && is_zonemap(&index) {
+            ensure!(
+                index.dataset_version == dataset.version().version,
+                "invalid empty turn-ID ZoneMap replacement"
+            );
+        } else {
+            ensure!(
+                matches!(key, Key::Status) && index.dataset_version == dataset.version().version,
+                "invalid empty status index replacement"
+            );
+        }
     } else if !remove.is_empty() {
         ensure!(
             remove.len() >= 2 && covered.iter().collect::<BTreeSet<_>>() == removed_coverage,

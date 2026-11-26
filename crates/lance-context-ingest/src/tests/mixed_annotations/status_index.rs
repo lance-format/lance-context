@@ -44,7 +44,10 @@ async fn owner_with_indexes(
                 max_records: 4,
                 max_batch_wait: Duration::from_millis(20),
                 retained_manifest_versions: history,
-                turn_id_index: turn_ids.then_some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+                turn_id_index: turn_ids.then_some(crate::materializer::TurnIdIndex {
+                    min_rows: 1,
+                    ..Default::default()
+                }),
                 status_index: status.then(crate::materializer::StatusIndex::default),
                 compaction: compact.then_some(crate::materializer::SmallFileCompaction {
                     target_file_bytes: 64 << 10,

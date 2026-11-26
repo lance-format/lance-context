@@ -29,8 +29,10 @@ async fn owner(
                 max_records: 2,
                 max_batch_wait: Duration::from_millis(20),
                 retained_manifest_versions: 2,
-                turn_id_index: (!status_index)
-                    .then_some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+                turn_id_index: (!status_index).then_some(crate::materializer::TurnIdIndex {
+                    min_rows: 1,
+                    ..Default::default()
+                }),
                 status_index: status_index.then_some(crate::materializer::StatusIndex {
                     min_rows: 1,
                     ..Default::default()
