@@ -4546,8 +4546,6 @@ dependencies = [
 [[package]]
 name = "lance-index"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df56fde7e5e34b1d6cf67de22fdfed3a9f6f2875fc5a5d452ae8ab5a1cef150b"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4620,8 +4618,6 @@ dependencies = [
 [[package]]
 name = "lance-index-core"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc6ab34b812d49209a8772809e24897d43c713115e11dfd2bb6d48a81beab39c"
 dependencies = [
  "arrow-array",
  "arrow-schema",

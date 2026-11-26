@@ -38,6 +38,7 @@ categories = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 
 [package.metadata.docs.rs]
 features = ["protoc"]
@@ -318,15 +319,19 @@ version = "=58.0.0"
 version = "=14.0.2"
 
 [dependencies.lance-core]
+path = "../lance-core"
 version = "=14.0.2"
 
 [dependencies.lance-datafusion]
+path = "../lance-datafusion"
 version = "=14.0.2"
 
 [dependencies.lance-encoding]
+path = "../lance-encoding"
 version = "=14.0.2"
 
 [dependencies.lance-file]
+path = "../lance-file"
 version = "=14.0.2"
 
 [dependencies.lance-geo]
@@ -334,9 +339,11 @@ version = "=14.0.2"
 optional = true
 
 [dependencies.lance-index-core]
+path = "../lance-index-core"
 version = "=14.0.2"
 
 [dependencies.lance-io]
+path = "../lance-io"
 version = "=14.0.2"
 default-features = false
 
@@ -456,6 +463,7 @@ version = "0.11.7"
 version = "0.3.0"
 
 [dev-dependencies.lance-datafusion]
+path = "../lance-datafusion"
 version = "=14.0.2"
 features = ["datagen"]
 
@@ -528,3 +536,12 @@ unsafe_op_in_unsafe_fn = "allow"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(coverage,coverage_nightly)"]
+
+[patch.crates-io]
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "6e5253a3a9c0565c2b5b07ea304023d23422f8a1" }
+lance-core = { path = "../lance-core" }
+lance-datafusion = { path = "../lance-datafusion" }
+lance-encoding = { path = "../lance-encoding" }
+lance-file = { path = "../lance-file" }
+lance-index-core = { path = "../lance-index-core" }
+lance-io = { path = "../lance-io" }

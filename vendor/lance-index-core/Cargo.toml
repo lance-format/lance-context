@@ -38,6 +38,7 @@ categories = [
 ]
 license = "Apache-2.0"
 repository = "https://github.com/lance-format/lance"
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json"]
 
 [lib]
 name = "lance_index_core"
@@ -82,9 +83,11 @@ version = "54.0.0"
 version = "0.3"
 
 [dependencies.lance-core]
+path = "../lance-core"
 version = "=14.0.2"
 
 [dependencies.lance-io]
+path = "../lance-io"
 version = "=14.0.2"
 default-features = false
 
@@ -149,3 +152,8 @@ unsafe_op_in_unsafe_fn = "allow"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(coverage,coverage_nightly)"]
+
+[patch.crates-io]
+object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "6e5253a3a9c0565c2b5b07ea304023d23422f8a1" }
+lance-core = { path = "../lance-core" }
+lance-io = { path = "../lance-io" }
