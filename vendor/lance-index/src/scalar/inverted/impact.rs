@@ -35,6 +35,7 @@ struct ImpactSkipDataInner {
     // decoded once at construction. Level1 markers are fully validated because
     // WAND may use them to skip a group; u32::MAX marks malformed entries.
     entry_doc_up_tos: Box<[u32]>,
+    _reservation: lance_core::memory::NativeReservation,
     // The most recently baked bounds with a stable scorer key. Each query holds
     // its own Arc in ImpactScoreCache, so replacing this slot for another scorer
     // cannot change bounds already in use. Scorers without a key never enter the
@@ -110,6 +111,14 @@ impl ImpactScoreCache {
 
 impl ImpactSkipData {
     pub fn new(entries: LargeBinaryArray, level0_len: usize) -> Result<Self> {
+        Self::new_with_native_memory(entries, level0_len, &None)
+    }
+
+    pub(crate) fn new_with_native_memory(
+        entries: LargeBinaryArray,
+        level0_len: usize,
+        memory: &lance_core::memory::NativeMemory,
+    ) -> Result<Self> {
         let expected_len = level0_len + level1_len(level0_len);
         if entries.len() != expected_len {
             return Err(Error::index(format!(
@@ -119,6 +128,11 @@ impl ImpactSkipData {
                 level0_len
             )));
         }
+        let reservation = lance_core::memory::try_reserve(
+            memory,
+            lance_core::memory::NativeMemoryKind::Index,
+            entries.len() * std::mem::size_of::<u32>(),
+        )?;
         let entry_doc_up_tos = (0..entries.len())
             .map(|entry_idx| {
                 if entries.is_null(entry_idx) {
@@ -137,6 +151,7 @@ impl ImpactSkipData {
             entries,
             level0_len,
             entry_doc_up_tos,
+            _reservation: reservation,
             last_keyed_bounds: Mutex::new(None),
         })))
     }

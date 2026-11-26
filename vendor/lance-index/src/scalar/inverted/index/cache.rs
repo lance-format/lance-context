@@ -339,6 +339,12 @@ pub(in super::super) enum PostingListGroupStorage {
     Materialized(Vec<PostingList>),
 }
 
+#[derive(Debug)]
+struct PackedImpactStates {
+    states: Vec<OnceLock<ImpactSkipData>>,
+    _reservation: lance_core::memory::NativeReservation,
+}
+
 #[derive(Debug, Clone)]
 pub(in super::super) struct PackedPostingListGroup {
     pub(in super::super) batch: RecordBatch,
@@ -355,7 +361,8 @@ pub(in super::super) struct PackedPostingListGroup {
     metadata: Option<(ScalarBuffer<f32>, ScalarBuffer<u32>)>,
     // The impact column position, read only when a slot first decodes its
     // skip data, and those per-slot states.
-    impacts: Option<(usize, Arc<[OnceLock<ImpactSkipData>]>)>,
+    impacts: Option<(usize, Arc<PackedImpactStates>)>,
+    native_memory: lance_core::memory::NativeMemory,
     pub(super) first_docs_states: Arc<super::posting_list::PackedFirstDocsStates>,
     pub(super) first_docs_state_capacity_bytes: usize,
     pub(super) impact_state_capacity_bytes: usize,
@@ -512,14 +519,20 @@ impl PostingListGroup {
                 );
             }
 
-            let states: Arc<[OnceLock<ImpactSkipData>]> = (0..batch.num_rows())
-                .map(|_| OnceLock::new())
-                .collect::<Vec<_>>()
-                .into();
+            let reservation = lance_core::memory::try_reserve(
+                memory,
+                lance_core::memory::NativeMemoryKind::Index,
+                batch.num_rows() * std::mem::size_of::<OnceLock<ImpactSkipData>>(),
+            )?;
+            let states = Arc::new(PackedImpactStates {
+                states: (0..batch.num_rows()).map(|_| OnceLock::new()).collect(),
+                _reservation: reservation,
+            });
             // Account up front for every allocation that the lazy states can
             // eventually retain. The impact entry bytes themselves remain in
             // `batch` and are already charged exactly once above.
             let capacity_bytes = states
+                .states
                 .len()
                 .saturating_mul(std::mem::size_of::<OnceLock<ImpactSkipData>>())
                 .saturating_add(derived_cache_bytes);
@@ -568,6 +581,7 @@ impl PostingListGroup {
                 posting_blocks,
                 metadata,
                 impacts,
+                native_memory: memory.clone(),
                 first_docs_states,
                 first_docs_state_capacity_bytes,
                 impact_state_capacity_bytes,
@@ -627,17 +641,28 @@ impl PostingListGroup {
                         })?,
                     ),
                 };
-                let impacts = group.impacts.as_ref().map(|(impact_column, states)| {
-                    states[slot]
-                        .get_or_init(|| {
-                            let impacts = group.batch.column(*impact_column).as_list::<i32>();
-                            let entries =
-                                list_slot(impacts.offsets(), impacts.values().as_binary(), slot);
-                            ImpactSkipData::new(entries, blocks.len())
-                                .expect("packed impact entry count was validated at construction")
-                        })
-                        .clone()
-                });
+                let impacts = group
+                    .impacts
+                    .as_ref()
+                    .map(|(impact_column, states)| -> Result<ImpactSkipData> {
+                        let state = &states.states[slot];
+                        if let Some(impact) = state.get() {
+                            return Ok(impact.clone());
+                        }
+                        let impacts = group.batch.column(*impact_column).as_list::<i32>();
+                        let entries =
+                            list_slot(impacts.offsets(), impacts.values().as_binary(), slot);
+                        let impact = ImpactSkipData::new_with_native_memory(
+                            entries,
+                            blocks.len(),
+                            &group.native_memory,
+                        )?;
+                        // A concurrent initializer owns its own admission. The losing
+                        // value drops here; only the published backing stays live.
+                        let _ = state.set(impact);
+                        Ok(state.get().unwrap().clone())
+                    })
+                    .transpose()?;
                 Ok(Some(PostingList::Compressed(
                     CompressedPostingList::new_packed_slot(
                         blocks,
