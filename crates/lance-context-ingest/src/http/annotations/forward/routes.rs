@@ -166,6 +166,11 @@ impl Routes {
                         .map_err(|_| Failure::bad("invalid_close"))?;
                     self.credential(keys, &close.producer)?
                 }
+                Operation::Replace => {
+                    let replacement: ReplaceProducerRequest = serde_json::from_slice(&bytes)
+                        .map_err(|_| Failure::bad("invalid_replacement"))?;
+                    self.credential(keys, &replacement.producer)?
+                }
                 Operation::FilterStatus => {
                     serde_json::from_slice::<StatusRequest>(&bytes)
                         .map_err(|_| Failure::bad("invalid_status_filter"))?

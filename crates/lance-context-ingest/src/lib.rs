@@ -43,9 +43,11 @@ pub mod http;
 pub mod materializer;
 #[cfg(feature = "service")]
 pub mod preparation;
+mod producer_replacement;
 #[cfg(feature = "materializer")]
 pub mod reader;
 pub mod receipt;
+pub use producer_replacement::{ProducerReplacement, ProducerReplacementFenced};
 pub mod turn_ingestion;
 #[cfg(feature = "worker")]
 pub mod worker;

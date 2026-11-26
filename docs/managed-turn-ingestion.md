@@ -57,6 +57,43 @@ returned empty or malformed JSON. `AppendResponseError` additionally preserves
 validated service labels when present. Status alone does not establish whether
 a mutation committed or authorize replacing its durable pending intent.
 
+## Replacing an executor that lost its journal
+
+`http::journal::ProducerControlClient` uses a small scheduler-owned control
+record. It reuses the WAL's existing generation fence and exact-tail retirement;
+no separate producer registry is required.
+
+1. Retain the original `ProducerOpen` tuple and an independently confirmed source
+   checkpoint in durable scheduler state. After executor loss, choose and persist
+   one replacement operation UUID.
+2. Call `prepare_replacement` with that original tuple and operation. It recovers
+   the signed predecessor credential. Durably save the **entire** returned
+   `ReplacementIntent` before calling `execute`.
+3. Execute that saved intent. The service fences the exact predecessor. It returns
+   `WaitingForRetirement` until the predecessor's latest source record has been
+   published and retired. Keep the same intent while waiting or after an unknown
+   response. Do not rerun preparation after replacement might have succeeded:
+   the original producer generation may already be gone.
+4. `Opened` returns the successor `ProducerOpen` tuple and credential. Persist the
+   tuple before starting its single executor with a fresh journal. Resume source
+   **first-create** operations from the last fully confirmed checkpoint. Existing
+   business keys preserve the original body and current annotations.
+
+The managed `replace-producer` HTTP route accepts the signed predecessor and
+replacement operation, routes by that credential's table/shard scope, and retains
+the owner's publication fence. A competing operation or stale generation receives
+409. The Rust client exposes a validated fence as `ProducerReplacementFenced`.
+It does not automatically retry. Pending-retirement polls use quorum observations.
+
+Repeating a successful intent returns the same live successor, even if it has
+already written. This is **not** permission to restart its sequence at one with an
+empty journal. If that successor executor also loses its journal, fence it with a
+new replacement intent. Scheduler ownership must prevent two executors using one
+generation. Replacement does not resolve old request results, make arbitrary
+annotation patches safe to replay, or complete source-output obligations. Keep
+those recovery records until the application's checkpoint protocol permits their
+removal.
+
 ## Read and source progress
 
 Annotation point reads use the internal business key and the existing owner read

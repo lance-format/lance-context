@@ -18,6 +18,7 @@ const DEADLINE: Duration = Duration::from_secs(30);
 
 #[cfg(all(feature = "http-client", feature = "service"))]
 mod http;
+mod replacement;
 
 fn bodies() -> Result<Vec<RecordBatch>> {
     // An operator may repeat this exact product-path test with externally

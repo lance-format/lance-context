@@ -95,6 +95,10 @@ impl Forwarder {
         Router::new()
             .route("/api/v1/health", get(health))
             .route("/api/v1/annotations/{table}/producer", post(open))
+            .route(
+                "/api/v1/annotations/{table}/replace-producer",
+                post(replace),
+            )
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
             .route(
@@ -287,6 +291,9 @@ async fn health(State(g): State<Forwarder>) -> StatusCode {
 
 async fn open(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Open).await
+}
+async fn replace(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
+    g.dispatch(t, r, Operation::Replace).await
 }
 async fn update(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Update).await
