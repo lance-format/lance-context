@@ -1172,6 +1172,33 @@ impl FileFragment {
         projection: &Schema,
         read_config: FragReadConfig,
     ) -> Result<FragmentReader> {
+        let policy = read_config
+            .file_reader_options
+            .as_ref()
+            .or(self.dataset.file_reader_options.as_ref())
+            .and_then(|options| options.read_memory_retry.as_ref());
+        let mut attempt = 0;
+        loop {
+            match self.open_once(projection, read_config.clone()).await {
+                Ok(reader) => return Ok(reader),
+                Err(error) => match policy {
+                    Some(policy) => {
+                        // The failed open and its joined metadata reads have
+                        // released their state before the policy waits.
+                        attempt += 1;
+                        (policy.0)(error, attempt, "fragment_open").await?;
+                    }
+                    None => return Err(error),
+                },
+            }
+        }
+    }
+
+    async fn open_once(
+        &self,
+        projection: &Schema,
+        read_config: FragReadConfig,
+    ) -> Result<FragmentReader> {
         let open_files = self.open_readers(projection, &read_config);
         let deletion_vec_load = if read_config.ignore_deletions {
             futures::future::Either::Left(futures::future::ready(Ok(None)))
@@ -1626,27 +1653,45 @@ impl FileFragment {
             // metadata; a fragment with several data files (one per
             // `add_columns` / merge) would otherwise pay them back to back.
             // `try_join_all` keeps the readers in data-file order.
-            let opens = self
+            let projected_files = self
                 .metadata
                 .files
                 .iter()
                 .filter(|data_file| data_file.fields.iter().any(|id| wanted_ids.contains(id)))
-                .map(|data_file| async move {
-                    match metadata_mode {
-                        MetadataMode::LazyAllowed => {
-                            self.open_reader(data_file, Some(projection), read_config)
-                                .await
-                        }
-                        MetadataMode::Full => {
-                            self.open_reader_with_full_metadata(
-                                data_file,
-                                Some(projection),
-                                read_config,
-                            )
+                .collect::<Vec<_>>();
+            let mut read_config = read_config.clone();
+            let options = read_config
+                .file_reader_options
+                .as_ref()
+                .or(self.dataset.file_reader_options.as_ref());
+            if projected_files.len() > 1
+                && let Some(options) = options
+                && options.batch_size_bytes.is_some()
+                && options.read_memory_retry.is_some()
+            {
+                // Reopening one adaptive stream may choose different row
+                // boundaries from the other files merged into this fragment.
+                let mut options = options.clone();
+                options.read_memory_retry = None;
+                read_config.file_reader_options = Some(options);
+            }
+            let read_config = &read_config;
+            let opens = projected_files.into_iter().map(|data_file| async move {
+                match metadata_mode {
+                    MetadataMode::LazyAllowed => {
+                        self.open_reader(data_file, Some(projection), read_config)
                             .await
-                        }
                     }
-                });
+                    MetadataMode::Full => {
+                        self.open_reader_with_full_metadata(
+                            data_file,
+                            Some(projection),
+                            read_config,
+                        )
+                        .await
+                    }
+                }
+            });
             let mut opened_files: Vec<Box<dyn GenericFileReader>> =
                 try_join_all(opens).await?.into_iter().flatten().collect();
 
