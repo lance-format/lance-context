@@ -1,5 +1,7 @@
 use super::*;
 
+mod covered_publication;
+
 fn bodies(ids: &[&str]) -> Result<RecordBatch> {
     Ok(RecordBatch::try_new(
         Arc::new(Schema::new(vec![
@@ -174,21 +176,7 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         None
     );
     assert_eq!(staging.observation().await.applied, 2);
-    // Even staged-positive results retain the same publication/base fence.
-    assert_eq!(
-        staging
-            .register_immutable_committed(
-                2,
-                3,
-                &[ImmutableRegistration {
-                    key: "a",
-                    exists_in_base: known["a"],
-                }],
-                &staged_lookup,
-            )
-            .await?,
-        None
-    );
+    // Covered staged results are exercised across publication below.
     let refreshed = staging
         .try_capture_immutable_base_with_staged(&mut known)
         .await?

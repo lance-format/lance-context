@@ -161,6 +161,9 @@ impl AnnotationStaging {
         }
         drop(state);
         let mut state = self.state.write().await;
+        // Preserve the immutable publication lineage: these rows came only
+        // from the verified frozen generation, through generation.through.
+        // A lookup that captured staged hits through that cut still covers it.
         state.base = state.views.install(selected);
         state.materialized = generation.through;
         state.frozen = None;

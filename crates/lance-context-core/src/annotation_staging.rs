@@ -136,6 +136,9 @@ enum PendingBatch {
 
 struct State {
     base: Arc<views::Base>,
+    // Local to this staging instance. Verified frozen publications preserve
+    // this lineage; maintenance starts a new one. It is not a durable epoch.
+    immutable_publications: Arc<()>,
     views: views::Registry,
     applied: u64,
     materialized: u64,
@@ -285,6 +288,7 @@ impl AnnotationStaging {
             limits,
             mutation: Mutex::new(()),
             state: RwLock::new(State {
+                immutable_publications: Arc::new(()),
                 base,
                 views,
                 applied: materialized,
