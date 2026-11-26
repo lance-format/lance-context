@@ -46,6 +46,7 @@ pub mod preparation;
 #[cfg(feature = "materializer")]
 pub mod reader;
 pub mod receipt;
+pub mod turn_ingestion;
 #[cfg(feature = "worker")]
 pub mod worker;
 
