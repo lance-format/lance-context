@@ -54,6 +54,32 @@ fn body() -> Result<RecordBatch> {
 
 #[cfg(feature = "materializer")]
 #[tokio::test]
+async fn key_scan_reports_native_work_for_early_hit() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("body.lance");
+    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(body()?)], schema());
+    let base = Arc::new(lance::Dataset::write(reader, path.to_str().unwrap(), None).await?);
+    let key = spec()?.business_key(&["a", "x"], 1024)?;
+    let budget = lance_context_core::MergeMemoryBudget::new(1 << 20);
+    let lookup = spec()?
+        .lookup_existing(base, &[key.as_str()], &budget)
+        .await?
+        .expect("lookup workspace admitted");
+    assert_eq!(lookup.get(&key), Some(true));
+    let observed = lookup.observation();
+    assert_eq!(observed.scans_started, 1);
+    assert_eq!(observed.projected_rows, 2);
+    // Both duplicate rows arrive in one batch. Finding the requested key
+    // drops the scan before polling EOF, but its actual work still counts.
+    assert!(observed.lance_bytes_read.is_some_and(|bytes| bytes > 0));
+    assert!(observed.lance_requests.is_some_and(|requests| requests > 0));
+    assert_eq!(observed.fragments_scanned, Some(1));
+    assert_eq!(observed.rows_scanned, Some(4));
+    assert!(observed.task_wait_time_ns.is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn key_scan_reports_native_work_for_missing_composite_key() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("body.lance");
