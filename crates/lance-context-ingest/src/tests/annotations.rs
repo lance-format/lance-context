@@ -93,9 +93,16 @@ pub(super) async fn request(
     body: Bytes,
 ) -> Result<PreparedAppend> {
     let upload = service.reserve_upload(body.len()).await?;
+    let shared_pool = service.ingress().client.payload_memory_pool().is_some();
+    let expected = body.clone();
     let original = body.as_ptr();
     let prepared = service.prepare(upload, body, producer, sequence).await?;
-    assert_eq!(prepared.body().as_ptr(), original);
+    assert_eq!(prepared.body(), &expected);
+    // Unknown parent capacity needs owned backing under the shared pool.
+    // The known-capacity prepare_owned path has a separate pointer assertion.
+    if !shared_pool {
+        assert_eq!(prepared.body().as_ptr(), original);
+    }
     Ok(prepared)
 }
 
@@ -452,4 +459,5 @@ async fn quorum_ack_waits_for_apply_and_another_ingress_reads_without_a_tail_sca
 mod uncertain_append;
 
 mod local_payload;
+mod payload_memory;
 mod source_pages;
