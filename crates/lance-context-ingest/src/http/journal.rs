@@ -10,6 +10,26 @@ use tokio::sync::Mutex as AsyncMutex;
 const MAX_METADATA: usize = 32 << 10;
 const MAX_TOKEN: usize = 12 << 10;
 
+#[cfg(feature = "materializer")]
+mod mutations;
+#[cfg(feature = "materializer")]
+pub use mutations::DurableMutationClient;
+
+enum Acknowledged {
+    Append(Accepted),
+    #[cfg(feature = "materializer")]
+    Mutation(super::annotations::MutationReply),
+}
+impl Acknowledged {
+    fn append(self) -> Result<Accepted> {
+        match self {
+            Self::Append(value) => Ok(value),
+            #[cfg(feature = "materializer")]
+            Self::Mutation(_) => anyhow::bail!("mutation result on immutable append client"),
+        }
+    }
+}
+
 /// Diagnostics reported by the HTTP service, not proof of an append's outcome.
 /// These details never advance or discard the durable pending intent.
 #[derive(Debug, Deserialize)]
@@ -65,6 +85,9 @@ struct Saved {
     next: u64,
     producer: Option<Opened>,
     last: Option<Accepted>,
+    #[cfg(feature = "materializer")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_mutation: Option<super::annotations::MutationReply>,
     pending: Option<Pending>,
 }
 impl Default for Saved {
@@ -74,6 +97,8 @@ impl Default for Saved {
             next: 1,
             producer: None,
             last: None,
+            #[cfg(feature = "materializer")]
+            last_mutation: None,
             pending: None,
         }
     }
@@ -122,6 +147,18 @@ impl DurableClient {
         client: reqwest::Client,
         budget: Arc<MergeMemoryBudget>,
     ) -> Result<Self> {
+        let contract = binding.contract()?;
+        Self::open_with_contract(config, layout, binding, contract, client, budget).await
+    }
+
+    async fn open_with_contract(
+        config: Config,
+        layout: &Layout,
+        binding: TableBinding,
+        contract: IngestContract,
+        client: reqwest::Client,
+        budget: Arc<MergeMemoryBudget>,
+    ) -> Result<Self> {
         let Config {
             directory,
             opens,
@@ -131,7 +168,7 @@ impl DurableClient {
         } = config;
         settings.validate()?;
         layout.validate()?;
-        let contract = binding.contract()?;
+        contract.validate()?;
         ensure!(
             !binding.table.is_nil()
                 && !binding.incarnation.is_nil()
@@ -188,7 +225,16 @@ impl DurableClient {
         base.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("HTTP base URL cannot contain path segments"))?
             .pop_if_empty()
-            .extend(["api", "v1", "ingest", &scope.contract.qualified_table]);
+            .extend([
+                "api",
+                "v1",
+                if scope.contract.policy == WritePolicy::TurnIngestion {
+                    "annotations"
+                } else {
+                    "ingest"
+                },
+                &scope.contract.qualified_table,
+            ]);
         tokio::task::spawn_blocking(move || {
             let workspace_guard = reservation;
             let binding_digest = digest(&serde_json::to_vec(&(&scope, &opens))?);
@@ -222,24 +268,17 @@ impl DurableClient {
                 } else {
                     Saved::default()
                 };
+                let last_sequence = recovered_sequence(&saved, &scope, &opens[key], groups[key])?;
                 ensure!(
                     saved.version == 1
                         && saved.next > 0
                         && saved.next < u64::MAX
-                        && (saved.last.is_none() || saved.producer.is_some()),
+                        && (last_sequence.is_none() || saved.producer.is_some()),
                     "invalid recovered sequence"
                 );
                 ensure!(
-                    saved.last.as_ref().map_or(saved.next == 1, |last| {
-                        last.sequence.checked_add(1) == Some(saved.next)
-                            && last.group == groups[key]
-                            && last.index > 0
-                            && last.index < u64::MAX
-                            && last.rows > 0
-                            && last.rows <= scope.contract.max_rows
-                            && !last.receipt.is_empty()
-                            && last.receipt.len() <= MAX_TOKEN
-                    }),
+                    last_sequence.map_or(saved.next == 1, |sequence| sequence.checked_add(1)
+                        == Some(saved.next)),
                     "invalid recovered ACK"
                 );
                 if let Some(credential) = &saved.producer {
@@ -367,15 +406,19 @@ impl DurableClient {
         self.stage_locked(key, &mut lane, body).await?;
         self.resume_locked(key, &mut lane)
             .await?
-            .context("staged append disappeared")
+            .context("staged append disappeared")?
+            .append()
     }
     /// Resend only the recovered/staged bytes and sequence. A network error
     /// leaves this intent intact; the caller decides when to retry it.
     pub async fn resume(&self, key: usize) -> Result<Option<Accepted>> {
         let mut lane = self.lane(key)?.lock().await;
-        self.resume_locked(key, &mut lane).await
+        self.resume_locked(key, &mut lane)
+            .await?
+            .map(Acknowledged::append)
+            .transpose()
     }
-    async fn resume_locked(&self, key: usize, lane: &mut Lane) -> Result<Option<Accepted>> {
+    async fn resume_locked(&self, key: usize, lane: &mut Lane) -> Result<Option<Acknowledged>> {
         ensure!(
             !lane.reopen,
             "local journal outcome unknown; reopen before continuing"
@@ -406,7 +449,13 @@ impl DurableClient {
         }
         let response = self
             .client
-            .post(self.endpoint("append"))
+            .post(self.endpoint(
+                if self.scope.contract.policy == WritePolicy::TurnIngestion {
+                    "update"
+                } else {
+                    "append"
+                },
+            ))
             .timeout(self.timeout)
             .header(header::CONTENT_TYPE.as_str(), ARROW_FILE)
             .header(PRODUCER, &lane.saved.producer.as_ref().unwrap().producer)
@@ -414,6 +463,34 @@ impl DurableClient {
             .body(pending.body.clone())
             .send()
             .await?;
+        #[cfg(feature = "materializer")]
+        if self.scope.contract.policy == WritePolicy::TurnIngestion {
+            let status = response.status();
+            if status != reqwest::StatusCode::OK
+                && status != reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            {
+                return Err(unresolved_append(response).await);
+            }
+            let result: super::annotations::MutationReply = bounded_json(response).await?;
+            mutations::validate(&result, &self.scope, &self.opens[key])?;
+            ensure!(
+                result.completion.meta.sequence == pending.sequence
+                    && result.completion.meta.digest == pending.digest
+                    && result.completion.meta.body_bytes == pending.bytes as u64
+                    && (status == reqwest::StatusCode::OK)
+                        == matches!(
+                            result.completion.result,
+                            crate::annotations::MutationResult::Applied
+                        ),
+                "foreign mutation ACK"
+            );
+            let mut next = lane.saved.clone();
+            next.next = pending.sequence + 1;
+            next.last_mutation = Some(result.clone());
+            next.pending = None;
+            self.persist(key, lane, next).await?;
+            return Ok(Some(Acknowledged::Mutation(result)));
+        }
         if response.status() != reqwest::StatusCode::ACCEPTED {
             return Err(unresolved_append(response).await);
         }
@@ -435,7 +512,7 @@ impl DurableClient {
         next.last = Some(accepted.clone());
         next.pending = None;
         self.persist(key, lane, next).await?;
-        Ok(Some(accepted))
+        Ok(Some(Acknowledged::Append(accepted)))
     }
     pub async fn last_accepted(&self, key: usize) -> Result<Option<Accepted>> {
         let lane = self.lane(key)?.lock().await;
@@ -454,6 +531,52 @@ impl DurableClient {
         tokio::task::spawn_blocking(move || drop(self)).await?;
         Ok(())
     }
+}
+
+fn recovered_sequence(
+    saved: &Saved,
+    scope: &Scope,
+    _open: &ProducerOpen,
+    group: u64,
+) -> Result<Option<u64>> {
+    #[cfg(feature = "materializer")]
+    if scope.contract.policy == WritePolicy::TurnIngestion {
+        ensure!(saved.last.is_none(), "immutable ACK in mutation journal");
+        return saved
+            .last_mutation
+            .as_ref()
+            .map(|last| {
+                mutations::validate(last, scope, _open)?;
+                Ok(last.completion.meta.sequence)
+            })
+            .transpose();
+    }
+    ensure!(
+        scope.contract.policy == WritePolicy::ImmutableUniqueIds,
+        "unsupported client journal policy"
+    );
+    #[cfg(feature = "materializer")]
+    ensure!(
+        saved.last_mutation.is_none(),
+        "mutation ACK in immutable journal"
+    );
+    saved
+        .last
+        .as_ref()
+        .map(|last| {
+            ensure!(
+                last.group == group
+                    && last.index > 0
+                    && last.index < u64::MAX
+                    && last.rows > 0
+                    && last.rows <= scope.contract.max_rows
+                    && !last.receipt.is_empty()
+                    && last.receipt.len() <= MAX_TOKEN,
+                "invalid recovered append ACK"
+            );
+            Ok(last.sequence)
+        })
+        .transpose()
 }
 async fn bounded_json<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
