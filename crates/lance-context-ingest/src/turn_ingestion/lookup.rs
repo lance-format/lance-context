@@ -11,7 +11,6 @@ use std::{
 
 const MAX_KEY_BYTES: usize = 64 << 10;
 const SCAN_BATCH_ROWS: usize = 2048;
-const ADMITTED_SCAN_READAHEAD: usize = 8;
 
 #[cfg(test)]
 mod tests;
@@ -97,9 +96,7 @@ impl TurnIngestionSpec {
     ///
     /// `None` means workspace was not admitted, not that keys are absent. It
     /// never waits for admission while ordered apply holds other resources.
-    /// Lance scan/decoder workspace requires separate caller admission. A
-    /// caller-supplied native memory pool permits bounded concurrent reads;
-    /// its reservations follow read/decode buffers and refusals remain errors.
+    /// Lance scan/decoder workspace requires separate caller admission.
     pub async fn lookup_existing(
         &self,
         base: Arc<Dataset>,
@@ -161,17 +158,9 @@ impl TurnIngestionSpec {
                 .collect::<Vec<_>>(),
         )?;
         scan.filter(&predicate)?;
-        let readahead = if base.session().native_memory().is_some() {
-            // These are scanner targets, not a replacement for admission of
-            // actual native pages. Keep the caller's pool and shared runtime.
-            scan.batch_size_bytes(1 << 20).io_buffer_size(8 << 20);
-            ADMITTED_SCAN_READAHEAD
-        } else {
-            1
-        };
         scan.batch_size(SCAN_BATCH_ROWS)
-            .batch_readahead(readahead)
-            .fragment_readahead(readahead);
+            .batch_readahead(1)
+            .fragment_readahead(1);
         let summary = Arc::new(Mutex::new(None));
         let observed = summary.clone();
         scan.scan_stats_callback(Arc::new(move |stats| {
