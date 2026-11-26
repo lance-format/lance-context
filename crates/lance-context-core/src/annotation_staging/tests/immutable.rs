@@ -46,6 +46,10 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
     let root = tempfile::tempdir()?;
     let base = empty(&root.path().join("body.lance")).await?;
     let staging = AnnotationStaging::new_immutable_body(base, scope(), 0, Limits::default())?;
+    let initial = staging.observation().await;
+    assert_eq!(initial.installed_base.rows, Some(0));
+    assert_eq!(initial.installed_base.source, scope());
+    assert!(initial.installed_base.immutable_body);
     let lookup = staging.capture_immutable_base().await?;
     let first = bodies(&["a", "a", "b"])?;
     assert_eq!(
@@ -121,9 +125,25 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         (scope(), 1)
     );
     assert!(!properties.contains_key(BODY_SNAPSHOT_PROPERTY));
+    // Even a committed dataset is not the installed read base until the
+    // publication installer switches it together with the materialized cut.
+    let before_install = staging.observation().await;
+    assert_eq!(before_install.installed_base, initial.installed_base);
+    assert_eq!(before_install.materialized, 0);
+    assert_eq!(before_install.applied, 2);
+    assert_eq!(before_install.active_entries, 1);
+    assert_eq!(before_install.frozen_entries, 2);
     staging
         .install_published(&prepared, selected.clone())
         .await?;
+    let installed = staging.observation().await;
+    assert_eq!(installed.installed_base.version, selected.version_id());
+    assert_eq!(installed.installed_base.rows, Some(2));
+    assert_eq!(installed.installed_base.source, scope());
+    assert_eq!(installed.materialized, 1);
+    assert_eq!(installed.applied, 2);
+    assert_eq!(installed.active_entries, 1);
+    assert_eq!(installed.frozen_entries, 0);
     assert_eq!(
         origin(&staging.capture_immutable_body("c").await?),
         origin(&c)

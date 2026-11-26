@@ -5,6 +5,8 @@ use std::{ops::Deref, sync::Weak};
 
 pub(super) struct Base {
     pub dataset: Arc<Dataset>,
+    // Computed once per installation, never on a read/observation hot path.
+    pub rows: Option<u64>,
     // Only validated index-only publications retain this identity. Data
     // publication, compaction and another staging instance invalidate lookups.
     values_identity: Arc<()>,
@@ -25,6 +27,7 @@ pub(super) struct Registry(Vec<Weak<Base>>);
 impl Registry {
     pub fn new(dataset: Arc<Dataset>) -> (Arc<Base>, Self) {
         let base = Arc::new(Base {
+            rows: manifest_rows(dataset.manifest()),
             dataset,
             values_identity: Arc::new(()),
         });
@@ -47,6 +50,7 @@ impl Registry {
     ) -> Arc<Base> {
         self.0.retain(|base| base.strong_count() != 0);
         let base = Arc::new(Base {
+            rows: manifest_rows(dataset.manifest()),
             dataset,
             values_identity,
         });
