@@ -78,6 +78,9 @@ async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows
         Some(ApplyOutcome::Applied)
     );
     let later = origin(&staging.capture_immutable_body("later").await?);
+    let observed = staging.observation().await;
+    assert_eq!(observed.immutable_lookup_reused, 0);
+    assert_eq!(observed.immutable_lookup_invalidated, 2);
     let rows = keys
         .iter()
         .map(|(key, present)| ImmutableRegistration {
@@ -85,6 +88,22 @@ async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows
             exists_in_base: *present,
         })
         .collect::<Vec<_>>();
+    let remaining = staging.entries.available_permits() as u32;
+    let held_entries = staging
+        .entries
+        .clone()
+        .acquire_many_owned(remaining)
+        .await
+        .unwrap();
+    let before_pressure = staging.observation().await;
+    assert_eq!(
+        staging
+            .register_immutable_committed(3, 4, &rows, &covered)
+            .await?,
+        Some(ApplyOutcome::Backpressure)
+    );
+    assert_eq!(staging.observation().await, before_pressure);
+    drop(held_entries);
     assert_eq!(
         staging
             .register_immutable_committed(3, 4, &rows, &covered)
@@ -100,6 +119,7 @@ async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows
         4
     );
     assert_eq!(staging.observation().await.active_entries, 2);
+    assert_eq!(staging.observation().await.immutable_lookup_reused, 1);
     for id in ["a", "b"] {
         assert!(matches!(
             staging.capture_immutable_body(id).await?.source(),
@@ -114,7 +134,7 @@ async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows
         .any(|base| base.version_id() == covered.dataset().version_id()));
     drop(versions);
     publish(&staging, &["c", "later"]).await?;
-    let before = staging.observation().await;
+    let mut before = staging.observation().await;
     assert_eq!(before.materialized, 4);
     // Now publication includes writes after capture. The old negative answer
     // must not authorize insertion of an already materialized row.
@@ -124,6 +144,7 @@ async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows
             .await?,
         None
     );
+    before.immutable_lookup_invalidated += 1;
     assert_eq!(staging.observation().await, before);
     drop((plain, nonblocking_plain, fresh, covered));
     let observed = staging.observation().await;
@@ -167,13 +188,16 @@ async fn covered_lookup_rejects_recovered_instance_and_native_maintenance() -> R
     let base = covered.dataset().clone();
     let recovered =
         AnnotationStaging::new_immutable_body(base.clone(), scope(), 2, Limits::default())?;
-    let before = recovered.observation().await;
+    let mut before = recovered.observation().await;
     assert_eq!(
         recovered
             .register_immutable_committed(2, 3, &request(&["new"]), &covered)
             .await?,
         None
     );
+    assert_eq!(before.immutable_lookup_reused, 0);
+    assert_eq!(before.immutable_lookup_invalidated, 0);
+    before.immutable_lookup_invalidated += 1;
     assert_eq!(recovered.observation().await, before);
 
     // Real native rewrite with the same cut; only verified frozen publications
@@ -181,7 +205,7 @@ async fn covered_lookup_rejects_recovered_instance_and_native_maintenance() -> R
     let transaction = super::super::compaction::compact(&base).await?;
     let selected = super::super::compaction::select(base, &transaction).await?;
     staging.install_compacted(&transaction, selected).await?;
-    let before = staging.observation().await;
+    let mut before = staging.observation().await;
     assert_eq!(before.materialized, 2);
     assert_eq!(
         staging
@@ -189,6 +213,7 @@ async fn covered_lookup_rejects_recovered_instance_and_native_maintenance() -> R
             .await?,
         None
     );
+    before.immutable_lookup_invalidated += 1;
     assert_eq!(staging.observation().await, before);
     let fresh = staging
         .try_capture_immutable_base_with_staged(&mut keys)
