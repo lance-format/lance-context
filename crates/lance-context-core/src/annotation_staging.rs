@@ -19,6 +19,7 @@ mod body;
 mod cold_points;
 mod compaction;
 mod immutable;
+mod manifest_rows;
 mod patch_lookup;
 mod preserve_id;
 mod publication;
@@ -29,6 +30,7 @@ mod status_filter;
 mod views;
 pub use body::{BodySnapshot, TurnBodySource, TurnRead, BODY_SNAPSHOT_PROPERTY};
 pub use immutable::{ImmutableBase, ImmutableBodyRead, ImmutableRegistration};
+pub use manifest_rows::manifest_rows;
 pub use patch_lookup::PatchLookup;
 pub use publication::{
     FrozenAnnotations, PreparedAnnotations, MAX_RESULTS_BYTES, RESULTS_PROPERTY,
@@ -162,9 +164,24 @@ pub struct AnnotationStaging {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledBase {
+    /// Scope of this staging instance and its materialized WAL position.
+    pub source: Scope,
+    pub version: u64,
+    /// Live rows in the installed dataset, excluding active/frozen staging.
+    /// None means its manifest lacks trustworthy counts; no scan is attempted.
+    pub rows: Option<u64>,
+    /// True for full immutable bodies; false for the annotation dataset.
+    pub immutable_body: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observation {
     pub applied: u64,
     pub materialized: u64,
+    /// Locally installed base, captured with materialized under one state lock.
+    /// May lag a committed/selected publication. Not a selection or GC proof.
+    pub installed_base: InstalledBase,
     pub active_entries: usize,
     pub frozen_entries: usize,
     /// Conservative allocation charges, including held values/generations.
@@ -666,6 +683,12 @@ impl AnnotationStaging {
         Observation {
             applied: state.applied,
             materialized: state.materialized,
+            installed_base: InstalledBase {
+                source: self.scope.clone(),
+                version: state.base.version_id(),
+                rows: state.base.rows,
+                immutable_body: self.immutable_body,
+            },
             active_entries: state.active.len(),
             frozen_entries: state.frozen.as_ref().map_or(0, |f| f.values.len()),
             retained_bytes: self.limits.retained_bytes - self.bytes.available_permits(),

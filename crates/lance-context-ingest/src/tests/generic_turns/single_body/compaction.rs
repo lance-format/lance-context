@@ -174,5 +174,8 @@ async fn full_body_compaction_preserves_bodies_row_ids_and_request_results() -> 
     drained(&c, &service, completed.index).await?;
     stop.send(()).unwrap();
     task.await??;
+    let installed = service.observation().await.0.installed_base;
+    assert_eq!(installed.rows, Some(6));
+    assert_eq!(installed.version, rewritten.version_id());
     c.shutdown().await
 }

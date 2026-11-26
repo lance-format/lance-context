@@ -320,7 +320,7 @@ impl Service {
                 through: snapshot.through,
                 uri: base.uri().to_owned(),
                 manifest: manifest.as_ref().clone(),
-                rows: read::selected_rows(base.manifest()),
+                rows: lance_context_core::annotation_staging::manifest_rows(base.manifest()),
             })
         })
         .await

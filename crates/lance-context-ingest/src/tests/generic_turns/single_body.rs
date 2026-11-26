@@ -161,6 +161,12 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     task.await??;
     drop(service);
     let (service, runtime) = owner(&c, &body, &spec).await?;
+    // Recovery observes the installed published snapshot before more apply.
+    let recovered = service.observation().await.0;
+    assert_eq!(recovered.installed_base.rows, Some(6));
+    assert_eq!(recovered.installed_base.version, selected.manifest.version);
+    assert_eq!(recovered.installed_base.source, selected.source);
+    assert_eq!(recovered.materialized, selected.through);
     let (stop, task) = run_owner(runtime);
     assert_eq!(
         service

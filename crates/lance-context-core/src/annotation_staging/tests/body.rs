@@ -517,8 +517,10 @@ async fn narrow_compaction_must_preserve_the_selected_body_reference() -> Result
         let result = staging
             .install_compacted(&transaction, selected.clone())
             .await;
+        let mut before = before;
         if mode == 0 {
             result?;
+            before.installed_base.version = selected.version_id();
             assert_eq!(BodySnapshot::read(&selected).await?, Some(reference));
         } else {
             assert!(result.is_err());
