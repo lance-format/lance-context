@@ -29,6 +29,12 @@ pub(super) async fn run(config: &Config, input: &str, log: &str, owner_config: &
         let value: serde_json::Value = serde_json::from_str(&line?)?;
         match value["event"].as_str() {
             Some("applied") => {
+                if let Some(start) = value.get("input_row_start") {
+                    ensure!(
+                        start.as_u64() == Some(acknowledged_rows as u64),
+                        "noncontiguous input row interval"
+                    );
+                }
                 let index = value["wal_index"].as_u64().context("missing ACK index")?;
                 ensure!(index > acknowledged, "nonmonotonic replay ACK");
                 acknowledged = index;

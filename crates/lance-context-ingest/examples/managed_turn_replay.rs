@@ -22,6 +22,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "managed_turn_replay/replay.rs"]
+mod replay;
 #[path = "managed_turn_replay/verify.rs"]
 mod verify;
 
@@ -39,7 +41,7 @@ struct Config {
     journal_directory: PathBuf,
 }
 
-fn encode(config: &Config, body: &RecordBatch) -> Result<Bytes> {
+fn frame(config: &Config, body: &RecordBatch) -> Result<RecordBatch> {
     let prepared = config
         .spec
         .prepare(body.clone(), config.limits.value_bytes)?;
@@ -75,15 +77,22 @@ fn encode(config: &Config, body: &RecordBatch) -> Result<Bytes> {
             new_null_array(&DataType::Float32, body.num_rows()),
         ],
     )?;
-    let batch = config.shard.bind_batch(&mixed::wire::creates_for(
+    config.shard.bind_batch(&mixed::wire::creates_for(
         &config.spec,
         body,
         &initial,
         &config.limits,
-    )?)?;
+    )?)
+}
+
+fn encode(config: &Config, bodies: &[RecordBatch]) -> Result<Bytes> {
+    let first = frame(config, &bodies[0])?;
     let mut bytes = Vec::new();
-    let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut bytes, &batch.schema())?;
-    writer.write(&batch)?;
+    let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut bytes, &first.schema())?;
+    writer.write(&first)?;
+    for body in &bodies[1..] {
+        writer.write(&frame(config, body)?)?;
+    }
     writer.finish()?;
     drop(writer);
     Ok(bytes.into())
@@ -154,7 +163,7 @@ async fn main() -> Result<()> {
     }
     ensure!(
         matches!(args.len(), 2 | 3),
-        "usage: managed_turn_replay <append|resume> CONFIG [ARROW_FILE]"
+        "usage: managed_turn_replay <append|append-batched|resume> CONFIG [ARROW_FILE]"
     );
     let config_bytes = std::fs::read(&args[1])?;
     ensure!(
@@ -224,7 +233,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let append = match args[0].as_str() {
-        "append" if args.len() == 3 => true,
+        "append" | "append-batched" if args.len() == 3 => true,
         "resume" if args.len() == 2 => false,
         _ => bail!("invalid mode/arguments"),
     };
@@ -304,44 +313,11 @@ async fn main() -> Result<()> {
             reader.schema() == *config.spec.body_schema(),
             "foreign input schema"
         );
-        for (batch_index, batch) in reader.enumerate() {
-            let batch = batch?;
-            let mut offset = 0;
-            while offset < batch.num_rows() {
-                let mut count = (batch.num_rows() - offset).min(config.binding.max_rows as usize);
-                let bytes = loop {
-                    let bytes = encode(&config, &batch.slice(offset, count))?;
-                    if bytes.len() <= config.binding.max_record_bytes as usize {
-                        break bytes;
-                    }
-                    ensure!(
-                        count > 1,
-                        "one body exceeds the configured WAL record limit"
-                    );
-                    count = count.div_ceil(2);
-                };
-                let length = bytes.len();
-                let sent = Instant::now();
-                let reply = client.append(0, bytes).await?;
-                ensure!(
-                    matches!(reply.completion.result, MutationResult::Applied),
-                    "committed mutation rejected: {:?}",
-                    reply.completion.result
-                );
-                let elapsed = sent.elapsed().as_secs_f64();
-                through = reply.completion.index;
-                rows += count;
-                wire_bytes += length;
-                latencies.push(elapsed);
-                println!(
-                    "{}",
-                    serde_json::json!({"event":"applied","input_batch":batch_index,"offset":offset,
-                    "rows":count,"bytes":length,"sequence":reply.completion.meta.sequence,
-                    "wal_index":through,"seconds":elapsed})
-                );
-                offset += count;
-            }
-        }
+        let report = replay::run(&config, &client, reader, args[0] == "append-batched").await?;
+        through = report.through;
+        rows = report.rows;
+        wire_bytes = report.bytes;
+        latencies = report.latencies;
     } else if let Some(reply) = client.resume(0).await? {
         ensure!(
             matches!(reply.completion.result, MutationResult::Applied),

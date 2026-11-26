@@ -118,6 +118,7 @@ cargo build --locked -p lance-context-ingest --features service,http-client \
 managed_turn_replay spec input.arrow session_id session_id id > turn-spec.json
 managed_turn_replay validate replay.json input.arrow
 managed_turn_replay append replay.json input.arrow
+managed_turn_replay append-batched fresh-replay.json input.arrow
 managed_turn_replay resume replay.json
 managed_turn_replay verify replay.json input.arrow replay.log owner.json
 managed_turn_replay slot owner.json GROUP SLOT
@@ -145,7 +146,9 @@ For wide schemas, the existing service-test configuration uses
 that directory and producer tuple; `resume` resolves its pending intent and
 waits for its selected publication. It does not resume a source reader or infer
 which later file rows to skip. Each successful request reports the input batch,
-row interval, producer sequence and WAL index. The final JSON reports the exact
+row interval, producer sequence and WAL index. Current replay output uses an
+absolute input row start and count, including when a request spans source batches.
+The final JSON reports the exact
 selected body reference and covered cut. Preserve version numbers as `u64` or
 raw JSON: detached versions can exceed JavaScript's exact integer range.
 
@@ -157,6 +160,14 @@ test expects a fresh destination containing only that input's unique keys. It
 prints only counts and snapshot identities. Its expected input is limited to
 128 MiB IPC, one million rows and 512 MiB of unique Arrow buffer allocations;
 these limits are verifier bounds, not a native scanner RSS quota.
+
+`append-batched` groups consecutive input batches toward half the configured
+record byte limit, while respecting the row limit. It writes them into one IPC
+file without concatenating body arrays. If actual encoded bytes exceed the
+record limit, it splits the group with shared Arrow slices before sending.
+It uses a fresh journal and one sequential producer lane, just like `append`.
+Compare it with `append` on the same input and controlled cold/warm state;
+duplicate-only replays do not measure throughput for newly inserted rows.
 
 The reported times measure this sequential replay, including client journal
 sync, encoding, RPC and publication waiting. They are not a sustained capacity
