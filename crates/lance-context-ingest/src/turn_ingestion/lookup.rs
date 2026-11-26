@@ -53,9 +53,27 @@ impl TurnLookup {
 
 impl TurnIngestionSpec {
     pub(crate) fn lookup_workspace(&self, lengths: impl Iterator<Item = usize>) -> Result<usize> {
-        let names = self.primary_key.iter().try_fold(0usize, |total, name| total.checked_add(name.len().checked_mul(8)?)).context("body lookup field names overflow")?;
-        let nodes = self.primary_key.len().checked_add(1).and_then(|columns| columns.checked_mul(512)).context("body lookup key columns overflow")?;
-        lengths.into_iter().try_fold(names, |total, length| total.checked_add(length.checked_mul(8)?)?.checked_add(nodes)).context("body lookup workspace overflow")
+        let names = self
+            .primary_key
+            .iter()
+            .try_fold(0usize, |total, name| {
+                total.checked_add(name.len().checked_mul(8)?)
+            })
+            .context("body lookup field names overflow")?;
+        let nodes = self
+            .primary_key
+            .len()
+            .checked_add(1)
+            .and_then(|columns| columns.checked_mul(512))
+            .context("body lookup key columns overflow")?;
+        lengths
+            .into_iter()
+            .try_fold(names, |total, length| {
+                total
+                    .checked_add(length.checked_mul(8)?)?
+                    .checked_add(nodes)
+            })
+            .context("body lookup workspace overflow")
     }
     /// Resolve the entire admitted key window with one scan of one snapshot.
     /// The caller accumulates unresolved keys across incoming frames before

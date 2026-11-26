@@ -8,7 +8,10 @@ const KEY: &str = "lance-context.immutable-turn-body.v1";
 
 pub(super) fn budget_parts(limit: usize) -> Result<(usize, usize)> {
     const MIB: usize = 1 << 20;
-    ensure!(limit >= 4 * MIB, "single body apply needs at least four MiB");
+    ensure!(
+        limit >= 4 * MIB,
+        "single body apply needs at least four MiB"
+    );
     let lookup = (limit / (4 * MIB)).max(1) * MIB;
     Ok((limit - lookup, lookup))
 }
@@ -83,7 +86,7 @@ pub fn contract(
 ) -> Result<IngestContract> {
     Ok(IngestContract {
         policy: WritePolicy::TurnIngestion,
-        schema: arrow_schema_fingerprint(&wire_schema(spec, limits, shard)?)?,
+        schema: arrow_schema_fingerprint(wire_schema(spec, limits, shard)?.as_ref())?,
         ..binding.contract()?
     })
 }
@@ -186,7 +189,13 @@ impl Service {
             .as_ref()
             .context("missing body spec")?;
         Ok(spec
-            .lookup_existing(base.dataset().clone(), keys, self.lookup_budget.as_ref().context("missing body lookup budget")?)
+            .lookup_existing(
+                base.dataset().clone(),
+                keys,
+                self.lookup_budget
+                    .as_ref()
+                    .context("missing body lookup budget")?,
+            )
             .await?
             .map(|keys| Lookup { base, keys }))
     }
@@ -273,7 +282,7 @@ impl Service {
                 },
                 through: snapshot.through,
                 uri: base.uri().to_owned(),
-                manifest,
+                manifest: manifest.as_ref().clone(),
             })
         })
         .await

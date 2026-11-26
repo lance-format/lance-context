@@ -376,8 +376,13 @@ impl Service {
             let (frames, lookup) = single_body::budget_parts(apply_budget.limit())?;
             ensure!(decode_workspace(&contract, limits, contract.max_record_bytes as usize)? <= frames,
                 "single body record exceeds frame workspace after reserving historical lookup capacity");
-            ensure!(spec.lookup_workspace(std::iter::repeat_n(limits.value_bytes, contract.max_rows as usize))? <= lookup,
-                "single body maximum key batch exceeds reserved historical lookup capacity");
+            ensure!(
+                spec.lookup_workspace(std::iter::repeat_n(
+                    limits.value_bytes,
+                    contract.max_rows as usize
+                ))? <= lookup,
+                "single body maximum key batch exceeds reserved historical lookup capacity"
+            );
         }
         Ingress::connect_with_schema(client, layout, binding, budget, contract, schema).await
     }
@@ -409,7 +414,10 @@ impl Service {
         // These two budgets partition, rather than increase, configured apply memory.
         let (apply_budget, lookup_budget) = if immutable {
             let (frames, lookup) = single_body::budget_parts(apply_budget.limit())?;
-            (MergeMemoryBudget::new(frames), Some(MergeMemoryBudget::new(lookup)))
+            (
+                MergeMemoryBudget::new(frames),
+                Some(MergeMemoryBudget::new(lookup)),
+            )
         } else {
             (apply_budget, None)
         };
@@ -1045,10 +1053,15 @@ impl Driver {
             }
         }
         let pending = self.pending.as_ref().unwrap();
-        let missing_body_lookup = service.is_single_body() && match &pending.decoded {
-            mixed::Decoded::Creates { rows, .. } => self.lookup.bodies.as_ref().is_none_or(|lookup| rows.iter().any(|row| lookup.keys.get(&row.turn).is_none())),
-            _ => true,
-        };
+        let missing_body_lookup = service.is_single_body()
+            && match &pending.decoded {
+                mixed::Decoded::Creates { rows, .. } => {
+                    self.lookup.bodies.as_ref().is_none_or(|lookup| {
+                        rows.iter().any(|row| lookup.keys.get(&row.turn).is_none())
+                    })
+                }
+                _ => true,
+            };
         if missing_body_lookup {
             self.lookup.bodies = None;
             let mut keys = Vec::new();
@@ -1060,7 +1073,9 @@ impl Driver {
             }
             self.lookup.bodies = service.lookup_bodies(&keys).await?;
             if self.lookup.bodies.is_none() && !self.lookahead.is_empty() {
-                let mixed::Decoded::Creates { rows, .. } = &pending.decoded else { unreachable!() };
+                let mixed::Decoded::Creates { rows, .. } = &pending.decoded else {
+                    unreachable!()
+                };
                 let keys = rows.iter().map(|row| row.turn.as_str()).collect::<Vec<_>>();
                 self.lookup.bodies = service.lookup_bodies(&keys).await?;
             }
