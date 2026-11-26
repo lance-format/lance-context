@@ -163,15 +163,23 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     // lookup, otherwise an all-duplicate burst can stop apply and publication.
     let mut burst = Vec::new();
     for slot in 3..11 {
-        let lane = producer(&service, slot).await?;
-        burst.push(request(&service, &lane, 1, encode_body(0)?).await?);
+        burst.push(producer(&service, slot).await?);
     }
-    let completed = futures::future::try_join_all(
-        burst
-            .iter()
-            .map(|request| service.submit(request, DEADLINE)),
+    let encoded = encode_body(0)?;
+    // Admission and sending belong to the same future: retaining every upload
+    // before sending any would deliberately fill the bounded upload budget.
+    let completed = tokio::time::timeout(
+        DEADLINE,
+        futures::future::try_join_all(burst.iter().map(|lane| {
+            let body = encoded.clone();
+            let service = &service;
+            async move {
+                let request = request(service, lane, 1, body).await?;
+                service.submit(&request, DEADLINE).await
+            }
+        })),
     )
-    .await?;
+    .await??;
     assert!(completed
         .iter()
         .all(|result| result.result == MutationResult::Applied));
