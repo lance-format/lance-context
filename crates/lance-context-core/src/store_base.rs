@@ -75,7 +75,6 @@ use crate::store::{CompactionConfig, CompactionStats, DroppedFragment, RepairRep
 
 mod grouped;
 pub use grouped::PreparedShardMerge;
-mod append_merge;
 mod index_maintenance;
 pub use index_maintenance::PreparedIndexOptimization;
 use index_maintenance::PreparedIndexSource;
@@ -302,7 +301,6 @@ pub struct PreparedMerge {
     reservation: Option<MergeReservation>,
     bulk_key_delete: bool,
     parallel_upsert_io: bool,
-    append_only: bool,
     staged: Option<StagedMergeFiles>,
     preparation_owner: Option<crate::merge_write_scope::PreparationOwner>,
 }
@@ -362,15 +360,6 @@ async fn encode_merge_files(
 }
 
 impl PreparedMerge {
-    /// Append immutable rows without looking up or replacing existing base keys.
-    /// WAL generation watermarks still make merge retries idempotent. Repeated
-    /// ingestion across generations or shards can leave duplicate base rows;
-    /// callers must deduplicate identical records when reading. This mode does
-    /// not support updates, tombstones, or a uniqueness guarantee on base keys.
-    pub fn use_append_only(&mut self) {
-        self.append_only = true;
-    }
-
     /// Opt in to a key-only hash-join deletion before the normal append.
     /// Publication, WAL draining, and replay semantics remain unchanged.
     /// Full BTree coverage can be faster with predicate deletion; callers must
@@ -1494,7 +1483,6 @@ impl StorageBase {
             reservation,
             bulk_key_delete: false,
             parallel_upsert_io: false,
-            append_only: false,
             staged: None,
             preparation_owner: crate::merge_write_scope::preparation_owner(),
         }))
@@ -1517,12 +1505,11 @@ impl StorageBase {
     /// `replay_after_wal_entry_position` and `wal_entry_position_last_seen`,
     /// which a concurrent flush advances; `..current.clone()` carries them.
     ///
-    /// The default base write replaces existing `key_column` values. Explicit
-    /// append-only preparations instead retain immutable copies across merges.
-    /// Both modes publish generation coverage atomically with the rows, so a
-    /// crash between base commit and shard drain is reconciled without replaying
-    /// those generations. Separate ingest retries require application dedup in
-    /// append-only mode.
+    /// The base write is a merge-insert keyed by `key_column`, so even if a
+    /// crash interrupts the sequence (data committed but the shard manifest not
+    /// yet drained), retrying the same generations replaces those keys instead
+    /// of appending physical duplicates. The next attempt can then drain the
+    /// manifest without relying on a particular Lance read-plan shape.
     async fn commit_merge(
         &mut self,
         manifest_store: &ShardManifestStore,
@@ -1542,7 +1529,6 @@ impl StorageBase {
             reservation,
             bulk_key_delete,
             parallel_upsert_io,
-            append_only,
             staged,
             preparation_owner: _,
         } = prepared;
@@ -1591,25 +1577,14 @@ impl StorageBase {
         if !batches.is_empty() {
             observe_phase!(
                 "append",
-                Box::pin(async {
-                    if append_only {
-                        if let Some(files) = &staged {
-                            files.validate(&self.dataset)?;
-                        }
-                        self.append_prepared_batches(batches, watermark, staged)
-                            .await
-                    } else {
-                        self.merge_prepared_batches(
-                            batches,
-                            merge_schema,
-                            watermark,
-                            bulk_key_delete,
-                            parallel_upsert_io,
-                            staged,
-                        )
-                        .await
-                    }
-                })
+                Box::pin(self.merge_prepared_batches(
+                    batches,
+                    merge_schema,
+                    watermark,
+                    bulk_key_delete,
+                    parallel_upsert_io,
+                    staged
+                ))
                 .await
             )?;
             self.pinned_version = None;

@@ -13,6 +13,9 @@ type Result<T> = std::result::Result<T, String>;
 
 mod pipeline;
 
+#[cfg(test)]
+mod managed_tests;
+
 type StageResult = std::result::Result<Option<StagedAppend>, (AppendPlan, String)>;
 
 fn collect_stage(
@@ -45,6 +48,11 @@ fn collect_stage(
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct AppendConfig {
+    /// Run immutable registered-store merges through the existing local append
+    /// executor. Requires worker base maintenance to be disabled and drained.
+    /// Physical ingest/replay duplicates are allowed; application readers deduplicate.
+    #[arg(long, env = "MANAGED_IMMUTABLE_APPEND", default_value_t = false)]
+    pub managed_immutable_append: bool,
     /// Opt-in immutable rollout targets. '*' selects all owned rollouts.
     #[arg(long, env = "ROLLOUT_APPEND_TARGETS", value_delimiter = ',')]
     pub rollout_append_targets: Vec<String>,
@@ -86,6 +94,7 @@ pub struct AppendConfig {
 impl Default for AppendConfig {
     fn default() -> Self {
         Self {
+            managed_immutable_append: false,
             rollout_append_targets: Vec::new(),
             rollout_append_concurrency: 4,
             rollout_append_max_generations: 64,
@@ -98,11 +107,28 @@ impl Default for AppendConfig {
     }
 }
 impl AppendConfig {
+    pub(crate) fn managed(&self, config: &crate::config::MasterConfig, target: &str) -> bool {
+        self.managed_immutable_append
+            && config.managed_store_kind.as_deref().is_some_and(|kind| {
+                target
+                    .strip_prefix(kind)
+                    .and_then(|tail| tail.strip_prefix(':'))
+                    .is_some_and(|name| lance_context_core::validate_store_name(name).is_ok())
+            })
+    }
+
     pub(crate) fn local(&self, target: &str) -> bool {
         self.rollout_append_local && self.enabled(target)
     }
 
     pub(crate) fn validate_local(&self, config: &crate::config::MasterConfig) -> Result<()> {
+        if self.managed_immutable_append
+            && (config.managed_store_kind.is_none()
+                || !self.rollout_append_local
+                || !config.maintenance.fence_legacy_maintenance)
+        {
+            return Err("managed immutable append requires a registered kind, local append and fenced maintenance".into());
+        }
         if !self.rollout_append_local {
             return Ok(());
         }
@@ -115,7 +141,7 @@ impl AppendConfig {
                 "resident local append cannot be combined with Kubernetes catch-up mode".into(),
             );
         }
-        if self.rollout_append_targets.is_empty()
+        if (self.rollout_append_targets.is_empty() && !self.managed_immutable_append)
             || config.catchup.shards.is_empty()
             || config.catchup.shards.len() > 256
             || config.catchup.shards.iter().any(|s| s.is_empty())
@@ -186,6 +212,62 @@ struct Capabilities {
     owned_targets: Vec<String>,
     #[serde(default)]
     drain_targets: Vec<String>,
+}
+
+#[derive(Clone)]
+struct AppendSource {
+    uri: String,
+    options: Option<lance_context_core::rollout_append::AppendOptions>,
+}
+
+impl AppendSource {
+    async fn resolve(state: &MasterState, target: &str) -> Result<Self> {
+        let uri = state
+            .maintenance_uri(target)
+            .await
+            .map_err(|e| e.to_string())?;
+        let options = if state.registered_target(target).is_some() {
+            if !state.config.append.managed(&state.config, target) {
+                return Err("registered append was not explicitly enabled".into());
+            }
+            let store = crate::registered_store::open(state, &uri)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut options = lance_context_core::rollout_append::AppendOptions::new(
+                Arc::new(store.dataset().schema().into()),
+                store.key_column(),
+            );
+            options.replay_policy =
+                lance_context_core::rollout_append::ReplayPolicy::AllowDuplicates;
+            options.session = state.rollout_session.clone();
+            Some(options)
+        } else {
+            None
+        };
+        Ok(Self { uri, options })
+    }
+
+    async fn stage(&self, plan: AppendPlan, local: LocalStaging) -> Result<StagedAppend> {
+        let result = if let Some(mut options) = self.options.clone() {
+            options.session = Some(local.session);
+            lance_context_core::rollout_append::stage_with_options(
+                &self.uri,
+                plan,
+                local.budget,
+                options,
+            )
+            .await
+        } else {
+            lance_context_core::rollout_append::stage(
+                &self.uri,
+                plan,
+                local.budget,
+                Some(local.session),
+            )
+            .await
+        };
+        result.map_err(|e| e.to_string())
+    }
 }
 
 async fn stage_remote(
@@ -321,14 +403,19 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
     if local_execution && shards.is_empty() {
         return Err("no stable WAL shard identities configured".into());
     }
-    let mut coordinator = AppendCoordinator::open(
-        &state.rollout_uri(target),
-        Some(lance_context_core::RolloutStore::build_session(
-            32 * 1024 * 1024,
-            32 * 1024 * 1024,
-        )),
-    )
-    .await
+    let source = AppendSource::resolve(state, target).await?;
+    let mut coordinator = if let Some(options) = source.options.clone() {
+        AppendCoordinator::open_with_options(&source.uri, options).await
+    } else {
+        AppendCoordinator::open(
+            &source.uri,
+            Some(lance_context_core::RolloutStore::build_session(
+                32 * 1024 * 1024,
+                32 * 1024 * 1024,
+            )),
+        )
+        .await
+    }
     .map_err(|e| e.to_string())?;
     let started = tokio::time::Instant::now();
     let mut total = 0;
@@ -338,7 +425,15 @@ pub(crate) async fn run(state: &Arc<MasterState>, target: &str) -> Result<String
         {
             break;
         }
-        let reclaimed = run_pass(state, target, &endpoints, &shards, &mut coordinator).await?;
+        let reclaimed = run_pass(
+            state,
+            target,
+            &endpoints,
+            &shards,
+            &mut coordinator,
+            &source,
+        )
+        .await?;
         total += reclaimed;
         // Skipping not-yet-started staging during drain must leave durable
         // demand even when this pass reclaimed nothing.
@@ -373,6 +468,7 @@ async fn run_pass(
     endpoints: &[String],
     shards: &[String],
     coordinator: &mut AppendCoordinator,
+    source: &AppendSource,
 ) -> Result<usize> {
     let config = &state.config.append;
     let (plans, mut reclaimed) = coordinator
@@ -396,7 +492,7 @@ async fn run_pass(
         let routes = (!endpoints.is_empty()).then(|| (
             endpoints[i % endpoints.len()].clone(), endpoints[(i + 1) % endpoints.len()].clone()));
         let target = target.to_owned();
-        let uri = state.rollout_uri(&target);
+        let source = source.clone();
         let local = local.clone();
         async move {
             // Checked when buffer capacity admits this future, not when plans
@@ -406,8 +502,7 @@ async fn run_pass(
                 return Ok(None);
             }
             let result = if let Some(local) = local {
-                lance_context_core::rollout_append::stage(&uri, plan.clone(), local.budget, Some(local.session))
-                    .await.map_err(|e| e.to_string())
+                source.stage(plan.clone(), local).await
             } else {
                 let (endpoint, fallback) = routes.expect("ordinary master requires staging endpoints");
                 match stage_remote(&client, &endpoint, &target, plan.clone()).await {
@@ -463,14 +558,7 @@ async fn run_pass(
             break;
         }
         let local = local.as_ref().unwrap();
-        match lance_context_core::rollout_append::stage(
-            &state.rollout_uri(target),
-            plan,
-            local.budget.clone(),
-            Some(local.session.clone()),
-        )
-        .await
-        {
+        match source.stage(plan, local.clone()).await {
             Ok(part) => {
                 reclaimed += coordinator
                     .commit(vec![part])

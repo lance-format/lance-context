@@ -44,6 +44,9 @@ pub(crate) fn enabled(config: &MasterConfig) -> bool {
 }
 
 pub(crate) fn selected(config: &MasterConfig, target: &str) -> bool {
+    if config.append.managed(config, target) {
+        return config.append.rollout_append_local && !config.merge_rollout.draining(target);
+    }
     let name = target.strip_prefix("generic:").unwrap_or(target);
     let dynamic = config.local_merge.master_local_merge_auto
         && config.merge_rollout.fence_legacy

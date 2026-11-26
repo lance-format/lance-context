@@ -321,7 +321,7 @@ impl MasterConfig {
             return Err(lance::Error::invalid_input("invalid managed store kind"));
         }
         let prefix = format!("{kind}:");
-        if self
+        let native_maintenance = self
             .merge_rollout
             .owned_targets
             .iter()
@@ -331,8 +331,8 @@ impl MasterConfig {
             .any(|target| target == "*" || target.starts_with(&prefix))
             || self.merge_rollout.fence_legacy
             || self.maintenance.fence_legacy_maintenance
-            || self.local_merge.master_local_merge_auto
-        {
+            || self.local_merge.master_local_merge_auto;
+        if native_maintenance && !self.append.managed_immutable_append {
             return Err(lance::Error::invalid_input(
                 "registered stores require worker-owned legacy maintenance",
             ));

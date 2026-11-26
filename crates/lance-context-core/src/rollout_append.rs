@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::{Array, BooleanArray, RecordBatch, StringArray};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use arrow_select::filter::filter_record_batch;
 use datafusion::prelude::{col, lit};
 use futures::TryStreamExt;
@@ -32,6 +32,68 @@ const REPLAY_RANGES_PREFIX: &str = "lance-context.rollout-append.replay-ranges."
 
 pub const MAX_PLAN_GENERATIONS: usize = 256;
 pub const MAX_STAGE_BYTES: usize = 256 * 1024 * 1024;
+
+/// How immutable ingest/replay copies already in base are handled. Generation
+/// watermarks protect merge retries in both modes, not arbitrary ingest retries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReplayPolicy {
+    /// Preserve rollout cutover/replay checks against existing base keys.
+    #[default]
+    CheckBase,
+    /// Skip base-key checks. Readers must deduplicate immutable identities,
+    /// including physical copies across shards, generations and writer restarts.
+    AllowDuplicates,
+}
+
+/// Trusted, application-owned schema and storage configuration. Never populate
+/// this from an untrusted staging RPC; resolve it from the table's registration.
+#[derive(Clone)]
+pub struct AppendOptions {
+    pub schema: Arc<Schema>,
+    /// One Utf8 identity column; updates and tombstones are not supported.
+    pub key_column: String,
+    pub replay_policy: ReplayPolicy,
+    pub storage_options: Option<HashMap<String, String>>,
+    pub session: Option<Arc<Session>>,
+}
+
+impl AppendOptions {
+    pub fn new(schema: Arc<Schema>, key_column: impl Into<String>) -> Self {
+        Self {
+            schema,
+            key_column: key_column.into(),
+            replay_policy: ReplayPolicy::CheckBase,
+            storage_options: None,
+            session: None,
+        }
+    }
+
+    fn rollout(session: Option<Arc<Session>>) -> Self {
+        Self {
+            session,
+            ..Self::new(Arc::new(crate::rollout_schema()), "id")
+        }
+    }
+
+    fn validate(&self, dataset: &Dataset) -> Result<()> {
+        if dataset.manifest().data_storage_format.version
+            == lance_file::version::ConcreteFileVersion::V1
+        {
+            return Err(Error::invalid_input(
+                "append staging requires Lance V2 files",
+            ));
+        }
+        if Schema::from(dataset.schema()) != *self.schema {
+            return Err(Error::invalid_input(
+                "append schema does not match the dataset",
+            ));
+        }
+        if self.schema.field_with_name(&self.key_column)?.data_type() != &DataType::Utf8 {
+            return Err(Error::invalid_input("append key must be Utf8"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
@@ -423,29 +485,28 @@ async fn dataset_has_sealed_wal(dataset: &Dataset, shards: &[String]) -> Result<
 /// table commits and shard drains retain ownership checks and version fencing.
 pub struct AppendCoordinator {
     dataset: Dataset,
+    options: AppendOptions,
     pub(crate) wal_collection: crate::wal_gc::Mode,
 }
 
 impl AppendCoordinator {
     pub async fn open(uri: &str, session: Option<Arc<Session>>) -> Result<Self> {
+        Self::open_with_options(uri, AppendOptions::rollout(session)).await
+    }
+
+    /// Open the existing append coordinator for an immutable application schema.
+    pub async fn open_with_options(uri: &str, options: AppendOptions) -> Result<Self> {
         // Do not open a resident shard writer or evolve schema on a staging worker.
-        let dataset = StorageBase::load_with_options(uri, None, session).await?;
-        let actual: Schema = dataset.schema().into();
-        let expected = crate::rollout_schema();
-        if dataset.manifest().data_storage_format.version
-            == lance_file::version::ConcreteFileVersion::V1
-        {
-            return Err(Error::invalid_input(
-                "rollout staging requires Lance V2 files",
-            ));
-        }
-        if actual != expected {
-            return Err(Error::invalid_input(
-                "rollout append requires the current rollout schema",
-            ));
-        }
+        let dataset = StorageBase::load_with_options(
+            uri,
+            options.storage_options.clone(),
+            options.session.clone(),
+        )
+        .await?;
+        options.validate(&dataset)?;
         Ok(Self {
             dataset,
+            options,
             wal_collection: crate::wal_gc::Mode::configured()?,
         })
     }
@@ -477,6 +538,7 @@ impl AppendCoordinator {
             return Err(Error::invalid_input("invalid rollout append limits"));
         }
         self.dataset.checkout_latest().await?;
+        self.options.validate(&self.dataset)?;
         let mut unique = HashSet::new();
         for name in shards {
             if !unique.insert(derive_shard_id(Some(name))) {
@@ -507,101 +569,108 @@ impl AppendCoordinator {
                 continue;
             };
             crate::merge_write_scope::checkpoint();
-            let key = format!("{CUTOVER_PREFIX}{shard}");
-            let epoch_key = format!("{WRITER_EPOCH_PREFIX}{shard}");
-            let previous_cutoff = self
-                .dataset
-                .metadata()
-                .get(&key)
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| Error::io("invalid rollout cutover"))
-                })
-                .transpose()?;
-            let previous_epoch = self
-                .dataset
-                .metadata()
-                .get(&epoch_key)
-                .map(|value| {
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| Error::io("invalid rollout writer epoch"))
-                })
-                .transpose()?;
-            if previous_epoch.is_some() && previous_cutoff.is_none() {
-                return Err(Error::io("rollout writer epoch has no replay boundary"));
-            }
-            if previous_epoch.is_some_and(|epoch| epoch > manifest.writer_epoch) {
-                return Err(Error::io("rollout writer epoch moved backwards"));
-            }
-            let prior_ranges = ReplayRanges::load(&self.dataset, shard)?;
-            let cutoff = if previous_epoch != Some(manifest.writer_epoch) || prior_ranges.is_none()
-            {
-                let high = manifest
-                    .sstables
-                    .iter()
-                    .map(|g| g.generation)
-                    .max()
-                    .unwrap_or(0)
-                    .max(manifest.current_generation)
-                    .max(previous_cutoff.unwrap_or(0));
-                let mut state = if let Some(mut state) = prior_ranges {
-                    match replay_generations(
-                        &shard_store(&self.dataset, shard).await?,
-                        &state,
-                        &manifest,
-                    )
-                    .await
-                    {
-                        Ok(ranges) => state.ranges.extend(ranges),
-                        Err(error) => {
-                            tracing::warn!(%shard, %error, "using conservative rollout replay boundary");
-                            state.ranges.push((0, high));
-                        }
-                    }
-                    state
-                } else {
-                    let conservative = ReplayRanges {
-                        epoch: manifest.writer_epoch,
-                        through: high,
-                        manifest_version: manifest.version,
-                        ranges: vec![(
-                            0,
-                            if previous_epoch == Some(manifest.writer_epoch) {
-                                previous_cutoff.unwrap_or(high)
-                            } else {
-                                high
-                            },
-                        )],
-                    };
-                    if previous_epoch.is_some() {
-                        match import_replay_ranges(&self.dataset, shard, &manifest, high).await {
-                            Ok(state) => state,
+            let cutoff = if self.options.replay_policy == ReplayPolicy::AllowDuplicates {
+                0
+            } else {
+                let key = format!("{CUTOVER_PREFIX}{shard}");
+                let epoch_key = format!("{WRITER_EPOCH_PREFIX}{shard}");
+                let previous_cutoff = self
+                    .dataset
+                    .metadata()
+                    .get(&key)
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| Error::io("invalid rollout cutover"))
+                    })
+                    .transpose()?;
+                let previous_epoch = self
+                    .dataset
+                    .metadata()
+                    .get(&epoch_key)
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| Error::io("invalid rollout writer epoch"))
+                    })
+                    .transpose()?;
+                if previous_epoch.is_some() && previous_cutoff.is_none() {
+                    return Err(Error::io("rollout writer epoch has no replay boundary"));
+                }
+                if previous_epoch.is_some_and(|epoch| epoch > manifest.writer_epoch) {
+                    return Err(Error::io("rollout writer epoch moved backwards"));
+                }
+                let prior_ranges = ReplayRanges::load(&self.dataset, shard)?;
+                let cutoff = if previous_epoch != Some(manifest.writer_epoch)
+                    || prior_ranges.is_none()
+                {
+                    let high = manifest
+                        .sstables
+                        .iter()
+                        .map(|g| g.generation)
+                        .max()
+                        .unwrap_or(0)
+                        .max(manifest.current_generation)
+                        .max(previous_cutoff.unwrap_or(0));
+                    let mut state = if let Some(mut state) = prior_ranges {
+                        match replay_generations(
+                            &shard_store(&self.dataset, shard).await?,
+                            &state,
+                            &manifest,
+                        )
+                        .await
+                        {
+                            Ok(ranges) => state.ranges.extend(ranges),
                             Err(error) => {
-                                tracing::warn!(%shard, %error, "preserving legacy rollout replay prefix");
-                                conservative
+                                tracing::warn!(%shard, %error, "using conservative rollout replay boundary");
+                                state.ranges.push((0, high));
                             }
                         }
+                        state
                     } else {
-                        // Initial cutover: the old commit/drain ambiguity must
-                        // be checked once. Future restarts add only replayed generations.
-                        conservative
-                    }
+                        let conservative = ReplayRanges {
+                            epoch: manifest.writer_epoch,
+                            through: high,
+                            manifest_version: manifest.version,
+                            ranges: vec![(
+                                0,
+                                if previous_epoch == Some(manifest.writer_epoch) {
+                                    previous_cutoff.unwrap_or(high)
+                                } else {
+                                    high
+                                },
+                            )],
+                        };
+                        if previous_epoch.is_some() {
+                            match import_replay_ranges(&self.dataset, shard, &manifest, high).await
+                            {
+                                Ok(state) => state,
+                                Err(error) => {
+                                    tracing::warn!(%shard, %error, "preserving legacy rollout replay prefix");
+                                    conservative
+                                }
+                            }
+                        } else {
+                            // Initial cutover: the old commit/drain ambiguity must
+                            // be checked once. Future restarts add only replayed generations.
+                            conservative
+                        }
+                    };
+                    state.epoch = manifest.writer_epoch;
+                    state.through = high;
+                    state.manifest_version = manifest.version;
+                    state.normalize(marks.get(&shard).copied());
+                    cutovers.insert(
+                        format!("{REPLAY_RANGES_PREFIX}{shard}"),
+                        serde_json::to_string(&state)?,
+                    );
+                    cutovers.insert(key, high.to_string());
+                    cutovers.insert(epoch_key, manifest.writer_epoch.to_string());
+                    high
+                } else {
+                    previous_cutoff.unwrap_or(0)
                 };
-                state.epoch = manifest.writer_epoch;
-                state.through = high;
-                state.manifest_version = manifest.version;
-                state.normalize(marks.get(&shard).copied());
-                cutovers.insert(
-                    format!("{REPLAY_RANGES_PREFIX}{shard}"),
-                    serde_json::to_string(&state)?,
-                );
-                cutovers.insert(key, high.to_string());
-                cutovers.insert(epoch_key, manifest.writer_epoch.to_string());
-                high
-            } else {
-                previous_cutoff.unwrap_or(0)
+                cutoff
             };
             let mut generations: Vec<_> = manifest
                 .sstables
@@ -772,30 +841,41 @@ pub async fn stage(
     budget: Arc<MergeMemoryBudget>,
     session: Option<Arc<Session>>,
 ) -> Result<StagedAppend> {
+    stage_with_options(uri, plan, budget, AppendOptions::rollout(session)).await
+}
+
+/// Stage an immutable application's WAL using the same bounded encoder and
+/// publication protocol as rollout. The options must match the coordinator.
+pub async fn stage_with_options(
+    uri: &str,
+    plan: AppendPlan,
+    budget: Arc<MergeMemoryBudget>,
+    options: AppendOptions,
+) -> Result<StagedAppend> {
     plan.validate()?;
-    let dataset = StorageBase::load_with_options(uri, None, session.clone())
-        .await?
-        .checkout_version(plan.base_version)
-        .await?;
+    let dataset = StorageBase::load_with_options(
+        uri,
+        options.storage_options.clone(),
+        options.session.clone(),
+    )
+    .await?
+    .checkout_version(plan.base_version)
+    .await?;
+    options.validate(&dataset)?;
     let dataset_uri = dataset.uri().to_owned();
-    let schema: Arc<Schema> = Arc::new(dataset.schema().into());
-    if dataset.manifest().data_storage_format.version
-        == lance_file::version::ConcreteFileVersion::V1
-    {
-        return Err(Error::invalid_input(
-            "rollout staging requires Lance V2 files",
-        ));
-    }
-    if *schema != crate::rollout_schema() {
-        return Err(Error::invalid_input("staging requires a rollout schema"));
-    }
-    let key = format!("{CUTOVER_PREFIX}{}", plan.shard);
-    if dataset.metadata().get(&key) != Some(&plan.legacy_through.to_string()) {
-        return Err(Error::invalid_input(
-            "staging plan does not match durable cutover",
-        ));
-    }
-    let replay_ranges = ReplayRanges::load(&dataset, plan.shard)?;
+    let schema = options.schema.clone();
+    let check_base = options.replay_policy == ReplayPolicy::CheckBase;
+    let replay_ranges = if check_base {
+        let key = format!("{CUTOVER_PREFIX}{}", plan.shard);
+        if dataset.metadata().get(&key) != Some(&plan.legacy_through.to_string()) {
+            return Err(Error::invalid_input(
+                "staging plan does not match durable cutover",
+            ));
+        }
+        ReplayRanges::load(&dataset, plan.shard)?
+    } else {
+        None
+    };
     let phase = crate::merge_write_scope::work_stage("memory_wait");
     let mut reservation = budget.reserve(plan.max_bytes.min(budget.limit())).await;
     drop(phase);
@@ -810,7 +890,12 @@ pub async fn stage(
             plan.shard,
             generation.path
         );
-        let source = StorageBase::load_with_options(&path, None, session.clone()).await?;
+        let source = StorageBase::load_with_options(
+            &path,
+            options.storage_options.clone(),
+            options.session.clone(),
+        )
+        .await?;
         let mut stream = source.scan().try_into_stream().await?;
         let mut current = Vec::new();
         while let Some(batch) = stream.try_next().await? {
@@ -830,18 +915,19 @@ pub async fn stage(
             }
             current.push(batch);
         }
-        let needs_lookup = replay_ranges
-            .as_ref()
-            .map_or(generation.number <= plan.legacy_through, |ranges| {
-                ranges.contains(generation.number)
-            });
+        let needs_lookup = check_base
+            && replay_ranges
+                .as_ref()
+                .map_or(generation.number <= plan.legacy_through, |ranges| {
+                    ranges.contains(generation.number)
+                });
         batches.extend(current.into_iter().map(|batch| (batch, needs_lookup)));
         completed += 1;
         if bytes >= plan.max_bytes {
             break;
         }
     }
-    // Rollout IDs are immutable. Dedup identical retries within this batch;
+    // Identities are immutable. Dedup identical retries within this batch;
     // during migration also exclude IDs already published by a legacy merge.
     let mut seen = HashSet::new();
     let lookup_started = std::time::Instant::now();
@@ -853,20 +939,21 @@ pub async fn stage(
         let mut ids = HashSet::new();
         for (batch, _) in batches.iter().filter(|(_, needs_lookup)| *needs_lookup) {
             let column = batch
-                .column_by_name("id")
+                .column_by_name(&options.key_column)
                 .unwrap()
                 .as_any()
                 .downcast_ref::<StringArray>()
-                .ok_or_else(|| Error::invalid_input("rollout id must be Utf8"))?;
+                .ok_or_else(|| Error::invalid_input("append key must be Utf8"))?;
             ids.extend(column.iter().flatten().map(str::to_owned));
         }
         let ids: Vec<_> = ids.into_iter().collect();
         lookup_ids = ids.len();
         for chunk in ids.chunks(1024) {
             let mut scanner = dataset.scan();
-            scanner.project(&["id"])?;
+            scanner.project(&[options.key_column.as_str()])?;
             scanner.filter_expr(
-                col("id").in_list(chunk.iter().map(|id| lit(id.clone())).collect(), false),
+                col(&options.key_column)
+                    .in_list(chunk.iter().map(|id| lit(id.clone())).collect(), false),
             );
             let mut rows = scanner.try_into_stream().await?;
             while let Some(batch) = rows.try_next().await? {
@@ -890,13 +977,13 @@ pub async fn stage(
     let mut output = Vec::new();
     for (batch, _) in batches {
         let ids = batch
-            .column_by_name("id")
+            .column_by_name(&options.key_column)
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         if ids.null_count() > 0 {
-            return Err(Error::invalid_input("rollout id cannot be null"));
+            return Err(Error::invalid_input("append key cannot be null"));
         }
         let keep = BooleanArray::from(
             ids.iter()
@@ -939,6 +1026,9 @@ pub async fn stage(
         rows,
     })
 }
+
+#[cfg(test)]
+mod application_tests;
 
 #[cfg(test)]
 mod tests {

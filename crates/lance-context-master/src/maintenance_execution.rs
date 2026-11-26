@@ -358,7 +358,8 @@ where
 }
 
 fn fenced(config: &crate::config::MasterConfig, target: &str) -> bool {
-    config.merge_rollout.owned(target)
+    config.append.managed(config, target)
+        || config.merge_rollout.owned(target)
         || (config.maintenance.fence_legacy_maintenance && !target.starts_with("datagen:"))
 }
 
@@ -372,10 +373,10 @@ where
     F: Future<Output = Result<String, String>>,
 {
     crate::merge_capacity::phase("fenced_maintenance");
-    let uri = match claim.task.target.strip_prefix("generic:") {
-        Some(name) => state.generic_uri(name),
-        None => state.rollout_uri(&claim.task.target),
-    };
+    let uri = state
+        .maintenance_uri(&claim.task.target)
+        .await
+        .map_err(|e| e.to_string())?;
     if !lance_context_core::merge_write_scope::supports_version_fencing(&uri) {
         return Err("invalid storage backend for maintenance fencing".into());
     }

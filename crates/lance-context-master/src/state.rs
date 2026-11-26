@@ -349,6 +349,20 @@ impl MasterState {
         Ok(registry.get(name).await?.map(|entry| entry.uri))
     }
 
+    /// Resolve registered application tables through their registry, retaining
+    /// the existing physical paths for built-in rollout/generic stores.
+    pub(crate) async fn maintenance_uri(&self, target: &str) -> lance::Result<String> {
+        if self.registered_target(target).is_some() {
+            self.target_uri(target).await?.ok_or_else(|| {
+                lance::Error::invalid_input("registered maintenance target does not exist")
+            })
+        } else if let Some(name) = target.strip_prefix("generic:") {
+            Ok(self.generic_uri(name))
+        } else {
+            Ok(self.rollout_uri(target))
+        }
+    }
+
     /// Options for every generic store opened by the master (read-only
     /// observation; the master never writes a generic store's WAL).
     pub(crate) fn generic_store_options(&self) -> GenericStoreOptions {
