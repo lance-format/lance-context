@@ -360,7 +360,7 @@ async fn recover_inner(
         .unwrap_err();
         assert!(
             matches!(
-                error.to_string().as_str(),
+                error.root_cause().to_string().as_str(),
                 "annotation retained manifest exceeds collection workspace"
                     | "retained index metadata exceeds collection workspace"
             ),
