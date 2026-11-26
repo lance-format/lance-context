@@ -461,11 +461,16 @@ impl Runtime {
     /// One admitted native annotation index writer can outlive cancellation, retaining
     /// its workspace until completion. It cannot publish a manifest itself.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) -> Result<()> {
+        use futures::FutureExt;
+        // These are task-lifetime allocations. Erase the two large loop types
+        // so embedding hosts do not inherit their recursive future layouts.
+        let driver = self.driver.run(std::future::pending()).boxed();
+        let publisher = self.publisher.run().boxed();
         tokio::pin!(shutdown);
         tokio::select! {
             _ = &mut shutdown => Ok(()),
-            result = self.driver.run(std::future::pending()) => result,
-            result = self.publisher.run() => result,
+            result = driver => result,
+            result = publisher => result,
         }
     }
 }
