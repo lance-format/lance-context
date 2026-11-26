@@ -12,6 +12,7 @@ const MAX_PAYLOAD_BYTES: u64 = 32 << 20;
 pub(super) struct Lookup {
     pub(super) registrations: Option<RegistrationLookup>,
     pub(super) patches: Option<PatchLookup>,
+    pub(super) bodies: Option<single_body::Lookup>,
 }
 
 pub(super) async fn fetch(
@@ -92,7 +93,9 @@ pub(super) async fn fetch(
             .phases
             .measure(Phase::AnnotationDecode, async {
                 tokio::task::spawn_blocking(move || -> Result<Pending> {
-                    let decoded = if mixed {
+                    let decoded = if single_body::is_schema(&schema) {
+                        single_body::decode(body, schema, max_rows, value_bytes)?
+                    } else if mixed {
                         mixed::wire::decode(body, schema, max_rows, value_bytes)?
                     } else {
                         mixed::Decoded::Patches(wire::decode(body, schema, max_rows, value_bytes)?)
@@ -118,6 +121,28 @@ pub(super) async fn prepare(
     page: &mut lance_context_wal::replication::Page,
     queued: &mut VecDeque<Pending>,
 ) -> Result<Lookup> {
+    if service.is_single_body() {
+        // Accumulate whole admitted records, rather than repeatedly scanning
+        // history for arbitrary 2048-key chunks. The apply budget bounds frames
+        // and the subsequent shared key-only query independently.
+        let mut bytes = head.meta.body_bytes;
+        while queued.len() + 1 < MAX_REQUESTS && bytes < MAX_PAYLOAD_BYTES {
+            let Some((index, meta)) = page.entries.first().cloned() else {
+                break;
+            };
+            if meta.body_bytes > MAX_PAYLOAD_BYTES - bytes {
+                break;
+            }
+            let Some(next) = fetch(service, index, meta).await? else {
+                break;
+            };
+            bytes += next.meta.body_bytes;
+            queued.push_back(next);
+            page.entries.remove(0);
+        }
+        // Driver refreshes this on stale-base detection as well as initially.
+        return Ok(Lookup::default());
+    }
     if head.meta.body_bytes > MAX_PAYLOAD_BYTES
         || head.decoded.rows() > MAX_ROWS
         || !service.shared.window.lock().unwrap().admits(&head.meta)
@@ -204,5 +229,6 @@ pub(super) async fn prepare(
     Ok(Lookup {
         registrations,
         patches,
+        bodies: None,
     })
 }

@@ -308,6 +308,25 @@ fn validate_native(
         .transaction_properties
         .as_ref()
         .and_then(|p| p.get(lance_context_core::annotation_staging::RESULTS_PROPERTY));
+    let schema = arrow_schema::Schema::from(base.schema());
+    let immutable = crate::annotations::single_body::is_schema(&schema);
+    if immutable {
+        let spec = crate::turn_ingestion::TurnIngestionSpec::from_schema(&schema)?
+            .context("full body identity specification missing")?;
+        ensure!(
+            schema == *crate::annotations::single_body::storage_schema(&spec)?
+                && !inserts
+                && results.is_some(),
+            "invalid single body publication binding/results"
+        );
+        ensure!(
+            matches!(
+                transaction.operation,
+                Operation::Append { .. } | Operation::UpdateConfig { .. }
+            ),
+            "single body ingestion may only append or retain outcomes"
+        );
+    }
     if let Some(results) = results {
         crate::annotations::checkpoint::Snapshot::decode(results, selection.scope()?.1)?;
     }
@@ -319,7 +338,10 @@ fn validate_native(
         );
     }
     if let Operation::Append { .. } = &transaction.operation {
-        ensure!(inserts, "patch-only annotations cannot insert rows");
+        ensure!(
+            inserts || immutable,
+            "patch-only annotations cannot insert rows"
+        );
         return Ok(());
     }
     if let Operation::UpdateConfig {

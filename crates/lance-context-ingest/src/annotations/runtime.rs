@@ -237,6 +237,38 @@ impl Runtime {
         .await
     }
 
+    /// Own one full-schema immutable table. All producer lanes share its
+    /// ordered first-create state and the original publication/recovery path.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_body_shard(
+        client: Arc<Client>,
+        layout: Arc<Layout>,
+        binding: TableBinding,
+        storage: Storage,
+        configuration: Configuration,
+        acquisition: materializer::Acquisition,
+        shard: Shard,
+        spec: &crate::turn_ingestion::TurnIngestionSpec,
+    ) -> Result<(Service, Self)> {
+        ensure!(
+            configuration.publication.turn_id_index.is_none()
+                && configuration.publication.status_index.is_none(),
+            "single body indexing is supplied by its consumer"
+        );
+        Self::connect_mode(
+            client,
+            layout,
+            binding,
+            storage,
+            None,
+            configuration,
+            acquisition,
+            Some(shard),
+            Some(spec),
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)] // Explicit routing augments the existing owned connection.
     async fn connect_mode(
         client: Arc<Client>,
@@ -565,7 +597,9 @@ impl Publisher {
         let selection = self.selection(pending);
         let prepared = phases
             .measure(Phase::Prepare, async {
-                if self.service.shared.body.is_some() {
+                if self.service.is_single_body() {
+                    frozen.prepare_full_body(&self.budget).await
+                } else if self.service.shared.body.is_some() {
                     frozen.prepare_mixed(&self.budget, 8192).await
                 } else {
                     frozen.prepare(&self.budget, 8192).await

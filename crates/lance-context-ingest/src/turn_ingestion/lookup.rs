@@ -52,6 +52,11 @@ impl TurnLookup {
 }
 
 impl TurnIngestionSpec {
+    pub(crate) fn lookup_workspace(&self, lengths: impl Iterator<Item = usize>) -> Result<usize> {
+        let names = self.primary_key.iter().try_fold(0usize, |total, name| total.checked_add(name.len().checked_mul(8)?)).context("body lookup field names overflow")?;
+        let nodes = self.primary_key.len().checked_add(1).and_then(|columns| columns.checked_mul(512)).context("body lookup key columns overflow")?;
+        lengths.into_iter().try_fold(names, |total, length| total.checked_add(length.checked_mul(8)?)?.checked_add(nodes)).context("body lookup workspace overflow")
+    }
     /// Resolve the entire admitted key window with one scan of one snapshot.
     /// The caller accumulates unresolved keys across incoming frames before
     /// calling; do not loop over arbitrarily small windows on a large base.
@@ -77,7 +82,9 @@ impl TurnIngestionSpec {
         }
         let started = Instant::now();
         ensure!(
-            arrow_schema::Schema::from(base.schema()) == *self.body_schema,
+            arrow_schema::Schema::from(base.schema()) == *self.body_schema
+                || arrow_schema::Schema::from(base.schema())
+                    == *crate::annotations::single_body::storage_schema(self)?,
             "body lookup schema differs from its ingestion specification"
         );
         ensure!(
@@ -85,27 +92,7 @@ impl TurnIngestionSpec {
                 .all(|key| !key.is_empty() && key.len() <= MAX_KEY_BYTES),
             "body lookup key exceeds limit"
         );
-        let names = self
-            .primary_key
-            .iter()
-            .try_fold(0usize, |total, name| {
-                total.checked_add(name.len().checked_mul(8)?)
-            })
-            .context("body lookup field names overflow")?;
-        let nodes = self
-            .primary_key
-            .len()
-            .checked_add(1)
-            .and_then(|columns| columns.checked_mul(512))
-            .context("body lookup key columns overflow")?;
-        let bytes = keys
-            .iter()
-            .try_fold(names, |total, key| {
-                total
-                    .checked_add(key.len().checked_mul(8)?)?
-                    .checked_add(nodes)
-            })
-            .context("body lookup workspace overflow")?;
+        let bytes = self.lookup_workspace(keys.iter().map(|key| key.len()))?;
         if bytes > workspace.limit() {
             return Ok(None);
         }
