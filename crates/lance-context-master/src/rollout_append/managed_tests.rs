@@ -98,11 +98,19 @@ async fn registered_shards_merge_through_the_existing_local_executor() {
         .unwrap();
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].pending_wal_generations, 2, "{rows:?}");
+    // Hot observations enqueue during the scan; the periodic sweep deduplicates
+    // that task rather than creating a second merge for the same table.
+    assert!(state
+        .task_store
+        .get_active_id(TaskKind::MergeWal, "events:table")
+        .await
+        .unwrap()
+        .is_some());
     assert_eq!(
         crate::scheduler::sweep_merge_wal_candidates(&state)
             .await
             .unwrap(),
-        1
+        0
     );
     let claim = state
         .task_store
