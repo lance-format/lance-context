@@ -1,5 +1,6 @@
 //! Read a small admitted prefix without advancing any application position.
 use super::*;
+use lance_context_wal::replication::runtime::client::payload_memory;
 
 const MAX_REQUESTS: usize = 8;
 // Match one core cold-lookup window. Bodies stay in their original requests;
@@ -53,14 +54,20 @@ pub(super) async fn fetch(
                         .client
                         .request_routed(Request::Fetch { group, index }),
                 )
-                .await?;
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if error.is::<payload_memory::Unavailable>() => return Ok(None),
+                Err(error) => return Err(error),
+            };
             ensure!(
                 matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
                 "committed annotation payload unavailable"
             );
-            // runtime::client::receive allocates vec![0; bytes] for each body;
-            // this is a complete allocation, unlike a caller's Bytes slice.
-            (response.body, Some(bytes))
+            // RPC reception owns this complete payload allocation, unlike a
+            // caller's Bytes slice. A configured pool follows its shared owner.
+            let capacity = response.body_capacity();
+            (response.body, Some(capacity))
         }
     };
     meta.check_body_length(body.len(), ingress.scope.contract.max_record_bytes as usize)?;
