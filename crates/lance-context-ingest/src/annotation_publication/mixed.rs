@@ -263,7 +263,7 @@ async fn load_body(
         "body snapshot differs from the authorized destination"
     );
     let body = lance::dataset::builder::DatasetBuilder::from_uri(&storage.uri)
-        .with_storage_options(storage.options.clone())
+        .with_read_params(storage.read_params(Default::default()))
         .with_session(storage.session.clone())
         .with_version(reference.version)
         .load()

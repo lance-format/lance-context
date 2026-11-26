@@ -23,11 +23,11 @@ mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
 #[cfg(feature = "service")]
-pub(crate) mod metadata_upload;
+pub mod metadata_upload;
 pub mod mixed;
 mod prefetch;
 #[cfg(all(feature = "service", feature = "lance-io-metrics"))]
-pub(crate) mod read_io;
+pub mod read_io;
 pub mod runtime;
 mod shard;
 pub mod single_body;

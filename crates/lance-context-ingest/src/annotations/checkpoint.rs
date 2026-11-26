@@ -554,9 +554,8 @@ pub(crate) async fn load_with_read_params(
     )?;
     Ok(Arc::new(
         DatasetBuilder::from_uri(&storage.uri)
-            .with_read_params(read_params)
+            .with_read_params(storage.read_params(read_params))
             .with_version(version)
-            .with_storage_options(storage.options.clone())
             .with_session(storage.session.clone())
             .with_commit_handler(Arc::new(handler))
             .load()
