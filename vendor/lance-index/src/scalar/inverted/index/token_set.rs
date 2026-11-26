@@ -9,6 +9,16 @@ use hashbrown::{HashTable, hash_table::Entry};
 
 use super::*;
 
+// Bytes keeps the Arrow allocation (and any native-memory reservation) alive.
+// Arrow implements AsRef<[u8]> for &Buffer, but not for an owned Buffer.
+struct FstBuffer(arrow::buffer::Buffer);
+
+impl AsRef<[u8]> for FstBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 struct TokenBytesWriter {
     values: Vec<u8>,
     reservation: lance_core::memory::NativeReservation,
@@ -249,7 +259,9 @@ impl TokenSet {
         let fst_col = batch[TOKEN_FST_BYTES_COL].as_binary::<i64>();
         let start = fst_col.value_offsets()[0] as usize;
         let end = fst_col.value_offsets()[1] as usize;
-        let bytes = Bytes::from_owner(fst_col.values().slice_with_length(start, end - start));
+        let bytes = Bytes::from_owner(FstBuffer(
+            fst_col.values().slice_with_length(start, end - start),
+        ));
         let map = fst::Map::new(bytes)
             .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
 
@@ -659,7 +671,11 @@ impl TokenDictionary {
                         Error::index(format!("failed to insert token {}: {}", token, e))
                     })?;
                 }
-                fst_token_batch(builder.into_map(), self.len() as u32, self.bytes.len())
+                let map = builder
+                    .into_map()
+                    .map_data(Bytes::from)
+                    .map_err(|error| Error::index(error.to_string()))?;
+                fst_token_batch(map, self.len() as u32, self.bytes.len())
             }
         }
     }
@@ -691,6 +707,19 @@ fn prefetch_fst_node(_fst_bytes: &[u8], _addr: fst::raw::CompiledAddr) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fst_bytes_share_and_retain_arrow_allocation() {
+        let buffer = arrow::buffer::Buffer::from_vec(vec![10_u8, 20, 30, 40]);
+        let slice = buffer.slice_with_length(1, 2);
+        let pointer = slice.as_ptr();
+        let bytes = Bytes::from_owner(FstBuffer(slice));
+        assert_eq!(bytes.as_ptr(), pointer);
+        drop(buffer);
+        let retained = bytes.slice(1..);
+        drop(bytes);
+        assert_eq!(retained.as_ref(), &[30]);
+    }
 
     fn fst_dictionary(terms: &[&str]) -> TokenSet {
         let mut terms = terms.to_vec();
