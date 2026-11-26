@@ -4,6 +4,9 @@ use arrow_schema::Field;
 use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
+#[cfg(feature = "materializer")]
+mod readahead;
+
 fn schema() -> SchemaRef {
     Arc::new(Schema::new_with_metadata(
         vec![
