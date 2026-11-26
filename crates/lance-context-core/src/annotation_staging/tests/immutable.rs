@@ -86,6 +86,20 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         origin(&a)
     );
     let c = staging.capture_immutable_body("c").await?;
+    let mut known = BTreeMap::from([
+        ("a".to_owned(), false),
+        ("b".to_owned(), false),
+        ("c".to_owned(), false),
+        ("d".to_owned(), true),
+    ]);
+    let staged_lookup = staging
+        .try_capture_immutable_base_with_staged(&mut known)
+        .await?
+        .unwrap();
+    assert_eq!(
+        known.values().copied().collect::<Vec<_>>(),
+        vec![true, true, true, false]
+    );
     assert_eq!(
         origin(&c),
         NewTurnSource {
@@ -140,6 +154,30 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         None
     );
     assert_eq!(staging.observation().await.applied, 2);
+    // Even staged-positive results retain the same publication/base fence.
+    assert_eq!(
+        staging
+            .register_immutable_committed(
+                2,
+                3,
+                &[ImmutableRegistration {
+                    key: "a",
+                    exists_in_base: known["a"],
+                }],
+                &staged_lookup,
+            )
+            .await?,
+        None
+    );
+    let refreshed = staging
+        .try_capture_immutable_base_with_staged(&mut known)
+        .await?
+        .unwrap();
+    assert_eq!(
+        known.values().copied().collect::<Vec<_>>(),
+        vec![false, false, true, false]
+    );
+    drop((staged_lookup, refreshed));
     assert_eq!(lookup.dataset().count_rows(None).await?, 0);
     drop((prepared, frozen, lookup, a, c));
     let frozen = staging

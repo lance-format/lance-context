@@ -185,24 +185,29 @@ impl Service {
         self.shared
             .phases
             .measure(Phase::AnnotationRegistrationLookup, async {
-                let Some(base) = self.shared.staging.try_capture_immutable_base().await? else {
-                    return Ok(None);
-                };
                 let spec = self
                     .ingress
                     .turn_spec
                     .as_ref()
                     .context("missing body spec")?;
-                let keys = match spec
-                    .lookup_existing(
-                        base.dataset().clone(),
-                        keys,
-                        self.lookup_budget
-                            .as_ref()
-                            .context("missing body lookup budget")?,
-                    )
-                    .await
-                {
+                let Some(mut prepared) = spec.prepare_lookup(
+                    keys,
+                    self.lookup_budget
+                        .as_ref()
+                        .context("missing body lookup budget")?,
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(base) = self
+                    .shared
+                    .staging
+                    .try_capture_immutable_base_with_staged(&mut prepared.keys)
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let keys = match spec.lookup_prepared(base.dataset().clone(), prepared).await {
                     Ok(keys) => keys,
                     Err(error)
                         if error.chain().any(|cause| {
@@ -222,7 +227,7 @@ impl Service {
                     }
                     Err(error) => return Err(error),
                 };
-                Ok(keys.map(|keys| Lookup { base, keys }))
+                Ok(Some(Lookup { base, keys }))
             })
             .await
             .context("immutable body historical lookup failed")

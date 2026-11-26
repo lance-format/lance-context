@@ -1,13 +1,16 @@
-//! Completed historical-key lookups for one service lifetime.
+//! Completed immutable-key lookup windows for one service lifetime.
 use super::*;
 
 /// Cumulative successful lookup windows, including probes whose captured base
 /// was subsequently replaced. Cached reuse and admission refusals add nothing.
 /// Failed/cancelled attempts remain visible in the existing lookup phase.
+/// A window entirely resolved by staging starts no native scan.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BodyLookupObservation {
     pub completed_lookups: u64,
     pub requested_keys: u64,
+    /// Keys resolved from the same captured active/frozen view, without history I/O.
+    pub staged_keys: u64,
     pub scans_started: u64,
     /// Returned key columns, including candidates removed by composite matching.
     /// These are not physical storage bytes or all scanned source rows.
@@ -29,6 +32,7 @@ impl BodyLookupObservation {
         self.requested_keys = self
             .requested_keys
             .saturating_add(value.requested_keys as u64);
+        self.staged_keys = self.staged_keys.saturating_add(value.staged_keys as u64);
         self.scans_started = self.scans_started.saturating_add(value.scans_started);
         self.projected_rows = self.projected_rows.saturating_add(value.projected_rows);
         self.projected_array_bytes = self

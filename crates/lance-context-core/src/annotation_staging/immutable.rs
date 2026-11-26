@@ -63,6 +63,23 @@ impl AnnotationStaging {
     /// Capture without waiting for reader capacity. `None` means existing
     /// readers hold every permit; callers must retain their unapplied request.
     pub async fn try_capture_immutable_base(&self) -> Result<Option<ImmutableBase>> {
+        self.try_capture_immutable_lookup(None).await
+    }
+
+    /// Mark keys already present in active/frozen while capturing the same
+    /// protected base. The caller owns and budgets this bounded key map.
+    /// False still requires a historical lookup; it does not mean absent.
+    pub async fn try_capture_immutable_base_with_staged(
+        &self,
+        keys: &mut BTreeMap<String, bool>,
+    ) -> Result<Option<ImmutableBase>> {
+        self.try_capture_immutable_lookup(Some(keys)).await
+    }
+
+    async fn try_capture_immutable_lookup(
+        &self,
+        keys: Option<&mut BTreeMap<String, bool>>,
+    ) -> Result<Option<ImmutableBase>> {
         self.require_immutable()?;
         let reader = match self.readers.clone().try_acquire_owned() {
             Ok(reader) => reader,
@@ -71,8 +88,18 @@ impl AnnotationStaging {
                 return Err(invalid("annotation staging reader admission closed"));
             }
         };
+        let state = self.state.read().await;
+        if let Some(keys) = keys {
+            for (key, present) in keys {
+                *present = state.active.contains_key(key)
+                    || state
+                        .frozen
+                        .as_ref()
+                        .is_some_and(|f| f.values.contains_key(key));
+            }
+        }
         Ok(Some(ImmutableBase {
-            base: self.state.read().await.base.clone(),
+            base: state.base.clone(),
             _reader: reader,
         }))
     }
