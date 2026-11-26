@@ -166,6 +166,9 @@ impl AnnotationStaging {
         } else {
             state.views.install(selected)
         };
+        // Covered immutable lookups only prove frozen-publication transitions.
+        // Keep maintenance conservative even when it preserves logical rows.
+        state.immutable_publications = Arc::new(());
         Ok(())
     }
 }
