@@ -134,7 +134,10 @@ impl AnnotationStaging {
         let covered_publication = lookup.covered.as_ref().is_some_and(|(lineage, through)| {
             Arc::ptr_eq(lineage, &state.immutable_publications) && state.materialized <= *through
         });
-        if !Arc::ptr_eq(&state.base, &lookup.base) && !covered_publication {
+        let changed_base = !Arc::ptr_eq(&state.base, &lookup.base);
+        if changed_base && !covered_publication {
+            state.immutable_lookup_invalidated =
+                state.immutable_lookup_invalidated.saturating_add(1);
             return Ok(None);
         }
         let pending = self.immutable_pending(&state, through, rows)?;
@@ -150,6 +153,9 @@ impl AnnotationStaging {
             }
             PendingBatch::Backpressure => ApplyOutcome::Backpressure,
         };
+        if changed_base && !matches!(outcome, ApplyOutcome::Backpressure) {
+            state.immutable_lookup_reused = state.immutable_lookup_reused.saturating_add(1);
+        }
         Ok(Some(outcome))
     }
 
