@@ -34,6 +34,7 @@ use lance_core::{
     Error, Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache},
     datatypes::{Field, Schema},
+    memory::{NativeMemory, NativeMemoryKind, retain_bytes, try_reserve},
 };
 use lance_encoding::format::pb as pbenc;
 use lance_encoding::format::pb21 as pbenc21;
@@ -742,6 +743,7 @@ impl FileReader {
         tail_bytes: &Bytes,
         tail_offset: u64,
         file_len: u64,
+        native_memory: &NativeMemory,
     ) -> Result<BTreeMap<u32, Bytes>> {
         let tail_end = tail_offset
             .checked_add(tail_bytes.len() as u64)
@@ -752,7 +754,12 @@ impl FileReader {
             if range.start >= tail_offset && range.end <= tail_end {
                 let rel_start = (range.start - tail_offset) as usize;
                 let rel_end = (range.end - tail_offset) as usize;
-                let bytes = Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]);
+                let reservation =
+                    try_reserve(native_memory, NativeMemoryKind::Read, rel_end - rel_start)?;
+                let bytes = retain_bytes(
+                    Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]),
+                    reservation,
+                );
                 retained_buffers.insert(index as u32, bytes);
             }
         }
@@ -763,20 +770,25 @@ impl FileReader {
         footer: &Footer,
         tail_bytes: &Bytes,
         tail_offset: u64,
-    ) -> Option<(u64, Bytes)> {
+        native_memory: &NativeMemory,
+    ) -> Result<Option<(u64, Bytes)>> {
         let start = footer.column_meta_start.max(tail_offset);
         let end = footer.column_meta_offsets_start;
         if start >= end || end > tail_offset + tail_bytes.len() as u64 {
-            return None;
+            return Ok(None);
         }
         let rel_start = (start - tail_offset) as usize;
         let rel_end = (end - tail_offset) as usize;
         // Copied rather than sliced so the cached index does not pin the whole tail
         // buffer, as `retained_global_buffers_from_tail` does.
-        Some((
+        let reservation = try_reserve(native_memory, NativeMemoryKind::Read, rel_end - rel_start)?;
+        Ok(Some((
             start,
-            Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]),
-        ))
+            retain_bytes(
+                Bytes::copy_from_slice(&tail_bytes[rel_start..rel_end]),
+                reservation,
+            ),
+        )))
     }
 
     // Checks to make sure the footer is written correctly and returns the
@@ -1050,6 +1062,7 @@ impl FileReader {
             &tail_bytes,
             tail_offset,
             file_len,
+            scheduler.native_memory(),
         )?;
 
         Ok(RawFileMetadataOpen::Current {
@@ -1118,9 +1131,14 @@ impl FileReader {
             &tail_bytes,
             tail_offset,
             file_len,
+            scheduler.native_memory(),
         )?;
-        let retained_column_metadata =
-            Self::retained_column_metadata_from_tail(&footer, &tail_bytes, tail_offset);
+        let retained_column_metadata = Self::retained_column_metadata_from_tail(
+            &footer,
+            &tail_bytes,
+            tail_offset,
+            scheduler.native_memory(),
+        )?;
 
         Ok(FileMetadataIndex {
             file_schema,
