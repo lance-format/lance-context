@@ -171,6 +171,39 @@ pub struct PreparedCheckpoint {
     bodies: mixed::frames::Frozen,
 }
 impl FrozenCheckpoint {
+    pub async fn prepare_full_body(
+        &self,
+        workspace: &Arc<MergeMemoryBudget>,
+    ) -> Result<PreparedCheckpoint> {
+        let mut selection = std::collections::BTreeMap::<u64, Vec<(u32, &str)>>::new();
+        for (key, source) in self.annotations.new_turns() {
+            selection
+                .entry(source.record_index)
+                .or_default()
+                .push((source.row, key));
+        }
+        let mut batches = Vec::new();
+        for (index, mut rows) in selection {
+            rows.sort_unstable_by_key(|row| row.0);
+            batches.extend(
+                self.bodies
+                    .get(&index)
+                    .context("missing frozen body frame")?
+                    .select(&rows)?,
+            );
+        }
+        Ok(PreparedCheckpoint {
+            origin: self.origin.clone(),
+            annotations: self
+                .annotations
+                .prepare_immutable_body(workspace, batches, self.bodies.clone())
+                .await
+                .map_err(runtime::publication_write_error)?,
+            results: self.results.clone(),
+            bodies: self.bodies.clone(),
+        })
+    }
+
     /// Complete source metadata captured under the same gate as values/results.
     /// The publisher still pins this selection before recording preparation.
     pub fn sources(&self) -> &lance_context_wal::replication::publication::SourceRange {

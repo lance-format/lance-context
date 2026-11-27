@@ -116,6 +116,58 @@ pub async fn provision(
         incarnation: binding.incarnation,
         contract: binding.contract()?,
     };
+    provision_schema(
+        client,
+        layout,
+        storage,
+        identity,
+        scope,
+        Arc::new(rollout_schema()),
+    )
+    .await
+}
+
+/// Provision a new full-body table under the existing idempotent genesis and
+/// catalog protocol. All lanes for this relation share this binding and URI.
+#[allow(clippy::too_many_arguments)]
+pub async fn provision_body_shard(
+    client: Arc<Client>,
+    layout: Arc<Layout>,
+    binding: TableBinding,
+    storage: Storage,
+    identity: Identity,
+    limits: &lance_context_core::annotation_staging::Limits,
+    shard: crate::annotations::Shard,
+    spec: &crate::turn_ingestion::TurnIngestionSpec,
+) -> Result<Storage> {
+    layout.group_for_bucket(shard.bucket)?;
+    let scope = Scope {
+        cluster: layout.cluster,
+        layout: layout.fingerprint()?,
+        table: binding.table,
+        destination: binding.destination.clone(),
+        incarnation: binding.incarnation,
+        contract: crate::annotations::single_body::contract(&binding, spec, limits, shard)?,
+    };
+    provision_schema(
+        client,
+        layout,
+        storage,
+        identity,
+        scope,
+        crate::annotations::single_body::storage_schema(spec)?,
+    )
+    .await
+}
+
+async fn provision_schema(
+    client: Arc<Client>,
+    layout: Arc<Layout>,
+    storage: Storage,
+    identity: Identity,
+    scope: Scope,
+    expected_schema: SchemaRef,
+) -> Result<Storage> {
     ensure!(
         client.identity() == (scope.cluster, scope.layout)
             && !scope.table.is_nil()
@@ -154,7 +206,7 @@ pub async fn provision(
             .await?;
         let schema: arrow_schema::Schema = dataset.schema().into();
         ensure!(
-            schema == rollout_schema(),
+            schema == *expected_schema,
             "managed generation schema differs"
         );
         return Ok(storage);
@@ -183,7 +235,8 @@ pub async fn provision(
             && authority.group == client.catalog_group(),
         "foreign bootstrap authority"
     );
-    let (object, transaction) = genesis(&storage, &scope, &identity).await?;
+    let (object, transaction) =
+        genesis_with_schema(&storage, &scope, &identity, expected_schema).await?;
     let applied = commit(
         &client,
         Command::Bootstrap(p::BootstrapManifest {
@@ -206,10 +259,20 @@ pub async fn provision(
     Ok(storage)
 }
 
+#[cfg(test)]
 pub(crate) async fn genesis(
     storage: &Storage,
     scope: &Scope,
     identity: &Identity,
+) -> Result<(p::ManifestObject, Uuid)> {
+    genesis_with_schema(storage, scope, identity, Arc::new(rollout_schema())).await
+}
+
+async fn genesis_with_schema(
+    storage: &Storage,
+    scope: &Scope,
+    identity: &Identity,
+    expected_schema: SchemaRef,
 ) -> Result<(p::ManifestObject, Uuid)> {
     let marker = serde_json::to_string(&(scope, identity))?;
     let parameters = WriteParams {
@@ -226,7 +289,7 @@ pub(crate) async fn genesis(
         )]))),
         ..Default::default()
     };
-    let schema = Arc::new(rollout_schema());
+    let schema = expected_schema.clone();
     let empty = RecordBatch::new_empty(schema.clone());
     let dataset = match Dataset::write(
         RecordBatchIterator::new(vec![Ok(empty)], schema),
@@ -254,7 +317,7 @@ pub(crate) async fn genesis(
         .context("genesis transaction missing")?;
     ensure!(
         dataset.version().version == 1
-            && schema == rollout_schema()
+            && schema == *expected_schema
             && dataset.count_rows(None).await? == 0
             && transaction
                 .transaction_properties

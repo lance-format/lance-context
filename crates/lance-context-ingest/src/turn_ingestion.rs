@@ -210,7 +210,7 @@ impl TurnIngestionSpec {
     #[cfg(feature = "materializer")]
     pub(crate) fn row_key(&self, body: &RecordBatch, row: usize, maximum: usize) -> Result<String> {
         ensure!(
-            row < body.num_rows() && body.schema() == self.body_schema,
+            row < body.num_rows() && body.schema().fields() == self.body_schema.fields(),
             "foreign turn row"
         );
         let values = self
