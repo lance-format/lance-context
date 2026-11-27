@@ -133,20 +133,33 @@ pub(super) async fn prepare(
         // history for arbitrary 2048-key chunks. The apply budget bounds frames
         // and the subsequent shared key-only query independently.
         let mut bytes = head.meta.body_bytes;
-        while queued.len() + 1 < MAX_REQUESTS && bytes < MAX_PAYLOAD_BYTES {
+        let stop = loop {
+            if queued.len() + 1 >= MAX_REQUESTS {
+                break PrefetchStop::RequestBound;
+            }
+            if bytes >= MAX_PAYLOAD_BYTES {
+                break PrefetchStop::ByteBound;
+            }
             let Some((index, meta)) = page.entries.first().cloned() else {
-                break;
+                break PrefetchStop::PageExhausted;
             };
             if meta.body_bytes > MAX_PAYLOAD_BYTES - bytes {
-                break;
+                break PrefetchStop::ByteBound;
             }
             let Some(next) = fetch(service, index, meta).await? else {
-                break;
+                break PrefetchStop::Admission;
             };
             bytes += next.meta.body_bytes;
             queued.push_back(next);
             page.entries.remove(0);
-        }
+        };
+        service
+            .shared
+            .body_lookups
+            .lock()
+            .unwrap()
+            .prefetch
+            .record(queued.len() + 1, bytes, stop);
         // Driver refreshes this on stale-base detection as well as initially.
         return Ok(Lookup::default());
     }

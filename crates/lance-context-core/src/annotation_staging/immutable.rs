@@ -143,6 +143,14 @@ impl AnnotationStaging {
         let pending = self.immutable_pending(&state, through, rows)?;
         let outcome = match pending {
             PendingBatch::Values(values) => {
+                let inserted = values.len() as u64;
+                let observed = &mut state.immutable_apply;
+                observed.batches = observed.batches.saturating_add(1);
+                observed.rows = observed.rows.saturating_add(rows.len() as u64);
+                observed.inserted_rows = observed.inserted_rows.saturating_add(inserted);
+                observed.duplicate_rows = observed
+                    .duplicate_rows
+                    .saturating_add(rows.len() as u64 - inserted);
                 state.active.extend(values);
                 state.applied = through;
                 ApplyOutcome::Applied

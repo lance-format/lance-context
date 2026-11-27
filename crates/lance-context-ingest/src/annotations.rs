@@ -37,7 +37,9 @@ mod status_filter;
 mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
-pub use lookup_observation::{BodyLookupObservation, LookupMetricObservation};
+pub use lookup_observation::{
+    BodyLookupObservation, BodyPrefetchObservation, LookupMetricObservation, PrefetchStop,
+};
 pub use shard::Shard;
 pub use window::SourceObservation;
 
@@ -1097,6 +1099,11 @@ impl Driver {
             }
             self.lookup.bodies = service.lookup_bodies(&keys).await?;
             if self.lookup.bodies.is_none() && !self.lookahead.is_empty() {
+                {
+                    let mut observed = service.shared.body_lookups.lock().unwrap();
+                    observed.lookahead_admission_fallbacks =
+                        observed.lookahead_admission_fallbacks.saturating_add(1);
+                }
                 // A head-only query must also release future decoded inputs.
                 // Otherwise they can keep native admission full when no
                 // applied prefix exists for the publisher to drain. Restore
@@ -1122,12 +1129,15 @@ impl Driver {
                     .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
                 return Ok(());
             }
-            service
-                .shared
-                .body_lookups
-                .lock()
-                .unwrap()
-                .record(self.lookup.bodies.as_ref().unwrap().keys.observation());
+            service.shared.body_lookups.lock().unwrap().record_window(
+                self.lookup.bodies.as_ref().unwrap().keys.observation(),
+                self.lookahead.len() + 1,
+                self.lookahead
+                    .iter()
+                    .fold(pending.meta.body_bytes, |bytes, next| {
+                        bytes.saturating_add(next.meta.body_bytes)
+                    }),
+            );
         }
         let _ordered = service.shared.ordered.lock().await;
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {
