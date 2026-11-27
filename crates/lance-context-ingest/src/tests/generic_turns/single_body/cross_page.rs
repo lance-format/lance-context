@@ -103,7 +103,12 @@ async fn exercise(cancel: bool) -> Result<()> {
             Shard { bucket: 0 },
             &input[i % input.len()],
         )?)?;
-        let prepared = request(&service, &lane, 1, encoded).await?;
+        // With a shared payload pool, preparation owns unknown upload backing.
+        // Check the original bytes; borrowed-pointer identity is not promised.
+        let expected = encoded.clone();
+        let upload = service.reserve_upload(encoded.len()).await?;
+        let prepared = service.prepare(upload, encoded, &lane, 1).await?;
+        assert_eq!(prepared.body(), &expected);
         let response = c
             .client
             .request_routed(Request::Append {
