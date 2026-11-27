@@ -742,6 +742,7 @@ impl GenericFileReader for NullReader {
 /// [`FragReadConfig::scan_scheduler`] rather than a longer, dataset-wide scope.
 #[derive(Clone)]
 pub struct BaseSchedulers {
+    native_memory: lance_core::memory::NativeMemory,
     /// `None` sizes each scheduler for the max bandwidth of its base's store.
     io_buffer_size: Option<u64>,
     schedulers: Arc<std::sync::Mutex<HashMap<u32, Arc<ScanScheduler>>>>,
@@ -760,6 +761,7 @@ impl BaseSchedulers {
     /// same budget as the scan's primary scheduler.
     pub fn new(io_buffer_size: u64) -> Self {
         Self {
+            native_memory: None,
             io_buffer_size: Some(io_buffer_size),
             schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
@@ -770,9 +772,15 @@ impl BaseSchedulers {
     /// [`SchedulerConfig::max_bandwidth`].
     pub fn max_bandwidth() -> Self {
         Self {
+            native_memory: None,
             io_buffer_size: None,
             schedulers: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_native_memory(mut self, memory: lance_core::memory::NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
     }
 
     /// Return the scheduler for `base_id`, building it once from `object_store`
@@ -786,7 +794,11 @@ impl BaseSchedulers {
                     Some(io_buffer_size) => SchedulerConfig::new(io_buffer_size),
                     None => SchedulerConfig::max_bandwidth(&object_store),
                 };
-                ScanScheduler::new(object_store, config)
+                ScanScheduler::new_with_native_memory(
+                    object_store,
+                    config,
+                    self.native_memory.clone(),
+                )
             })
             .clone()
     }
@@ -1063,19 +1075,24 @@ impl FileFragment {
         // Load the file metadata, confirm the schema is compatible, and
         // determine the column offsets
         let mut frag = Fragment::new(fragment_id as u64);
-        let scheduler = ScanScheduler::new(
+        let scheduler = ScanScheduler::new_with_native_memory(
             dataset.object_store.clone(),
             SchedulerConfig::max_bandwidth(&dataset.object_store),
+            dataset.session().native_memory(),
         );
         let file_scheduler = scheduler
             .open_file(&filepath, &CachedFileSize::unknown())
             .await?;
+        let mut file_reader_options = dataset.file_reader_options.clone().unwrap_or_default();
+        if file_reader_options.decoder_config.native_memory.is_none() {
+            file_reader_options.decoder_config.native_memory = dataset.session().native_memory();
+        }
         let reader = lance_file::reader::FileReader::try_open(
             file_scheduler,
             None,
             Arc::<DecoderPlugins>::default(),
             &dataset.metadata_cache.file_metadata_cache(&filepath),
-            dataset.file_reader_options.clone().unwrap_or_default(),
+            file_reader_options,
         )
         .await?;
         // If the schemas are not compatible we can't calculate field id offsets
@@ -1168,6 +1185,33 @@ impl FileFragment {
     /// `projection` may be an empty schema only if `with_row_id` is true. In that
     /// case, the reader will only be generating row ids.
     pub async fn open(
+        &self,
+        projection: &Schema,
+        read_config: FragReadConfig,
+    ) -> Result<FragmentReader> {
+        let policy = read_config
+            .file_reader_options
+            .as_ref()
+            .or(self.dataset.file_reader_options.as_ref())
+            .and_then(|options| options.read_memory_retry.as_ref());
+        let mut attempt = 0;
+        loop {
+            match self.open_once(projection, read_config.clone()).await {
+                Ok(reader) => return Ok(reader),
+                Err(error) => match policy {
+                    Some(policy) => {
+                        // The failed open and its joined metadata reads have
+                        // released their state before the policy waits.
+                        attempt += 1;
+                        (policy.0)(error, attempt, "fragment_open").await?;
+                    }
+                    None => return Err(error),
+                },
+            }
+        }
+    }
+
+    async fn open_once(
         &self,
         projection: &Schema,
         read_config: FragReadConfig,
@@ -1453,9 +1497,10 @@ impl FileFragment {
             // scheduler for this file.
             let scheduler = match read_config.base_schedulers.as_ref() {
                 Some(cache) => cache.get_or_create(base_id, object_store),
-                None => ScanScheduler::new(
+                None => ScanScheduler::new_with_native_memory(
                     object_store.clone(),
                     SchedulerConfig::max_bandwidth(&object_store),
+                    self.dataset.session().native_memory(),
                 ),
             };
             (scheduler, read_config.reader_priority.unwrap_or(0))
@@ -1466,9 +1511,10 @@ impl FileFragment {
             )
         } else {
             (
-                ScanScheduler::new(
+                ScanScheduler::new_with_native_memory(
                     self.dataset.object_store.clone(),
                     SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                    self.dataset.session().native_memory(),
                 ),
                 0,
             )
@@ -1502,11 +1548,15 @@ impl FileFragment {
             &physical_schema,
             field_id_to_column_idx.as_ref(),
         )?;
-        let file_reader_options = read_config
+        let mut file_reader_options = read_config
             .file_reader_options
             .clone()
             .or_else(|| self.dataset.file_reader_options.clone())
             .unwrap_or_default();
+        if file_reader_options.decoder_config.native_memory.is_none() {
+            file_reader_options.decoder_config.native_memory =
+                self.dataset.session().native_memory();
+        }
         let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
             && reader_projection.column_indices.len().saturating_mul(4)
                 < data_file
@@ -1626,27 +1676,45 @@ impl FileFragment {
             // metadata; a fragment with several data files (one per
             // `add_columns` / merge) would otherwise pay them back to back.
             // `try_join_all` keeps the readers in data-file order.
-            let opens = self
+            let projected_files = self
                 .metadata
                 .files
                 .iter()
                 .filter(|data_file| data_file.fields.iter().any(|id| wanted_ids.contains(id)))
-                .map(|data_file| async move {
-                    match metadata_mode {
-                        MetadataMode::LazyAllowed => {
-                            self.open_reader(data_file, Some(projection), read_config)
-                                .await
-                        }
-                        MetadataMode::Full => {
-                            self.open_reader_with_full_metadata(
-                                data_file,
-                                Some(projection),
-                                read_config,
-                            )
+                .collect::<Vec<_>>();
+            let mut read_config = read_config.clone();
+            let options = read_config
+                .file_reader_options
+                .as_ref()
+                .or(self.dataset.file_reader_options.as_ref());
+            if projected_files.len() > 1
+                && let Some(options) = options
+                && options.batch_size_bytes.is_some()
+                && options.read_memory_retry.is_some()
+            {
+                // Reopening one adaptive stream may choose different row
+                // boundaries from the other files merged into this fragment.
+                let mut options = options.clone();
+                options.read_memory_retry = None;
+                read_config.file_reader_options = Some(options);
+            }
+            let read_config = &read_config;
+            let opens = projected_files.into_iter().map(|data_file| async move {
+                match metadata_mode {
+                    MetadataMode::LazyAllowed => {
+                        self.open_reader(data_file, Some(projection), read_config)
                             .await
-                        }
                     }
-                });
+                    MetadataMode::Full => {
+                        self.open_reader_with_full_metadata(
+                            data_file,
+                            Some(projection),
+                            read_config,
+                        )
+                        .await
+                    }
+                }
+            });
             let mut opened_files: Vec<Box<dyn GenericFileReader>> =
                 try_join_all(opens).await?.into_iter().flatten().collect();
 

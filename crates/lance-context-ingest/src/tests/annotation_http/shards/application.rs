@@ -9,7 +9,12 @@ fn configuration(c: &network::Cluster, physical: &Physical, owner_url: String) -
     config.tables = vec![config::Table {
         binding: physical.binding.clone(),
         uri: physical.narrow.uri.clone(),
-        storage_options: physical.narrow.options.clone(),
+        storage_options: physical
+            .narrow
+            .params
+            .storage_options()
+            .cloned()
+            .unwrap_or_default(),
         bootstrap: Identity {
             owner: Uuid::new_v4(),
             acquisition: Uuid::new_v4(),
@@ -29,7 +34,12 @@ fn configuration(c: &network::Cluster, physical: &Physical, owner_url: String) -
         projection: None,
         body: Some(config::Body {
             uri: physical.body.uri.clone(),
-            storage_options: physical.body.options.clone(),
+            storage_options: physical
+                .body
+                .params
+                .storage_options()
+                .cloned()
+                .unwrap_or_default(),
         }),
         exclusive_reclamation: None,
     });

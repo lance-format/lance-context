@@ -50,7 +50,7 @@ struct Counts {
 /// HEAD and get_ranges complete at return. Local file handles are passed through
 /// unchanged and counted in file_payloads: their later reads are not observable.
 #[derive(Debug, Serialize)]
-pub(crate) struct Observation {
+pub struct Observation {
     class: &'static str,
     started: u64,
     completed: u64,
@@ -78,14 +78,15 @@ struct Target {
     data_class: usize,
 }
 
-pub(crate) struct Scope(Arc<[Counts; 5]>);
+/// API-level read observations for one owner session; this adds no read-ahead.
+pub struct Scope(Arc<[Counts; 5]>);
 
 /// Capture backend identity before the existing upload wrapper is installed.
 /// Install counters afterward, preserving the owner's original URI resolution.
-pub(crate) struct Providers(HashMap<String, Arc<dyn ObjectStoreProvider>>);
+pub struct Providers(HashMap<String, Arc<dyn ObjectStoreProvider>>);
 
 impl Providers {
-    pub(crate) fn capture(narrow: &Storage, body: Option<&str>) -> Result<Self> {
+    pub fn capture(narrow: &Storage, body: Option<&str>) -> Result<Self> {
         let registry = narrow.session.store_registry();
         let mut providers = HashMap::new();
         for uri in std::iter::once(narrow.uri.as_str()).chain(body) {
@@ -102,7 +103,8 @@ impl Providers {
 }
 
 impl Scope {
-    pub(crate) fn install(
+    /// Install after upload wrapping and before opening any dataset handles.
+    pub fn install(
         narrow: &Storage,
         body: Option<&Storage>,
         identities: Providers,
@@ -132,7 +134,7 @@ impl Scope {
                     .0
                     .get(&scheme)
                     .context("read identity provider missing")?
-                    .calculate_object_store_prefix(&uri, Some(&storage.options))?,
+                    .calculate_object_store_prefix(&uri, storage.params.storage_options())?,
                 base: if storage.base.as_ref().is_empty() {
                     String::new()
                 } else {
@@ -162,7 +164,8 @@ impl Scope {
         Ok(Self(counts))
     }
 
-    pub(crate) fn observation(&self) -> Vec<Observation> {
+    /// Serializable per-class counters; API durations include SDK retries.
+    pub fn observation(&self) -> Vec<Observation> {
         self.0
             .iter()
             .enumerate()

@@ -90,7 +90,7 @@ pub struct Annotations {
     pub turns: Option<crate::turn_ingestion::TurnIngestionSpec>,
     /// Stable deployment-authorized service address; never supplied by a client.
     pub owner_url: String,
-    /// Explicit physical bucket for this table. Only fresh mixed bindings opt in.
+    /// Explicit physical bucket for this table. Fresh mixed or full-body bindings opt in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<crate::annotations::Shard>,
     /// Complete authorized owner map for a shared ingress. Owners may omit it.
@@ -174,8 +174,8 @@ impl Annotations {
         };
         layout.group_for_bucket(shard.bucket)?;
         ensure!(
-            self.body.is_some(),
-            "explicit annotation shards require mixed body storage"
+            self.body.is_some() || self.turns.is_some(),
+            "explicit annotation shards require mixed or full body storage"
         );
         if self.routes.is_empty() {
             return Ok(());
@@ -356,11 +356,20 @@ impl Config {
             );
             a.validate_shards(&self.layout, &self.tables[0].binding)?;
             if let Some(spec) = &a.turns {
-                ensure!(a.body.is_some() && a.shard.is_some() && a.exclusive_reclamation.is_none(),
-                    "generic turns require explicit body/shard and no exclusive physical reclamation");
-                a.shard
-                    .unwrap()
-                    .turn_contract(&self.tables[0].binding, spec, &a.staging)?;
+                ensure!(a.shard.is_some() && a.exclusive_reclamation.is_none()
+                    && a.source.is_none() && a.projection.is_none(),
+                    "generic turns require explicit shard and no source, projection or exclusive physical reclamation");
+                let shard = a.shard.unwrap();
+                if a.body.is_some() {
+                    shard.turn_contract(&self.tables[0].binding, spec, &a.staging)?;
+                } else {
+                    crate::annotations::single_body::contract(
+                        &self.tables[0].binding,
+                        spec,
+                        &a.staging,
+                        shard,
+                    )?;
+                }
             }
             ensure!(
                 a.apply_memory_bytes > 0
@@ -422,7 +431,7 @@ impl Config {
     }
 }
 impl WalConnection {
-    pub(super) fn client(&self) -> Result<Arc<Client>> {
+    pub fn client(&self) -> Result<Arc<Client>> {
         wal_client(
             &self.layout,
             &self.limits,

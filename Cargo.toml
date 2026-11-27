@@ -13,7 +13,7 @@ members = [
     "python",
 ]
 resolver = "2"
-exclude = ["vendor/raft-engine", "vendor/lance-io", "vendor/lance-core", "vendor/lance", "vendor/lance-encoding"]
+exclude = ["vendor/raft-engine", "vendor/lance-io", "vendor/lance-core", "vendor/lance", "vendor/lance-encoding", "vendor/lance-datafusion", "vendor/lance-file", "vendor/lance-index", "vendor/lance-index-core"]
 
 [workspace.package]
 edition = "2021"
@@ -32,6 +32,10 @@ lance-io = { path = "vendor/lance-io" }
 lance-core = { path = "vendor/lance-core" }
 lance = { path = "vendor/lance" }
 lance-encoding = { path = "vendor/lance-encoding" }
+lance-datafusion = { path = "vendor/lance-datafusion" }
+lance-file = { path = "vendor/lance-file" }
+lance-index = { path = "vendor/lance-index" }
+lance-index-core = { path = "vendor/lance-index-core" }
 # Azure completion response-loss and singleton DELETE fixes; same object_store 0.14.2.
 # See vendor/lance-io/BACKPORT.md.
 object_store = { git = "https://github.com/beinan/arrow-rs-object-store", rev = "6e5253a3a9c0565c2b5b07ea304023d23422f8a1" }

@@ -254,7 +254,7 @@ fn metadata_upload_install_normalizes_the_uri_scheme() -> Result<()> {
     let storage = Storage {
         uri: "FILE-OBJECT-STORE:///tmp/owner-table".to_owned(),
         base: Path::from("tmp/owner-table"),
-        options: Default::default(),
+        params: Default::default(),
         session: Arc::new(lance::session::Session::default()),
     };
     let scope = Scope::install(&storage)?;

@@ -1,7 +1,7 @@
 //! Follow only body references selected by protected narrow snapshots.
 use super::*;
 use lance_context_core::annotation_staging::BodySnapshot;
-use lance_io::object_store::{ObjectStore, ObjectStoreParams, StorageOptionsAccessor};
+use lance_io::object_store::ObjectStore;
 use lance_table::io::commit::{CommitHandler, ConditionalPutCommitHandler};
 use object_store::ObjectStoreExt;
 
@@ -17,12 +17,7 @@ pub(super) async fn store(storage: &Storage) -> Result<Arc<ObjectStore>> {
     let (store, base) = ObjectStore::from_uri_and_params(
         storage.session.store_registry(),
         &storage.uri,
-        &ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                storage.options.clone(),
-            ))),
-            ..Default::default()
-        },
+        &storage.params,
     )
     .await?;
     ensure!(

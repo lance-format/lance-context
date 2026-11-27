@@ -191,8 +191,54 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         .unwrap();
     assert_eq!(
         known.values().copied().collect::<Vec<_>>(),
+        vec![true, true, true, false]
+    );
+    assert_eq!(refreshed.cached_keys(), 2);
+    assert_eq!(staging.observation().await.immutable_membership.hits, 2);
+    let before_misses = staging.observation().await.immutable_membership;
+    let lineage = staging.state.read().await.immutable_publications.clone();
+    // A warmed future cut cannot leak into an older captured base, and another
+    // lineage cannot inherit the entry even with an identical business key.
+    assert!(
+        !staging
+            .published_values
+            .contains_immutable("a", &lineage, 0)
+            .await
+    );
+    assert!(
+        !staging
+            .published_values
+            .contains_immutable("a", &Arc::new(()), 1)
+            .await
+    );
+    let after_misses = staging.observation().await.immutable_membership;
+    assert_eq!(
+        after_misses.miss_future_cut,
+        before_misses.miss_future_cut + 1
+    );
+    assert_eq!(
+        after_misses.miss_wrong_lineage,
+        before_misses.miss_wrong_lineage + 1
+    );
+    assert_eq!(after_misses.misses, before_misses.misses + 2);
+    assert_eq!(after_misses.miss_absent, before_misses.miss_absent);
+    assert!(after_misses.session_cache_capacity_bytes.is_some());
+    // Cache eviction loses only acceleration. Unknown remains a real lookup.
+    selected.session().file_metadata_cache().clear().await;
+    let evicted = staging
+        .try_capture_immutable_base_with_staged(&mut known)
+        .await?
+        .unwrap();
+    assert_eq!(evicted.cached_keys(), 0);
+    assert_eq!(
+        staging.observation().await.immutable_membership.miss_absent,
+        after_misses.miss_absent + 3
+    );
+    assert_eq!(
+        known.values().copied().collect::<Vec<_>>(),
         vec![false, false, true, false]
     );
+    drop(evicted);
     drop((staged_lookup, refreshed));
     assert_eq!(lookup.dataset().count_rows(None).await?, 0);
     drop((prepared, frozen, lookup, a, c));
@@ -235,6 +281,22 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
     let recovered =
         AnnotationStaging::new_immutable_body(selected.clone(), scope(), 2, Limits::default())?;
     assert_eq!(recovered.observation().await.immutable_apply.batches, 0);
+    let mut keys = BTreeMap::from([("c".to_owned(), false)]);
+    let cold = recovered
+        .try_capture_immutable_base_with_staged(&mut keys)
+        .await?
+        .unwrap();
+    assert_eq!(cold.cached_keys(), 0);
+    assert_eq!(
+        recovered
+            .observation()
+            .await
+            .immutable_membership
+            .miss_absent,
+        1
+    );
+    assert!(!keys["c"]); // A fresh instance cannot inherit another owner's truth.
+    drop(cold);
     let base = recovered.capture_immutable_base().await?;
     let mut duplicates = request(&["a", "b", "c"]);
     for row in &mut duplicates {
@@ -246,6 +308,13 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
             .await?,
         Some(ApplyOutcome::Applied)
     );
+    let warm = recovered
+        .try_capture_immutable_base_with_staged(&mut keys)
+        .await?
+        .unwrap();
+    assert_eq!(warm.cached_keys(), 1);
+    assert!(keys["c"]);
+    drop(warm);
     let frozen = recovered
         .freeze_with_results(uuid::Uuid::new_v4(), Some("replay-results".into()))
         .await?

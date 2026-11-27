@@ -8,12 +8,18 @@ use super::*;
 pub struct ImmutableBase {
     base: Arc<views::Base>,
     covered: Option<(Arc<()>, u64)>,
+    cached_keys: usize,
     _reader: OwnedSemaphorePermit,
 }
 
 impl ImmutableBase {
     pub fn dataset(&self) -> &Arc<Dataset> {
         &self.base.dataset
+    }
+
+    /// Positive committed membership reused while capturing this lookup.
+    pub fn cached_keys(&self) -> usize {
+        self.cached_keys
     }
 }
 
@@ -58,6 +64,7 @@ impl AnnotationStaging {
         Ok(ImmutableBase {
             base: self.state.read().await.base.clone(),
             covered: None,
+            cached_keys: 0,
             _reader: reader,
         })
     }
@@ -68,8 +75,9 @@ impl AnnotationStaging {
         self.try_capture_immutable_lookup(None).await
     }
 
-    /// Mark keys already present in active/frozen while capturing the same
-    /// protected base. The caller owns and budgets this bounded key map.
+    /// Mark keys present in active/frozen or the committed membership cache,
+    /// while capturing the same protected base. The caller owns and budgets
+    /// this bounded key map.
     /// False still requires a historical lookup; it does not mean absent.
     /// Results for exactly these keys may survive verified publications up to
     /// the captured applied cut. The caller must preserve each marked hit when
@@ -97,18 +105,33 @@ impl AnnotationStaging {
         let covered = keys
             .as_ref()
             .map(|_| (state.immutable_publications.clone(), state.applied));
+        let base = state.base.clone();
+        let lineage = state.immutable_publications.clone();
+        let materialized = state.materialized;
+        let mut cached_keys = 0;
         if let Some(keys) = keys {
-            for (key, present) in keys {
+            for (key, present) in keys.iter_mut() {
                 *present = state.active.contains_key(key)
                     || state
                         .frozen
                         .as_ref()
                         .is_some_and(|f| f.values.contains_key(key));
             }
+            drop(state);
+            // Resident-only probes own no state lock. A concurrent install is
+            // handled by the original captured-base/lineage validation at apply.
+            for (key, present) in keys.iter_mut().filter(|(_, present)| !**present) {
+                *present = self
+                    .published_values
+                    .contains_immutable(key, &lineage, materialized)
+                    .await;
+                cached_keys += usize::from(*present);
+            }
         }
         Ok(Some(ImmutableBase {
-            base: state.base.clone(),
+            base,
             covered,
+            cached_keys,
             _reader: reader,
         }))
     }
@@ -129,6 +152,23 @@ impl AnnotationStaging {
         rows: &[ImmutableRegistration<'_>],
         lookup: &ImmutableBase,
     ) -> Result<Option<ApplyOutcome>> {
+        Ok(self
+            .register_immutable_committed_with_count(after, through, rows, lookup)
+            .await?
+            .map(|(outcome, _)| outcome))
+    }
+
+    /// The same atomic registration with its actual first-create count.
+    /// The count is zero for rejected/backpressured attempts; only Applied
+    /// makes it meaningful for duplicate-batch observation. This is not a
+    /// separate application or a second asynchronously sampled observation.
+    pub async fn register_immutable_committed_with_count(
+        &self,
+        after: u64,
+        through: u64,
+        rows: &[ImmutableRegistration<'_>],
+        lookup: &ImmutableBase,
+    ) -> Result<Option<(ApplyOutcome, usize)>> {
         self.require_immutable()?;
         let _mutation = self.mutation.lock().await;
         let mut state = self.state.write().await;
@@ -143,6 +183,32 @@ impl AnnotationStaging {
             return Ok(None);
         }
         let pending = self.immutable_pending(&state, through, rows)?;
+        if matches!(&pending, PendingBatch::Values(_)) {
+            let lineage = state.immutable_publications.clone();
+            let materialized = state.materialized;
+            drop(state);
+            let warming = self.published_values.begin_apply_warming();
+            for row in rows.iter().filter(|row| row.exists_in_base) {
+                let state = self.state.read().await;
+                // Covered staged hits are only durable after their generation
+                // was published. Never cache an active/frozen-only key.
+                let staged = state.active.contains_key(row.key)
+                    || state
+                        .frozen
+                        .as_ref()
+                        .is_some_and(|f| f.values.contains_key(row.key));
+                drop(state);
+                if !staged {
+                    self.published_values
+                        .remember_immutable(row.key, &lineage, materialized)
+                        .await;
+                }
+            }
+            warming.complete();
+            // The mutation gate still excludes publication/apply. Cancellation
+            // during optional warming leaves this request wholly unapplied.
+            state = self.state.write().await;
+        }
         let outcome = match pending {
             PendingBatch::Values(values) => {
                 let inserted = values.len() as u64;
@@ -155,15 +221,15 @@ impl AnnotationStaging {
                     .saturating_add(rows.len() as u64 - inserted);
                 state.active.extend(values);
                 state.applied = through;
-                ApplyOutcome::Applied
+                (ApplyOutcome::Applied, inserted as usize)
             }
             PendingBatch::Rejected(rejection) => {
                 state.applied = through;
-                ApplyOutcome::Rejected(rejection)
+                (ApplyOutcome::Rejected(rejection), 0)
             }
-            PendingBatch::Backpressure => ApplyOutcome::Backpressure,
+            PendingBatch::Backpressure => (ApplyOutcome::Backpressure, 0),
         };
-        if changed_base && !matches!(outcome, ApplyOutcome::Backpressure) {
+        if changed_base && !matches!(outcome.0, ApplyOutcome::Backpressure) {
             state.immutable_lookup_reused = state.immutable_lookup_reused.saturating_add(1);
         }
         Ok(Some(outcome))

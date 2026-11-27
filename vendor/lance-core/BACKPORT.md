@@ -20,3 +20,10 @@ Call-site patches in lance, lance-encoding, and lance-io are required together.
 Context's staging cancellation and merge-budget regressions exercise them.
 Remove these patches when a published release provides equivalent ownership
 and the same regressions pass.
+
+`NativeMemoryPool::try_reserve_cache` distinguishes optional cache retention
+from required decoder/index allocations. Its default delegates to the existing
+`try_reserve`; hosts may override it to decline warming without reclaiming live
+backing. The allocation-kind wrapper forwards this distinction. Context uses
+the hook only for disposable immutable membership markers; required processing
+continues to use the original admission methods.

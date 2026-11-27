@@ -57,6 +57,43 @@ returned empty or malformed JSON. `AppendResponseError` additionally preserves
 validated service labels when present. Status alone does not establish whether
 a mutation committed or authorize replacing its durable pending intent.
 
+## Replacing an executor that lost its journal
+
+`http::journal::ProducerControlClient` uses a small scheduler-owned control
+record. It reuses the WAL's existing generation fence and exact-tail retirement;
+no separate producer registry is required.
+
+1. Retain the original `ProducerOpen` tuple and an independently confirmed source
+   checkpoint in durable scheduler state. After executor loss, choose and persist
+   one replacement operation UUID.
+2. Call `prepare_replacement` with that original tuple and operation. It recovers
+   the signed predecessor credential. Durably save the **entire** returned
+   `ReplacementIntent` before calling `execute`.
+3. Execute that saved intent. The service fences the exact predecessor. It returns
+   `WaitingForRetirement` until the predecessor's latest source record has been
+   published and retired. Keep the same intent while waiting or after an unknown
+   response. Do not rerun preparation after replacement might have succeeded:
+   the original producer generation may already be gone.
+4. `Opened` returns the successor `ProducerOpen` tuple and credential. Persist the
+   tuple before starting its single executor with a fresh journal. Resume source
+   **first-create** operations from the last fully confirmed checkpoint. Existing
+   business keys preserve the original body and current annotations.
+
+The managed `replace-producer` HTTP route accepts the signed predecessor and
+replacement operation, routes by that credential's table/shard scope, and retains
+the owner's publication fence. A competing operation or stale generation receives
+409. The Rust client exposes a validated fence as `ProducerReplacementFenced`.
+It does not automatically retry. Pending-retirement polls use quorum observations.
+
+Repeating a successful intent returns the same live successor, even if it has
+already written. This is **not** permission to restart its sequence at one with an
+empty journal. If that successor executor also loses its journal, fence it with a
+new replacement intent. Scheduler ownership must prevent two executors using one
+generation. Replacement does not resolve old request results, make arbitrary
+annotation patches safe to replay, or complete source-output obligations. Keep
+those recovery records until the application's checkpoint protocol permits their
+removal.
+
 ## Read and source progress
 
 Annotation point reads use the internal business key and the existing owner read
@@ -84,6 +121,26 @@ external reader retention is integrated. WAL source progress uses the existing
 managed publication protocol. Long-running storage reclamation and a real
 application's source checkpoint bridge require separate qualification.
 
+## Membership cache observations
+
+The existing annotation observation includes `immutable_membership` cache
+diagnostics. Its `misses` is the sum of `miss_disabled`, `miss_absent`,
+`miss_wrong_key`, `miss_wrong_lineage` and `miss_future_cut`. These describe
+resident probes, not completed ingestion, publication or source progress.
+`miss_absent` cannot distinguish a new key, eviction, unsupported resident
+lookup or a fresh owner namespace. Ordinary verified append publication preserves
+the namespace and lineage. `warms` counts submitted insertions, which may be
+immediately evicted; `refusals` counts backing admission or size failures, not
+evictions.
+
+`session_cache_capacity_bytes` and `session_cache_reported_entries` report the
+existing shared Session backend, including other entry types and namespaces.
+The latter is an approximate entry count whose zero value can also mean the
+backend does not support a cheap count. Neither field measures membership-only
+resident bytes. No eviction count is exposed by the current cache API. These
+observations perform no cache enumeration, maintenance flush, storage read or
+extra key lookup; each membership probe still updates one atomic counter.
+
 ## Executable integration checks
 
 The Rust `tests::generic_turns` tests use actual RF3 services, Lance files and
@@ -104,3 +161,72 @@ repeats it and adds two keys; the fourth adds two keys in another session.
 and `selected-body.json` for independent reader compatibility checks.
 
 These are correctness checks, not throughput or real-source acceptance results.
+
+## Bounded Arrow-file replay
+
+Build the example inside this repository, using its root `Cargo.lock` and
+`[patch]` entries. Cargo does not inherit these patches when another workspace
+adds a git dependency on `lance-context-ingest`. An independently configured
+consumer workspace must supply and qualify its own matching patches.
+
+```sh
+cargo build --locked -p lance-context-ingest --features service,http-client \
+  --example managed_turn_replay
+managed_turn_replay spec input.arrow session_id session_id id > turn-spec.json
+managed_turn_replay validate replay.json input.arrow
+managed_turn_replay append replay.json input.arrow
+managed_turn_replay append-batched fresh-replay.json input.arrow
+managed_turn_replay resume replay.json
+managed_turn_replay verify replay.json input.arrow replay.log owner.json
+managed_turn_replay slot owner.json GROUP SLOT
+```
+
+`replay.json` supplies `layout`, `binding`, `spec`, staging `limits`, `shard`,
+the persisted producer `open` tuple, `endpoint`, `bearer_token_file` and
+`journal_directory`. Generate `spec` from the actual input: schema metadata is
+part of the binding, so a synthetic fixture does not establish a real input's
+schema contract. Provision the matching fresh table pair before replay.
+`validate` checks schema and business-key bounds without opening a journal or
+contacting the service; its output contains aggregate counts and lengths only.
+`slot` performs a read-only quorum query with the owner's existing trusted WAL
+configuration. Slots are allocated per Raft group across all table bindings;
+using the same slot number for two tables does not create independent producers.
+
+This entry runs one producer lane on one already partitioned shard. It uses the
+normal `DurableMutationClient`, accepts an IPC file of at most 128 MiB and bounds
+each request to the configured limits (at most 8 MiB / 8192 rows). An oversized
+individual turn is rejected. It shares a 1 GiB memory budget with its journal.
+For wide schemas, the existing service-test configuration uses
+`RUST_MIN_STACK=16777216`.
+
+`append` requires a fresh journal directory. On an uncertain result, preserve
+that directory and producer tuple; `resume` resolves its pending intent and
+waits for its selected publication. It does not resume a source reader or infer
+which later file rows to skip. Each successful request reports the input batch,
+row interval, producer sequence and WAL index. Current replay output uses an
+absolute input row start and count, including when a request spans source batches.
+The final JSON reports the exact
+selected body reference and covered cut. Preserve version numbers as `u64` or
+raw JSON: detached versions can exceed JavaScript's exact integer range.
+
+`verify` checks that the replay ACKs cover the entire input, then opens the exact
+selected body version and validates its native transaction and authorized URI.
+It compares schema/metadata and every value against the first input occurrence
+of each business key, rejecting missing or duplicate published keys. This bounded
+test expects a fresh destination containing only that input's unique keys. It
+prints only counts and snapshot identities. Its expected input is limited to
+128 MiB IPC, one million rows and 512 MiB of unique Arrow buffer allocations;
+these limits are verifier bounds, not a native scanner RSS quota.
+
+`append-batched` groups consecutive input batches toward half the configured
+record byte limit, while respecting the row limit. It writes them into one IPC
+file without concatenating body arrays. If actual encoded bytes exceed the
+record limit, it splits the group with shared Arrow slices before sending.
+It uses a fresh journal and one sequential producer lane, just like `append`.
+Compare it with `append` on the same input and controlled cold/warm state;
+duplicate-only replays do not measure throughput for newly inserted rows.
+
+The reported times measure this sequential replay, including client journal
+sync, encoding, RPC and publication waiting. They are not a sustained capacity
+benchmark. The entry never advances an external source checkpoint, and its
+candidate-row count is not a count of newly inserted unique turns.

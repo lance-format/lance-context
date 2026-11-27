@@ -4,14 +4,13 @@ use arrow_array::{
     LargeBinaryArray, RecordBatchIterator, TimestampMicrosecondArray,
 };
 use futures::TryStreamExt;
-use lance::dataset::{builder::DatasetBuilder, WriteParams};
+use lance::dataset::{builder::DatasetBuilder, ReadParams, WriteParams};
 use lance::index::DatasetIndexExt;
 use lance_context_ingest::materializer::Storage;
 use lance_context_wal::replication::{
     publication::lance::ManagedManifest,
     runtime::client::{Reply, Request},
 };
-use lance_io::object_store::{ObjectStoreParams, StorageOptionsAccessor};
 use lance_table::io::commit::ConditionalPutCommitHandler;
 
 fn batch(first: usize, rows: usize) -> Result<RecordBatch, arrow_schema::ArrowError> {
@@ -66,12 +65,7 @@ pub(super) async fn seed(config: &Config, w: &Workload) -> Result<()> {
         Some(WriteParams {
             enable_stable_row_ids: true,
             commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
-            store_params: Some(ObjectStoreParams {
-                storage_options_accessor: Some(Arc::new(
-                    StorageOptionsAccessor::with_static_options(store.options),
-                )),
-                ..Default::default()
-            }),
+            store_params: Some(store.params),
             ..Default::default()
         }),
     )
@@ -119,7 +113,10 @@ pub(super) async fn verify(config: &Config, w: &Workload) -> Result<()> {
     let started = Instant::now();
     let dataset = loop {
         let dataset = DatasetBuilder::from_uri(&store.uri)
-            .with_storage_options(store.options.clone())
+            .with_read_params(ReadParams {
+                store_options: Some(store.params.clone()),
+                ..Default::default()
+            })
             .with_session(store.session.clone())
             .with_commit_handler(Arc::new(reader.clone()))
             .load()

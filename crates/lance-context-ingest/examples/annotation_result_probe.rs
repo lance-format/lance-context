@@ -136,7 +136,10 @@ async fn main() -> Result<()> {
         table.binding.incarnation,
     )?);
     let selected = DatasetBuilder::from_uri(&storage.uri)
-        .with_storage_options(storage.options.clone())
+        .with_read_params(lance::dataset::ReadParams {
+            store_options: Some(storage.params.clone()),
+            ..Default::default()
+        })
         .with_session(storage.session.clone())
         .with_commit_handler(handler.clone())
         .load()
@@ -225,7 +228,10 @@ async fn main() -> Result<()> {
         );
     }
     let after = DatasetBuilder::from_uri(&storage.uri)
-        .with_storage_options(storage.options)
+        .with_read_params(lance::dataset::ReadParams {
+            store_options: Some(storage.params.clone()),
+            ..Default::default()
+        })
         .with_session(storage.session)
         .with_commit_handler(handler)
         .load()

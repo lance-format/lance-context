@@ -1,0 +1,1318 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Vector Storage, holding (quantized) vectors and providing distance calculation.
+
+use crate::vector::quantizer::QuantizerStorage;
+use arrow::compute::concat_batches;
+use arrow_array::{
+    Array, ArrayRef, FixedSizeListArray, RecordBatch, UInt8Array, cast::AsArray, types::UInt8Type,
+};
+use arrow_schema::SchemaRef;
+use futures::stream::{self, Stream, StreamExt, TryStreamExt};
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
+use lance_core::deepsize::DeepSizeOf;
+use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::{Error, ROW_ID, Result};
+use lance_encoding::decoder::FilterExpression;
+use lance_file::reader::FileReader;
+use lance_index_core::remapping::{BatchRowIdRemapper, remap_row_ids_preserving_layout_async};
+use lance_io::ReadBatchParams;
+use lance_io::scheduler::IoStats;
+use lance_io::spill::SpillStore;
+use lance_linalg::distance::DistanceType;
+use prost::Message;
+use std::{
+    any::Any,
+    borrow::Cow,
+    collections::BinaryHeap,
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+
+use crossbeam_queue::ArrayQueue;
+
+use crate::frag_reuse::{FragReuseIndex, FragReuseIndexHandle};
+use crate::scalar::RowIdRemapper;
+use crate::{
+    pb,
+    vector::{
+        ivf::storage::{IVF_METADATA_KEY, IvfModel},
+        quantizer::Quantization,
+    },
+};
+
+use super::graph::OrderedFloat;
+use super::graph::OrderedNode;
+use super::pairwise::{
+    EncodedPartition, PairwisePartition, PairwiseScorer, PairwiseSpillWriter, list_values,
+};
+use super::quantizer::{Quantizer, QuantizerMetadata};
+use super::{ApproxMode, DISTANCE_TYPE_KEY};
+
+/// Coalesce source-index reads independently of the scoring vector batch size.
+const PAIRWISE_READ_BATCH_SIZE: usize = 8192;
+// Bound each scoring/spill batch in code space; very wide vectors still need
+// at least one aligned group of 32 rows for packed quantizers.
+const PAIRWISE_VECTOR_BATCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Stage consecutive `batch_size` row ranges of `source` concurrently on the
+/// CPU pool, yielding them in storage order.
+fn stage_pairwise_batches(
+    scorer: Arc<PairwiseScorer>,
+    source: RecordBatch,
+    batch_size: usize,
+    remapper: Option<Arc<dyn RowIdRemapper>>,
+) -> impl Stream<Item = Result<RecordBatch>> {
+    let source = Arc::new(source);
+    let num_rows = source.num_rows();
+    stream::iter((0..num_rows).step_by(batch_size))
+        .map(move |start| {
+            let rows = start..start.saturating_add(batch_size).min(num_rows);
+            let (source, scorer, remapper) = (source.clone(), scorer.clone(), remapper.clone());
+            spawn_cpu(move || scorer.stage(&source, rows, remapper.as_deref()))
+        })
+        .buffered(get_num_compute_intensive_cpus())
+}
+
+async fn spawn_prewarm_materialization<R, F>(materialize: F) -> Result<R>
+where
+    R: Send + 'static,
+    F: FnOnce() -> Result<R> + Send + 'static,
+{
+    // `spawn_cpu` work is non-cancellable. If the caller-owned cache loader is
+    // dropped, this pure CPU tail may finish, but its result is dropped with
+    // this future and therefore cannot be inserted into the cache. A later
+    // cache lookup remains responsible for retrying the load.
+    spawn_cpu(materialize).await
+}
+
+fn compact_prewarm_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
+    let schema = batches
+        .first()
+        .ok_or_else(|| Error::internal("prewarm partition has no storage batches"))?
+        .schema();
+    if batches.len() == 1 {
+        let batch = batches.into_iter().next().ok_or_else(|| {
+            Error::internal("prewarm partition storage batch unexpectedly missing")
+        })?;
+        if batch.num_rows() == 0 {
+            Ok(batch)
+        } else {
+            Ok(batch.shrink_to_fit()?)
+        }
+    } else {
+        // Concatenation allocates compact output buffers already; do not
+        // deep-copy them a second time with `shrink_to_fit`.
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+}
+
+/// <section class="warning">
+///  Internal API
+///
+///  API stability is not guaranteed
+/// </section>
+pub trait DistCalculator {
+    fn distance(&self, id: u32) -> f32;
+
+    // return the distances of all rows
+    // k_hint is a hint that can be used for optimization
+    fn distance_all(&self, k_hint: usize) -> Vec<f32>;
+
+    // Write the distances of all rows into caller-owned scratch buffers.
+    fn distance_all_with_scratch(
+        &self,
+        k_hint: usize,
+        dists: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+        _u32_scratch: &mut Vec<u32>,
+    ) {
+        *dists = self.distance_all(k_hint);
+    }
+
+    fn prefetch(&self, _id: u32) {}
+
+    /// Whether [`Self::accumulate_topk_with_scratch`] can replace scoring every
+    /// row with [`Self::distance_all`] and pushing each score into a top-k heap.
+    ///
+    /// When this returns true, `accumulate_topk_with_scratch` into an empty heap
+    /// must, for any `lower_bound` and `upper_bound`, select the same rows (up
+    /// to ties at the k-th distance), with bit-identical distances, as pushing
+    /// every `distance_all` score that lies in `[lower_bound, upper_bound)`, or
+    /// every score when both bounds are `None`. Since the accumulator treats a
+    /// missing bound as `f32::MIN` or `f32::MAX`, every score must lie in
+    /// `[f32::MIN, f32::MAX)`.
+    fn has_exact_topk_scan(&self) -> bool {
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_id: impl Fn(u32) -> u64,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        dists: &mut Vec<f32>,
+        u16_scratch: &mut Vec<u16>,
+        u8_scratch: &mut Vec<u8>,
+        u32_scratch: &mut Vec<u32>,
+    ) {
+        if k == 0 {
+            return;
+        }
+
+        self.distance_all_with_scratch(k, dists, u16_scratch, u8_scratch, u32_scratch);
+        accumulate_distances_into_heap(k, lower_bound, upper_bound, row_id, res, dists);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_filtered_topk_with_scratch(
+        &self,
+        k: usize,
+        lower_bound: Option<f32>,
+        upper_bound: Option<f32>,
+        row_ids: impl Iterator<Item = (u32, u64)>,
+        accept_row: impl Fn(u64) -> bool,
+        res: &mut BinaryHeap<OrderedNode<u64>>,
+        _dists: &mut Vec<f32>,
+        _u16_scratch: &mut Vec<u16>,
+        _u8_scratch: &mut Vec<u8>,
+        _u32_scratch: &mut Vec<u32>,
+    ) {
+        if k == 0 {
+            return;
+        }
+
+        let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+        let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+        let mut max_dist = res.peek().map(|node| node.dist);
+
+        for (id, row_id) in row_ids {
+            if !accept_row(row_id) {
+                continue;
+            }
+            let dist = OrderedFloat(self.distance(id));
+            if dist < lower_bound || dist >= upper_bound {
+                continue;
+            }
+            if res.len() < k {
+                res.push(OrderedNode::new(row_id, dist));
+                if res.len() == k {
+                    max_dist = res.peek().map(|node| node.dist);
+                }
+            } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+                res.pop();
+                res.push(OrderedNode::new(row_id, dist));
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        }
+    }
+}
+
+/// Push rows `0..dists.len()` whose distance lies in `[lower_bound,
+/// upper_bound)` into the top-`k` heap `res`.
+pub(crate) fn accumulate_distances_into_heap(
+    k: usize,
+    lower_bound: Option<f32>,
+    upper_bound: Option<f32>,
+    row_id: impl Fn(u32) -> u64,
+    res: &mut BinaryHeap<OrderedNode<u64>>,
+    dists: &[f32],
+) {
+    let lower_bound = lower_bound.unwrap_or(f32::MIN).into();
+    let upper_bound = upper_bound.unwrap_or(f32::MAX).into();
+    let mut max_dist = res.peek().map(|node| node.dist);
+
+    for (id, dist) in dists.iter().copied().enumerate() {
+        let dist = OrderedFloat(dist);
+        if dist < lower_bound || dist >= upper_bound {
+            continue;
+        }
+        if res.len() < k {
+            res.push(OrderedNode::new(row_id(id as u32), dist));
+            if res.len() == k {
+                max_dist = res.peek().map(|node| node.dist);
+            }
+        } else if max_dist.is_some_and(|max_dist| max_dist > dist) {
+            res.pop();
+            res.push(OrderedNode::new(row_id(id as u32), dist));
+            max_dist = res.peek().map(|node| node.dist);
+        }
+    }
+}
+
+pub const STORAGE_METADATA_KEY: &str = "storage_metadata";
+
+#[derive(Debug)]
+pub struct QueryScratch {
+    pub distances: Vec<f32>,
+    pub query_f32: Vec<f32>,
+    pub u16: Vec<u16>,
+    pub u8: Vec<u8>,
+    pub u32: Vec<u32>,
+}
+
+impl QueryScratch {
+    pub const fn new() -> Self {
+        Self {
+            distances: Vec::new(),
+            query_f32: Vec::new(),
+            u16: Vec::new(),
+            u8: Vec::new(),
+            u32: Vec::new(),
+        }
+    }
+
+    pub fn with_capacity(capacity: QueryScratchCapacity) -> Self {
+        Self {
+            distances: vec![0.0; capacity.distances],
+            query_f32: vec![0.0; capacity.query_f32],
+            u16: vec![0; capacity.u16],
+            u8: vec![0; capacity.u8],
+            u32: vec![0; capacity.u32],
+        }
+    }
+}
+
+impl Default for QueryScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeepSizeOf for QueryScratch {
+    fn deep_size_of_children(&self, _context: &mut lance_core::deepsize::Context) -> usize {
+        self.distances.capacity() * size_of::<f32>()
+            + self.query_f32.capacity() * size_of::<f32>()
+            + self.u16.capacity() * size_of::<u16>()
+            + self.u8.capacity() * size_of::<u8>()
+            + self.u32.capacity() * size_of::<u32>()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QueryScratchCapacity {
+    pub distances: usize,
+    pub query_f32: usize,
+    pub u16: usize,
+    pub u8: usize,
+    pub u32: usize,
+}
+
+impl QueryScratchCapacity {
+    pub const fn new(distances: usize, query_f32: usize, u16: usize, u8: usize) -> Self {
+        Self::new_with_u32(distances, query_f32, u16, u8, 0)
+    }
+
+    pub const fn new_with_u32(
+        distances: usize,
+        query_f32: usize,
+        u16: usize,
+        u8: usize,
+        u32: usize,
+    ) -> Self {
+        Self {
+            distances,
+            query_f32,
+            u16,
+            u8,
+            u32,
+        }
+    }
+
+    fn deep_size_bytes(&self) -> usize {
+        self.distances * size_of::<f32>()
+            + self.query_f32 * size_of::<f32>()
+            + self.u16 * size_of::<u16>()
+            + self.u8 * size_of::<u8>()
+            + self.u32 * size_of::<u32>()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DistanceCalculatorOptions {
+    pub approx_mode: ApproxMode,
+}
+
+#[derive(Debug)]
+pub struct RabitRawQueryContext {
+    pub code_dim: usize,
+    pub ex_bits: u8,
+    pub rotated_query: Vec<f32>,
+    pub dist_table: Vec<f32>,
+    /// The rotated query zero-padded to a 64-dim multiple for the ex-dot
+    /// kernels; empty when `code_dim` is already aligned (the kernels then
+    /// read `rotated_query` directly).
+    pub ex_query: Vec<f32>,
+    pub sum_q: f32,
+}
+
+#[derive(Clone, Copy)]
+pub enum QueryResidual<'a> {
+    Centroid(&'a dyn arrow_array::Array),
+    RabitRawQuery {
+        rotated_centroid: Option<&'a [f32]>,
+        query: Option<&'a RabitRawQueryContext>,
+    },
+}
+
+#[derive(Debug)]
+pub struct QueryScratchPool {
+    scratches: ArrayQueue<QueryScratch>,
+    scratch_capacity: QueryScratchCapacity,
+}
+
+impl QueryScratchPool {
+    pub fn new(size: usize) -> Self {
+        Self::with_capacity(size, QueryScratchCapacity::default())
+    }
+
+    pub fn with_capacity(size: usize, capacity: QueryScratchCapacity) -> Self {
+        let size = size.max(1);
+        let scratches = ArrayQueue::new(size);
+        for _ in 0..size {
+            scratches
+                .push(QueryScratch::with_capacity(capacity))
+                .expect("query scratch pool should have spare capacity during initialization");
+        }
+        Self {
+            scratches,
+            scratch_capacity: capacity,
+        }
+    }
+
+    pub fn scratch(&self) -> QueryScratchGuard<'_> {
+        let (scratch, pooled) = if let Some(scratch) = self.scratches.pop() {
+            (scratch, true)
+        } else {
+            (QueryScratch::with_capacity(self.scratch_capacity), false)
+        };
+        QueryScratchGuard {
+            pool: self,
+            scratch: Some(scratch),
+            pooled,
+        }
+    }
+
+    pub fn with_scratch<T>(&self, f: impl FnOnce(&mut QueryScratch) -> T) -> T {
+        let mut scratch = self.scratch();
+        f(&mut scratch)
+    }
+}
+
+pub struct QueryScratchGuard<'a> {
+    pool: &'a QueryScratchPool,
+    scratch: Option<QueryScratch>,
+    pooled: bool,
+}
+
+impl Deref for QueryScratchGuard<'_> {
+    type Target = QueryScratch;
+
+    fn deref(&self) -> &Self::Target {
+        self.scratch
+            .as_ref()
+            .expect("query scratch guard should hold scratch")
+    }
+}
+
+impl DerefMut for QueryScratchGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.scratch
+            .as_mut()
+            .expect("query scratch guard should hold scratch")
+    }
+}
+
+impl Drop for QueryScratchGuard<'_> {
+    fn drop(&mut self) {
+        if !self.pooled {
+            return;
+        }
+        if let Some(scratch) = self.scratch.take() {
+            match self.pool.scratches.push(scratch) {
+                Ok(()) => {}
+                Err(_) => unreachable!("query scratch pool should not exceed its capacity"),
+            }
+        }
+    }
+}
+
+impl DeepSizeOf for QueryScratchPool {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        let mut total = self.scratches.capacity() * size_of::<QueryScratch>();
+        let mut scratches = Vec::new();
+        while let Some(scratch) = self.scratches.pop() {
+            total += scratch.deep_size_of_children(context);
+            scratches.push(scratch);
+        }
+        let checked_out = self.scratches.capacity().saturating_sub(scratches.len());
+        total += checked_out * self.scratch_capacity.deep_size_bytes();
+        for scratch in scratches {
+            let _ = self.scratches.push(scratch);
+        }
+        total
+    }
+}
+
+/// Vector Storage is the abstraction to store the vectors.
+///
+/// It can be in-memory or on-disk, raw vector or quantized vectors.
+///
+/// It abstracts away the logic to compute the distance between vectors.
+///
+/// TODO: should we rename this to "VectorDistance"?;
+///
+/// <section class="warning">
+///  Internal API
+///
+///  API stability is not guaranteed
+/// </section>
+pub trait VectorStore: Send + Sync + Sized + Clone {
+    type DistanceCalculator<'a>: DistCalculator
+    where
+        Self: 'a;
+
+    fn as_any(&self) -> &dyn Any;
+
+    fn schema(&self) -> &SchemaRef;
+
+    fn to_batches(&self) -> Result<impl Iterator<Item = RecordBatch> + Send>;
+
+    fn len(&self) -> usize;
+
+    /// Returns true if this graph is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return [DistanceType].
+    fn distance_type(&self) -> DistanceType;
+
+    /// Get the lance ROW ID from one vector.
+    fn row_id(&self, id: u32) -> u64;
+
+    fn row_ids(&self) -> impl Iterator<Item = &u64>;
+
+    /// Append Raw [RecordBatch] into the Storage.
+    /// The storage implement will perform quantization if necessary.
+    fn append_batch(&self, batch: RecordBatch, vector_column: &str) -> Result<Self>;
+
+    /// Create a [DistCalculator] to compute the distance between the query.
+    ///
+    /// Using dist calculator can be more efficient as it can pre-compute some
+    /// values.
+    fn dist_calculator(&self, query: ArrayRef, dist_q_c: f32) -> Self::DistanceCalculator<'_>;
+
+    /// Create a [DistCalculator], reusing caller-owned scratch for query-time
+    /// precomputed state when the storage supports it.
+    fn dist_calculator_with_scratch<'a>(
+        &'a self,
+        query: ArrayRef,
+        dist_q_c: f32,
+        _residual: Option<QueryResidual<'a>>,
+        _f32_scratch: &'a mut Vec<f32>,
+        _options: DistanceCalculatorOptions,
+    ) -> Self::DistanceCalculator<'a> {
+        self.dist_calculator(query, dist_q_c)
+    }
+
+    fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_>;
+
+    fn dist_between(&self, u: u32, v: u32) -> f32 {
+        let dist_cal_u = self.dist_calculator_from_id(u);
+        dist_cal_u.distance(v)
+    }
+
+    fn prefers_candidate(&self, candidate: &OrderedNode, selected: &[OrderedNode]) -> bool {
+        let dist_cal_candidate = self.dist_calculator_from_id(candidate.id);
+        selected
+            .iter()
+            .all(|other| candidate.dist < OrderedFloat(dist_cal_candidate.distance(other.id)))
+    }
+}
+
+pub struct StorageBuilder<Q: Quantization> {
+    vector_column: String,
+    distance_type: DistanceType,
+    quantizer: Q,
+
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+}
+
+impl<Q: Quantization> StorageBuilder<Q> {
+    pub fn new(
+        vector_column: String,
+        distance_type: DistanceType,
+        quantizer: Q,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::new_with_remapper(vector_column, distance_type, quantizer, frag_reuse_index)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_remapper(
+        vector_column: String,
+        distance_type: DistanceType,
+        quantizer: Q,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            vector_column,
+            distance_type,
+            quantizer,
+            frag_reuse_index,
+        })
+    }
+
+    pub fn build(&self, batches: Vec<RecordBatch>) -> Result<Q::Storage> {
+        let mut batch = concat_batches(batches[0].schema_ref(), batches.iter())?;
+
+        if batch.column_by_name(self.quantizer.column()).is_none() {
+            let vectors = batch
+                .column_by_name(&self.vector_column)
+                .ok_or(Error::index(format!(
+                    "Vector column {} not found in batch",
+                    self.vector_column
+                )))?;
+            let codes = self.quantizer.quantize(vectors)?;
+            batch = batch.drop_column(&self.vector_column)?.try_with_column(
+                arrow_schema::Field::new(self.quantizer.column(), codes.data_type().clone(), true),
+                codes,
+            )?;
+        }
+
+        debug_assert!(batch.column_by_name(ROW_ID).is_some());
+        debug_assert!(batch.column_by_name(self.quantizer.column()).is_some());
+
+        Q::Storage::try_from_batch_with_remapper(
+            batch,
+            &self.quantizer.metadata(None),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+        )
+    }
+}
+
+/// Loader to load partitioned PQ storage from disk.
+#[derive(Debug)]
+pub struct IvfQuantizationStorage<Q: Quantization> {
+    reader: FileReader,
+
+    distance_type: DistanceType,
+    metadata: Q::Metadata,
+
+    ivf: IvfModel,
+    /// Legacy synchronous remapper (index_version 0). Mutually exclusive with
+    /// `batch_remapper`; both `None` means no translation is needed.
+    frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    /// Asynchronous batch remapper (tagged histories).
+    batch_remapper: Option<Arc<dyn BatchRowIdRemapper>>,
+}
+
+impl<Q: Quantization> DeepSizeOf for IvfQuantizationStorage<Q> {
+    fn deep_size_of_children(&self, context: &mut lance_core::deepsize::Context) -> usize {
+        self.metadata.deep_size_of_children(context) + self.ivf.deep_size_of_children(context)
+    }
+}
+
+impl<Q: Quantization> IvfQuantizationStorage<Q> {
+    /// Open a Loader.
+    ///
+    ///
+    pub async fn try_new(
+        reader: FileReader,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Result<Self> {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::try_new_with_remapper(reader, frag_reuse_index).await
+    }
+
+    #[doc(hidden)]
+    pub async fn try_new_with_remapper(
+        reader: FileReader,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Self> {
+        let schema = reader.schema();
+
+        let distance_type = DistanceType::try_from(
+            schema
+                .metadata
+                .get(DISTANCE_TYPE_KEY)
+                .ok_or(Error::index(format!("{} not found", DISTANCE_TYPE_KEY)))?
+                .as_str(),
+        )?;
+
+        let ivf_pos = schema
+            .metadata
+            .get(IVF_METADATA_KEY)
+            .ok_or(Error::index(format!("{} not found", IVF_METADATA_KEY)))?
+            .parse()
+            .map_err(|e| Error::index(format!("Failed to decode IVF metadata: {}", e)))?;
+        // Parsed before the reads below because it holds the position of the
+        // quantizer buffer, which is what lets that read start alongside the
+        // IVF one.
+        let mut metadata_strs: Vec<String> = serde_json::from_str(
+            schema
+                .metadata
+                .get(STORAGE_METADATA_KEY)
+                .ok_or(Error::index(format!("{} not found", STORAGE_METADATA_KEY)))?
+                .as_str(),
+        )?;
+        debug_assert_eq!(metadata_strs.len(), 1);
+        // for now the metadata is the same for all partitions, so we just store one
+        let metadata_str = metadata_strs
+            .pop()
+            .ok_or(Error::index("metadata is empty".to_string()))?;
+        let mut metadata: Q::Metadata = serde_json::from_str(&metadata_str)?;
+        let quantizer_buffer_pos = metadata.buffer_index();
+
+        // Both positions come from the schema metadata, so the reads do not
+        // depend on each other: issue them together instead of waiting for the
+        // IVF protobuf before asking for the quantizer buffer.
+        let (ivf_bytes, quantizer_bytes) =
+            futures::try_join!(reader.read_global_buffer(ivf_pos), async {
+                match quantizer_buffer_pos {
+                    Some(pos) => reader.read_global_buffer(pos).await.map(Some),
+                    None => Ok(None),
+                }
+            })?;
+        let ivf = IvfModel::try_from(pb::Ivf::decode(ivf_bytes)?)?;
+
+        // we store large metadata (e.g. PQ codebook) in global buffer,
+        // and the schema metadata just contains a pointer to the buffer
+        if let Some(bytes) = quantizer_bytes {
+            metadata.parse_buffer(bytes)?;
+        }
+
+        Ok(Self {
+            reader,
+            distance_type,
+            metadata,
+            ivf,
+            frag_reuse_index,
+            batch_remapper: None,
+        })
+    }
+
+    /// Construct from pre-parsed metadata, skipping global buffer reads.
+    /// Used when reconstructing from a disk cache.
+    pub fn from_cached(
+        reader: FileReader,
+        ivf: IvfModel,
+        metadata: Q::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+    ) -> Self {
+        let frag_reuse_index = frag_reuse_index
+            .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
+        Self::from_cached_with_remapper(reader, ivf, metadata, distance_type, frag_reuse_index)
+    }
+
+    #[doc(hidden)]
+    pub fn from_cached_with_remapper(
+        reader: FileReader,
+        ivf: IvfModel,
+        metadata: Q::Metadata,
+        distance_type: DistanceType,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Self {
+        Self {
+            reader,
+            distance_type,
+            metadata,
+            ivf,
+            frag_reuse_index,
+            batch_remapper: None,
+        }
+    }
+
+    /// Set the batch row-ID remapper used when decoding each partition.
+    ///
+    /// Only tagged fragment-reuse histories use this; the legacy remapper is
+    /// supplied through the constructors instead.
+    pub fn with_row_id_remapping(mut self, remapping: Arc<dyn BatchRowIdRemapper>) -> Self {
+        self.frag_reuse_index = None;
+        self.batch_remapper = Some(remapping);
+        debug_assert!(self.frag_reuse_index.is_none() || self.batch_remapper.is_none());
+        self
+    }
+
+    pub fn reader(&self) -> &FileReader {
+        &self.reader
+    }
+
+    pub fn ivf(&self) -> &IvfModel {
+        &self.ivf
+    }
+
+    pub fn num_rows(&self) -> u64 {
+        self.reader.num_rows()
+    }
+
+    pub fn partition_size(&self, part_id: usize) -> usize {
+        self.ivf.partition_size(part_id)
+    }
+
+    pub fn quantizer(&self) -> Result<Quantizer> {
+        let metadata = self.metadata();
+        Q::from_metadata(metadata, self.distance_type)
+    }
+
+    pub fn metadata(&self) -> &Q::Metadata {
+        &self.metadata
+    }
+
+    pub fn distance_type(&self) -> DistanceType {
+        self.distance_type
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        Arc::new(self.reader.schema().as_ref().into())
+    }
+
+    /// Get the number of partitions in the storage.
+    pub fn num_partitions(&self) -> usize {
+        self.ivf.num_partitions()
+    }
+
+    /// Load a partition's quantization storage, optionally measuring the exact
+    /// I/O it performs into `io_stats`.
+    ///
+    /// When `io_stats` is `Some`, the partition is read through a reader whose
+    /// scheduler also records into the sink (a cheap clone that shares all
+    /// cached metadata, so no file is re-opened).  When `None`, the normal
+    /// uninstrumented reader is used.
+    pub async fn load_partition(
+        &self,
+        part_id: usize,
+        io_stats: Option<IoStats>,
+    ) -> Result<Q::Storage> {
+        let range = self.ivf.row_range(part_id);
+        let batch = if range.is_empty() {
+            let schema = self.reader.schema();
+            let arrow_schema = arrow_schema::Schema::from(schema.as_ref());
+            RecordBatch::new_empty(Arc::new(arrow_schema))
+        } else {
+            let reader = match &io_stats {
+                Some(io_stats) => Cow::Owned(self.reader.with_io_stats(io_stats.recorder())),
+                None => Cow::Borrowed(&self.reader),
+            };
+            let batches = reader
+                .read_stream(
+                    ReadBatchParams::Range(range),
+                    u32::MAX,
+                    1,
+                    FilterExpression::no_filter(),
+                )
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+            let schema = Arc::new(self.reader.schema().as_ref().into());
+            concat_batches(&schema, batches.iter())?
+        };
+        if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            lance_index_core::remapping::check_batch_remapping_entry()?;
+            let row_id_idx = batch.schema().index_of(ROW_ID)?;
+            let (batch, remapper) =
+                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
+                    .await?;
+            return Q::Storage::try_from_batch_with_remapper(
+                batch,
+                self.metadata(),
+                self.distance_type,
+                Some(remapper),
+            );
+        }
+        // Legacy synchronous remapping path.
+        Q::Storage::try_from_batch_with_remapper(
+            batch,
+            self.metadata(),
+            self.distance_type,
+            self.frag_reuse_index.clone(),
+        )
+    }
+
+    /// Read only `columns` of the given rows; the batch keeps file schema order.
+    async fn read_vector_columns(
+        &self,
+        params: ReadBatchParams,
+        columns: &[&str],
+    ) -> Result<RecordBatch> {
+        let projection = lance_file::versions::reader_projection_from_column_names(
+            self.reader.version(),
+            self.reader.schema(),
+            columns,
+        )?;
+        let schema = Arc::new(projection.schema.as_ref().into());
+        let batches = self
+            .reader
+            .read_stream_projected(
+                params,
+                u32::MAX,
+                1,
+                projection,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+
+    async fn read_vector_range(&self, range: std::ops::Range<usize>) -> Result<RecordBatch> {
+        let batches = self
+            .reader
+            .read_stream(
+                ReadBatchParams::Range(range),
+                u32::MAX,
+                1,
+                FilterExpression::no_filter(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let schema = Arc::new(self.reader.schema().as_ref().into());
+        Ok(concat_batches(&schema, batches.iter())?)
+    }
+
+    /// Stage a partition's codes once for native pair scoring, in storage order.
+    ///
+    /// `batch_size` is a maximum; wide staged rows use smaller power-of-two
+    /// batches targeting 16 MiB, with a minimum packed group of 32 rows.
+    /// Partitions whose staged size exceeds `memory_limit` are written to
+    /// `spill_store` one batch at a time. Row IDs are remapped during staging.
+    pub async fn prepare_pairwise_partition(
+        &self,
+        partition_id: usize,
+        batch_size: usize,
+        memory_limit: usize,
+        centroid: ArrayRef,
+        spill_store: &dyn SpillStore,
+    ) -> Result<PairwisePartition> {
+        if batch_size == 0 || !batch_size.is_multiple_of(32) {
+            return Err(Error::invalid_input(format!(
+                "pairwise batch_size={batch_size} must be a positive multiple of 32"
+            )));
+        }
+        if partition_id >= self.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.num_partitions()
+            )));
+        }
+        let num_rows = self.partition_size(partition_id);
+        let quantizer = self.quantizer()?;
+        let scorer = {
+            let quantizer = quantizer.clone();
+            let metric = self.distance_type;
+            let schema = self.schema();
+            Arc::new(
+                spawn_cpu(move || PairwiseScorer::new(&quantizer, centroid, metric, &schema))
+                    .await?,
+            )
+        };
+        let row_bytes = scorer.row_bytes();
+        let rows = PAIRWISE_VECTOR_BATCH_BYTES / row_bytes;
+        let batch_size = if rows < batch_size {
+            1usize << rows.max(32).ilog2()
+        } else {
+            batch_size
+        };
+        let fits = row_bytes
+            .checked_mul(num_rows)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .is_some_and(|bytes| bytes <= memory_limit);
+        let encoded = if num_rows == 0 {
+            EncodedPartition::Memory(Vec::new())
+        } else if fits {
+            let source = self
+                .read_pairwise_codes(partition_id, 0..num_rows, &quantizer)
+                .await?;
+            EncodedPartition::Memory(
+                stage_pairwise_batches(
+                    scorer.clone(),
+                    source,
+                    batch_size,
+                    self.frag_reuse_index.clone(),
+                )
+                .try_collect()
+                .await?,
+            )
+        } else {
+            let mut writer = PairwiseSpillWriter::new(spill_store).await?;
+            // Align source reads to whole vector batches so each spill range
+            // still corresponds to exactly one staged batch during replay.
+            let read_batch_size = PAIRWISE_READ_BATCH_SIZE.div_ceil(batch_size) * batch_size;
+            for start in (0..num_rows).step_by(read_batch_size) {
+                let end = start.saturating_add(read_batch_size).min(num_rows);
+                let source = self
+                    .read_pairwise_codes(partition_id, start..end, &quantizer)
+                    .await?;
+                let mut batches = stage_pairwise_batches(
+                    scorer.clone(),
+                    source,
+                    batch_size,
+                    self.frag_reuse_index.clone(),
+                );
+                while let Some(batch) = batches.try_next().await? {
+                    writer.write(batch).await?;
+                }
+            }
+            EncodedPartition::Spilled(writer.finish().await?)
+        };
+        Ok(PairwisePartition {
+            encoded,
+            scorer,
+            batch_size,
+            num_rows,
+        })
+    }
+
+    /// Read a row range of a partition's index file. PQ codes are returned
+    /// column-major over the range (the on-disk transposed layout), which the
+    /// PQ scorer stages without transposing.
+    async fn read_pairwise_codes(
+        &self,
+        partition_id: usize,
+        range: std::ops::Range<usize>,
+        quantizer: &Quantizer,
+    ) -> Result<RecordBatch> {
+        if partition_id >= self.num_partitions() {
+            return Err(Error::invalid_input(format!(
+                "partition_id={partition_id} out of range 0..{}",
+                self.num_partitions()
+            )));
+        }
+        let partition = self.ivf.row_range(partition_id);
+        if range.start > range.end || range.end > partition.len() || range.is_empty() {
+            return Err(Error::invalid_input(format!(
+                "vector range {range:?} outside partition {partition_id} of size {}",
+                partition.len()
+            )));
+        }
+        let start = range.start;
+        let rows = partition.start + start..partition.start + range.end;
+        let column = quantizer.column();
+        let transposed_pq =
+            matches!(quantizer, Quantizer::Product(_)) && self.metadata.is_transposed();
+        if !transposed_pq || range.len() == partition.len() {
+            let batch = self.read_vector_range(rows).await?;
+            if !matches!(quantizer, Quantizer::Product(_)) || transposed_pq {
+                // Non-PQ codes are row-major, and a whole partition's
+                // flattened transposed PQ rows are already column-major.
+                return Ok(batch);
+            }
+            return spawn_cpu(move || {
+                let codes = batch
+                    .column_by_name(column)
+                    .and_then(|codes| codes.as_fixed_size_list_opt())
+                    .ok_or_else(|| Error::invalid_input(format!("missing {column}")))?;
+                let code_bytes = codes.value_length() as usize;
+                let values = codes
+                    .values()
+                    .as_primitive_opt::<UInt8Type>()
+                    .ok_or_else(|| Error::invalid_input(format!("{column} must hold u8 codes")))?;
+                let values = super::pq::storage::transpose(values, batch.num_rows(), code_bytes);
+                let codes = FixedSizeListArray::try_new_from_values(values, code_bytes as i32)?;
+                Ok(batch.replace_column_by_name(column, Arc::new(codes))?)
+            })
+            .await;
+        }
+        let schema = arrow_schema::Schema::from(self.reader.schema().as_ref());
+        let code_index = schema.index_of(column)?;
+        let code_nullable = schema.field(code_index).is_nullable();
+        let code_bytes = match schema.field(code_index).data_type() {
+            arrow_schema::DataType::FixedSizeList(_, size) => *size as usize,
+            other => {
+                return Err(Error::invalid_input(format!(
+                    "{column} must be a fixed-size list, got {other}"
+                )));
+            }
+        };
+        // The file rows at this range hold unrelated code bytes, so read only
+        // the other columns (row IDs) there.
+        let other_columns = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .filter(|name| *name != column)
+            .collect::<Vec<_>>();
+        let batch = self
+            .read_vector_columns(ReadBatchParams::Range(rows), &other_columns)
+            .await?;
+        // The flattened column-major matrix spans the whole partition: each
+        // code byte's values for this range are one contiguous span. Coalesce
+        // the file rows holding all spans into a single ranged read.
+        let spans = (0..code_bytes)
+            .map(|byte| {
+                let first = byte * partition.len() + start;
+                first..first + range.len()
+            })
+            .collect::<Vec<_>>();
+        let mut row_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut span_ranges = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let rows = span.start / code_bytes..span.end.div_ceil(code_bytes);
+            match row_ranges.last_mut() {
+                Some(last) if last.end >= rows.start => last.end = last.end.max(rows.end),
+                _ => row_ranges.push(rows),
+            }
+            span_ranges.push(row_ranges.len() - 1);
+        }
+        let encoded = self
+            .read_vector_columns(
+                ReadBatchParams::Ranges(
+                    row_ranges
+                        .iter()
+                        .map(|rows| {
+                            (partition.start + rows.start) as u64
+                                ..(partition.start + rows.end) as u64
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                &[column],
+            )
+            .await?;
+        spawn_cpu(move || {
+            let values = list_values::<UInt8Type>(&encoded, column)?;
+            let mut range_offsets = Vec::with_capacity(row_ranges.len());
+            let mut offset = 0;
+            for rows in &row_ranges {
+                range_offsets.push(offset);
+                offset += rows.len();
+            }
+            let mut codes = Vec::with_capacity(spans.len() * range.len());
+            for (span, index) in spans.into_iter().zip(span_ranges) {
+                let row = range_offsets[index] + span.start / code_bytes - row_ranges[index].start;
+                let first = row * code_bytes + span.start % code_bytes;
+                codes.extend_from_slice(&values[first..first + span.len()]);
+            }
+            let codes = FixedSizeListArray::try_new_from_values(
+                UInt8Array::from(codes),
+                code_bytes as i32,
+            )?;
+            let field = arrow_schema::Field::new(column, codes.data_type().clone(), code_nullable);
+            Ok(batch.try_with_column_at(code_index, field, Arc::new(codes))?)
+        })
+        .await
+    }
+
+    /// Materialize a compact partition for the parallel prewarm path.
+    ///
+    /// The input may be a slice of a larger contiguous read. Deep-copying its
+    /// visible rows before constructing storage prevents a cached partition
+    /// from retaining the entire prewarm window's Arrow buffers.
+    #[doc(hidden)]
+    pub async fn materialize_partition_for_prewarm(
+        &self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Q::Storage>
+    where
+        Q::Metadata: 'static,
+        Q::Storage: 'static,
+    {
+        let metadata = self.metadata.clone();
+        let distance_type = self.distance_type;
+        if let Some(remapping) = &self.batch_remapper {
+            // Tagged asynchronous path.
+            lance_index_core::remapping::check_batch_remapping_entry()?;
+            let batch =
+                spawn_prewarm_materialization(move || compact_prewarm_batches(batches)).await?;
+            let row_id_idx = batch.schema().index_of(ROW_ID)?;
+            // Row-map IO must finish outside the CPU-only materialization pool.
+            let (batch, remapper) =
+                remap_row_ids_preserving_layout_async(remapping.as_ref(), batch, row_id_idx)
+                    .await?;
+            return spawn_prewarm_materialization(move || {
+                Q::Storage::try_from_batch_with_remapper(
+                    batch,
+                    &metadata,
+                    distance_type,
+                    Some(remapper),
+                )
+            })
+            .await;
+        }
+        // Legacy synchronous remapping path.
+        let frag_reuse_index = self.frag_reuse_index.clone();
+        spawn_prewarm_materialization(move || {
+            let batch = compact_prewarm_batches(batches)?;
+            Q::Storage::try_from_batch_with_remapper(
+                batch,
+                &metadata,
+                distance_type,
+                frag_reuse_index,
+            )
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        QueryScratchCapacity, QueryScratchPool, compact_prewarm_batches,
+        spawn_prewarm_materialization,
+    };
+    use arrow_array::{Array, ArrayRef, RecordBatch, UInt64Array};
+    use lance_core::deepsize::DeepSizeOf;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_prewarm_materialization_uses_cpu_pool() {
+        let thread_name =
+            spawn_prewarm_materialization(|| Ok(std::thread::current().name().map(str::to_owned)))
+                .await
+                .unwrap();
+        assert_eq!(thread_name.as_deref(), Some("lance-cpu"));
+    }
+
+    #[test]
+    fn test_prewarm_storage_batches_own_compact_buffers() {
+        let parent = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(UInt64Array::from_iter_values(0..100)) as ArrayRef,
+        )])
+        .unwrap();
+        let parent_array = parent
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let parent_ptr = parent_array.values().as_ptr();
+        let parent_size = parent_array.get_array_memory_size();
+
+        let compact = compact_prewarm_batches(vec![parent.slice(10, 10)]).unwrap();
+        let compact_array = compact
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_ne!(compact_array.values().as_ptr(), parent_ptr);
+        assert!(compact_array.get_array_memory_size() < parent_size);
+        assert_eq!(compact_array.values(), &(10..20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_query_scratch_pool_reuses_buffers() {
+        let pool = QueryScratchPool::new(1);
+        let first_ptrs = pool.with_scratch(|scratch| {
+            scratch.query_f32.clear();
+            scratch.query_f32.resize(16, 1.0);
+            scratch.distances.clear();
+            scratch.distances.resize(8, 2.0);
+            scratch.u16.clear();
+            scratch.u16.resize(4, 3);
+            scratch.u8.clear();
+            scratch.u8.resize(2, 4);
+            scratch.u32.clear();
+            scratch.u32.resize(3, 5);
+            (
+                scratch.query_f32.as_ptr(),
+                scratch.distances.as_ptr(),
+                scratch.u16.as_ptr(),
+                scratch.u8.as_ptr(),
+                scratch.u32.as_ptr(),
+            )
+        });
+
+        let second_ptrs = pool.with_scratch(|scratch| {
+            assert_eq!(scratch.query_f32.len(), 16);
+            assert!(scratch.query_f32.iter().all(|value| *value == 1.0));
+            assert_eq!(scratch.distances.len(), 8);
+            assert!(scratch.distances.iter().all(|value| *value == 2.0));
+            assert_eq!(scratch.u16.len(), 4);
+            assert!(scratch.u16.iter().all(|value| *value == 3));
+            assert_eq!(scratch.u8.len(), 2);
+            assert!(scratch.u8.iter().all(|value| *value == 4));
+            assert_eq!(scratch.u32.len(), 3);
+            assert!(scratch.u32.iter().all(|value| *value == 5));
+            (
+                scratch.query_f32.as_ptr(),
+                scratch.distances.as_ptr(),
+                scratch.u16.as_ptr(),
+                scratch.u8.as_ptr(),
+                scratch.u32.as_ptr(),
+            )
+        });
+
+        assert_eq!(first_ptrs, second_ptrs);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_is_pool_owned() {
+        let first_pool = QueryScratchPool::new(1);
+        let second_pool = QueryScratchPool::new(1);
+
+        let first_ptr = first_pool.with_scratch(|scratch| {
+            scratch.query_f32.resize(16, 1.0);
+            scratch.query_f32.as_ptr()
+        });
+        let second_ptr = second_pool.with_scratch(|scratch| {
+            scratch.query_f32.resize(16, 1.0);
+            scratch.query_f32.as_ptr()
+        });
+
+        assert_ne!(first_ptr, second_ptr);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_uses_temporary_scratch_when_empty() {
+        let pool =
+            QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
+        let pooled = pool.scratch();
+        assert!(pooled.pooled);
+
+        let temporary = pool.scratch();
+        assert!(!temporary.pooled);
+        assert_eq!(temporary.distances.len(), 8);
+        assert_eq!(temporary.query_f32.len(), 16);
+        assert_eq!(temporary.u16.len(), 4);
+        assert_eq!(temporary.u8.len(), 2);
+        assert_eq!(temporary.u32.len(), 3);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_deep_size_includes_buffer_capacity() {
+        let empty_size = QueryScratchPool::new(1).deep_size_of();
+        let pool =
+            QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
+
+        assert!(pool.deep_size_of() > empty_size);
+
+        let idle_size = pool.deep_size_of();
+        let _checked_out = pool.scratch();
+
+        assert_eq!(pool.deep_size_of(), idle_size);
+    }
+
+    #[test]
+    fn test_query_scratch_pool_initializes_buffer_capacity() {
+        let pool =
+            QueryScratchPool::with_capacity(1, QueryScratchCapacity::new_with_u32(8, 16, 4, 2, 3));
+
+        pool.with_scratch(|scratch| {
+            assert_eq!(scratch.distances.len(), 8);
+            assert_eq!(scratch.distances.capacity(), 8);
+            assert_eq!(scratch.query_f32.len(), 16);
+            assert_eq!(scratch.query_f32.capacity(), 16);
+            assert_eq!(scratch.u16.len(), 4);
+            assert_eq!(scratch.u16.capacity(), 4);
+            assert_eq!(scratch.u8.len(), 2);
+            assert_eq!(scratch.u8.capacity(), 2);
+            assert_eq!(scratch.u32.len(), 3);
+            assert_eq!(scratch.u32.capacity(), 3);
+        });
+    }
+}

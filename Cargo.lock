@@ -4206,6 +4206,7 @@ dependencies = [
  "lance-context-core",
  "lance-context-metrics",
  "lance-context-wal",
+ "lance-core",
  "lance-datafusion",
  "lance-file",
  "lance-index",
@@ -4424,8 +4425,6 @@ dependencies = [
 [[package]]
 name = "lance-datafusion"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2df1f26d0a01b1103d587bd46226979b5a03b1117f63d6fb0503a496708a6e38"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4501,8 +4500,6 @@ dependencies = [
 [[package]]
 name = "lance-file"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f909cbffa69e3287fe8bbcbb2b004e3b9c3a8f013b4d0ad0ae751a38128ab8"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4551,8 +4548,6 @@ dependencies = [
 [[package]]
 name = "lance-index"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df56fde7e5e34b1d6cf67de22fdfed3a9f6f2875fc5a5d452ae8ab5a1cef150b"
 dependencies = [
  "arc-swap",
  "arrow",
@@ -4625,8 +4620,6 @@ dependencies = [
 [[package]]
 name = "lance-index-core"
 version = "14.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc6ab34b812d49209a8772809e24897d43c713115e11dfd2bb6d48a81beab39c"
 dependencies = [
  "arrow-array",
  "arrow-schema",

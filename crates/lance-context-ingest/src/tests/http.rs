@@ -12,7 +12,6 @@ use axum::{
 };
 use lance_context_wal::client_journal::Settings;
 use std::{
-    collections::HashMap,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -175,7 +174,7 @@ async fn storage(path: &Path) -> Result<crate::materializer::Storage> {
     Ok(crate::materializer::Storage {
         uri: path.to_str().unwrap().into(),
         base: object_store::path::Path::parse(object_base)?,
-        options: HashMap::new(),
+        params: Default::default(),
         session: Arc::new(lance::session::Session::default()),
     })
 }

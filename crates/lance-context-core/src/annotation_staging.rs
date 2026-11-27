@@ -26,6 +26,7 @@ mod patch_lookup;
 mod preserve_id;
 mod publication;
 mod published_values;
+pub use published_values::{MembershipObservation, MembershipWarmObservation};
 mod registration;
 mod registration_lookup;
 mod status_filter;
@@ -202,6 +203,7 @@ pub struct Observation {
     /// Process-local; a rejected attempt does not advance the applied cut.
     pub immutable_lookup_invalidated: u64,
     pub immutable_apply: ImmutableApplyObservation,
+    pub immutable_membership: MembershipObservation,
     /// Locally installed base, captured with materialized under one state lock.
     /// May lag a committed/selected publication. Not a selection or GC proof.
     pub installed_base: InstalledBase,
@@ -740,6 +742,7 @@ impl AnnotationStaging {
             immutable_lookup_reused: state.immutable_lookup_reused,
             immutable_lookup_invalidated: state.immutable_lookup_invalidated,
             immutable_apply: state.immutable_apply.clone(),
+            immutable_membership: self.published_values.membership_observation(),
             installed_base: InstalledBase {
                 source: self.scope.clone(),
                 version: state.base.version_id(),

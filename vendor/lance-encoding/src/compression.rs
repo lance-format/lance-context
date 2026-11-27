@@ -1046,6 +1046,10 @@ pub(crate) fn require_no_block_payload(data: Option<LanceBuffer>, codec: &str) -
 }
 
 pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
+    fn native_memory(&self) -> lance_core::memory::NativeMemory {
+        None
+    }
+
     fn create_miniblock_decompressor(
         &self,
         description: &CompressiveEncoding,
@@ -1069,9 +1073,21 @@ pub trait DecompressionStrategy: std::fmt::Debug + Send + Sync {
 }
 
 #[derive(Debug, Default)]
-pub struct DefaultDecompressionStrategy {}
+pub struct DefaultDecompressionStrategy {
+    native_memory: lance_core::memory::NativeMemory,
+}
+
+impl DefaultDecompressionStrategy {
+    pub fn with_native_memory(native_memory: lance_core::memory::NativeMemory) -> Self {
+        Self { native_memory }
+    }
+}
 
 impl DecompressionStrategy for DefaultDecompressionStrategy {
+    fn native_memory(&self) -> lance_core::memory::NativeMemory {
+        self.native_memory.clone()
+    }
+
     fn create_miniblock_decompressor(
         &self,
         description: &CompressiveEncoding,
@@ -1098,14 +1114,18 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                         "Inline bitpacking requires an 8, 16, 32, or 64-bit width and no leaf compression",
                     ));
                 }
-                Ok(Box::new(InlineBitpacking::from_description(description)))
+                Ok(Box::new(
+                    InlineBitpacking::from_description(description)
+                        .with_native_memory(self.native_memory.clone()),
+                ))
             }
             #[cfg(not(feature = "bitpacking"))]
             Compression::InlineBitpacking(_) => Err(Error::not_supported_source(
                 "this runtime was not built with bitpacking support".into(),
             )),
             Compression::Variable(variable) => Ok(Box::new(
-                BinaryMiniBlockDecompressor::from_variable(variable)?,
+                BinaryMiniBlockDecompressor::from_variable(variable)?
+                    .with_native_memory(self.native_memory.clone()),
             )),
             Compression::Fsst(description) => {
                 if description.symbol_table.is_empty()
@@ -1127,10 +1147,10 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                     })?,
                     decompression_strategy,
                 )?;
-                Ok(Box::new(FsstMiniBlockDecompressor::new(
-                    description,
-                    inner_decompressor,
-                )))
+                Ok(Box::new(
+                    FsstMiniBlockDecompressor::new(description, inner_decompressor)
+                        .with_native_memory(self.native_memory.clone()),
+                ))
             }
             Compression::PackedStruct(description) => Ok(Box::new(
                 PackedStructFixedWidthMiniBlockDecompressor::try_new(description)?,
@@ -1271,10 +1291,13 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 }
                 Ok(Box::new(VariableDecoder::default()))
             }
-            Compression::Fsst(fsst) => Ok(Box::new(FsstPerValueDecompressor::new(
-                LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
-                Box::new(VariableDecoder::default()),
-            ))),
+            Compression::Fsst(fsst) => Ok(Box::new(
+                FsstPerValueDecompressor::new(
+                    LanceBuffer::from_bytes(fsst.symbol_table.clone(), 1),
+                    Box::new(VariableDecoder::default()),
+                )
+                .with_native_memory(self.native_memory.clone()),
+            )),
             Compression::General(general) => Ok(Box::new(CompressedBufferEncoder::from_scheme(
                 general.compression.as_ref().expect_ok()?.scheme(),
             )?)),

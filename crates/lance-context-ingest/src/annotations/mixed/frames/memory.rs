@@ -5,6 +5,13 @@ use std::{
     mem::{size_of, size_of_val},
 };
 
+pub(super) struct Retention {
+    pub charge: usize,
+    /// Distinct backing capacity within this frame, including the input floor.
+    /// Does not include array/schema bookkeeping or claim process RSS.
+    pub backing_bytes: usize,
+}
+
 /// Keep the existing row workspace allowance as well as Arrow's retained
 /// allocations. Do not sum per-array buffer sizes: every slice of an IPC input
 /// reports the size of the same visible input. Bytes may retain a larger parent.
@@ -18,7 +25,7 @@ pub(super) fn retained_bytes(
     input_bytes: usize,
     original: usize,
     input_allocation: Option<(usize, usize)>,
-) -> Option<usize> {
+) -> Option<Retention> {
     // Only the allocation owner can provide this bound. Arrow's Bytes-backed
     // capacity alone cannot establish it, even when nonzero.
     let (input_address, input_capacity) = input_allocation?;
@@ -28,7 +35,7 @@ pub(super) fn retained_bytes(
     let mut bytes =
         original.checked_sub(input_bytes.checked_mul(2)?.checked_add(input_capacity)?)?;
     bytes = bytes.checked_add(batches.capacity().checked_mul(size_of::<RecordBatch>())?)?;
-    let mut allocations = BTreeMap::<usize, usize>::new();
+    let mut allocations = BTreeMap::<usize, (usize, usize)>::new();
     for batch in batches {
         let schema = batch.schema();
         bytes = bytes.checked_add(size_of_val(schema.as_ref()))?;
@@ -77,8 +84,11 @@ pub(super) fn retained_bytes(
                 let allocation = capacity.checked_add(bookkeeping)?;
                 allocations
                     .entry(address)
-                    .and_modify(|old| *old = (*old).max(allocation))
-                    .or_insert(allocation);
+                    .and_modify(|old| {
+                        old.0 = old.0.max(allocation);
+                        old.1 = old.1.max(capacity);
+                    })
+                    .or_insert((allocation, capacity));
             }
             pending.extend(data.child_data().iter().cloned());
         }
@@ -87,6 +97,12 @@ pub(super) fn retained_bytes(
     // The metadata-only walk has dropped all temporary ArrayData before return.
     let buffers = allocations
         .values()
-        .try_fold(0usize, |n, b| n.checked_add(*b))?;
-    bytes.checked_add(buffers.max(input_capacity))
+        .try_fold(0usize, |n, (charge, _)| n.checked_add(*charge))?;
+    let backing_bytes = allocations
+        .values()
+        .try_fold(0usize, |n, (_, capacity)| n.checked_add(*capacity))?;
+    Some(Retention {
+        charge: bytes.checked_add(buffers.max(input_capacity))?,
+        backing_bytes: backing_bytes.max(input_capacity),
+    })
 }
