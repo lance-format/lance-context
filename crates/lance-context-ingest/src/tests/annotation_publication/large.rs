@@ -358,6 +358,7 @@ async fn recover_inner(
         )
         .await?
         .unwrap_err();
+        // Runtime::run wraps publisher errors ("annotation publisher stopped").
         assert!(
             matches!(
                 error.root_cause().to_string().as_str(),

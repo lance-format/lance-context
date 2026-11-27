@@ -173,6 +173,11 @@ impl Ahead {
             let Some(head) = prefetch::fetch(&service, index, meta).await? else {
                 return Ok(Loaded::Unavailable);
             };
+            if prefetch::exceeds_key_window(&service, &head)? {
+                // Symmetric with the foreground: an oversize head may need the
+                // whole lookup budget, so it is never speculated beside one.
+                return Ok(Loaded::Unavailable);
+            }
             page.entries.remove(0);
             let mut tail = VecDeque::new();
             let prepared = prefetch::prepare(&service, &head, &mut page, &mut tail, cut).await?;
@@ -186,8 +191,13 @@ impl Ahead {
                 let deadline = tokio::time::Instant::now() + batch_wait;
                 prefetch::coalesce(&service, &head, &mut page, &mut tail, cut, deadline).await?;
             }
-            // Without an opt-in wait, preserve promotion-time batching
-            // rather than launching a one-record query at each source gap.
+            // Without an opt-in wait, a successor that merely exhausted the
+            // committed page keeps promotion-time refill: records committed
+            // before promotion join this window's single scan instead of
+            // forcing a second one. A window sealed by a real bound (e.g.
+            // `KeyBound`) cannot grow, so its query starts now and overlaps
+            // the foreground. Exactness is unchanged: apply revalidates the
+            // captured base.
             let query = if deferred && batch_wait.is_zero() {
                 None
             } else {
@@ -333,4 +343,51 @@ pub(super) async fn tick(ahead: &mut Option<Ahead>) {
         Poll::Ready(())
     })
     .await
+}
+
+/// Drive `foreground` to completion, also polling the speculative successor
+/// on each wakeup. The foreground is polled first so it claims native
+/// capacity before speculative work; the successor never gates completion.
+/// No task is spawned: dropping this future drops neither the successor nor
+/// its retained records, which stay owned by the driver's `ahead` slot.
+pub(super) async fn drive<F: std::future::Future>(
+    foreground: F,
+    ahead: &mut Option<Ahead>,
+) -> F::Output {
+    let mut foreground = std::pin::pin!(foreground);
+    futures::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = foreground.as_mut().poll(cx) {
+            return Poll::Ready(output);
+        }
+        if let Some(ahead) = ahead {
+            ahead.poll(cx, None);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drive_returns_foreground_without_successor() {
+        let mut ahead = None;
+        assert_eq!(drive(async { 7 }, &mut ahead).await, 7);
+    }
+
+    #[tokio::test]
+    async fn drive_completes_pending_foreground() {
+        let mut ahead = None;
+        let out = drive(
+            async {
+                tokio::task::yield_now().await;
+                3
+            },
+            &mut ahead,
+        )
+        .await;
+        assert_eq!(out, 3);
+    }
 }
