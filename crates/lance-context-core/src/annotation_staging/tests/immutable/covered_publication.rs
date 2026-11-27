@@ -155,7 +155,7 @@ async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows
 }
 
 #[tokio::test]
-async fn covered_lookup_rejects_recovered_instance_and_native_maintenance() -> Result<()> {
+async fn covered_lookup_survives_native_maintenance_but_rejects_recovered_instance() -> Result<()> {
     let root = tempfile::tempdir()?;
     let batch = bodies(&[])?;
     let base = Arc::new(
@@ -180,12 +180,22 @@ async fn covered_lookup_rejects_recovered_instance_and_native_maintenance() -> R
         );
         publish(&staging, &[id]).await?;
     }
-    let mut keys = BTreeMap::from([("new".to_owned(), false)]);
+    let mut keys = BTreeMap::from([("a".to_owned(), false), ("new".to_owned(), false)]);
     let covered = staging
         .try_capture_immutable_base_with_staged(&mut keys)
         .await?
         .unwrap();
     let base = covered.dataset().clone();
+    let plain = staging.capture_immutable_base().await?;
+    assert_eq!(base.count_rows(Some("id = 'a'".into())).await?, 1);
+    keys.insert("a".into(), true);
+    let rows = keys
+        .iter()
+        .map(|(key, present)| ImmutableRegistration {
+            key,
+            exists_in_base: *present,
+        })
+        .collect::<Vec<_>>();
     let recovered =
         AnnotationStaging::new_immutable_body(base.clone(), scope(), 2, Limits::default())?;
     let mut before = recovered.observation().await;
@@ -200,30 +210,89 @@ async fn covered_lookup_rejects_recovered_instance_and_native_maintenance() -> R
     before.immutable_lookup_invalidated += 1;
     assert_eq!(recovered.observation().await, before);
 
-    // Real native rewrite with the same cut; only verified frozen publications
-    // are eligible for reuse, so maintenance conservatively invalidates it.
+    // A real native rewrite preserves membership and the cut. Only the
+    // staged-covered query may survive; a plain capture still needs refresh.
     let transaction = super::super::compaction::compact(&base).await?;
-    let selected = super::super::compaction::select(base, &transaction).await?;
-    staging.install_compacted(&transaction, selected).await?;
-    let mut before = staging.observation().await;
-    assert_eq!(before.materialized, 2);
+    let selected = super::super::compaction::select(base.clone(), &transaction).await?;
+    staging
+        .install_compacted(&transaction, selected.clone())
+        .await?;
     assert_eq!(
         staging
-            .register_immutable_committed(2, 3, &request(&["new"]), &covered)
+            .register_immutable_committed(2, 3, &rows, &plain)
             .await?,
         None
     );
-    before.immutable_lookup_invalidated += 1;
-    assert_eq!(staging.observation().await, before);
-    let fresh = staging
-        .try_capture_immutable_base_with_staged(&mut keys)
-        .await?
-        .unwrap();
     assert_eq!(
         staging
-            .register_immutable_committed(2, 3, &request(&["new"]), &fresh)
+            .register_immutable_committed(2, 3, &rows, &covered)
             .await?,
         Some(ApplyOutcome::Applied)
     );
+    let first = origin(&staging.capture_immutable_body("new").await?);
+    assert_eq!(first.record_index, 3);
+    assert_eq!(staging.observation().await.active_entries, 1);
+    assert_eq!(staging.observation().await.immutable_lookup_reused, 1);
+
+    // Index-only installation has the same logical proof, without reusing
+    // physical rows or losing the old dataset's GC protection.
+    let mut indexed = selected.as_ref().clone();
+    let index = indexed
+        .create_index_builder(
+            &["id"],
+            IndexType::Scalar,
+            &ScalarIndexParams::for_builtin(lance_index::scalar::BuiltinIndexType::ZoneMap),
+        )
+        .name("immutable_membership_test".into())
+        .execute_uncommitted()
+        .await?;
+    let mut transaction = lance_table::transaction::Transaction::new_from_version(
+        selected.version_id(),
+        lance_table::transaction::Operation::CreateIndex {
+            new_indices: vec![index],
+            removed_indices: vec![],
+        },
+    );
+    transaction.transaction_properties = selected
+        .read_transaction()
+        .await?
+        .unwrap()
+        .transaction_properties;
+    let indexed = super::super::compaction::select(selected, &transaction).await?;
+    staging.install_indexed(&transaction, indexed).await?;
+    let frozen = staging.freeze(uuid::Uuid::new_v4()).await?.unwrap();
+    assert_eq!(
+        staging
+            .register_immutable_committed(3, 4, &rows, &covered)
+            .await?,
+        Some(ApplyOutcome::Applied)
+    );
+    assert_eq!(origin(&staging.capture_immutable_body("new").await?), first);
+    let observed = staging.observation().await;
+    assert_eq!(observed.materialized, 2);
+    assert_eq!(observed.active_entries, 0);
+    assert_eq!(observed.frozen_entries, 1);
+    assert_eq!(observed.immutable_lookup_reused, 2);
+    assert_eq!(observed.immutable_lookup_invalidated, 1);
+    assert!(staging
+        .protected_bases()
+        .await?
+        .datasets()
+        .any(|dataset| dataset.version_id() == base.version_id()));
+    assert_eq!(covered.dataset().count_rows(None).await?, 2);
+
+    // Materializing an insertion after the captured cut still invalidates the
+    // old negative answer, even though the same lineage survived maintenance.
+    install(&staging, frozen, &["new"]).await?;
+    assert_eq!(
+        staging
+            .register_immutable_committed(4, 5, &rows, &covered)
+            .await?,
+        None
+    );
+    assert_eq!(staging.observation().await.applied, 4);
+    drop((covered, plain));
+    assert_eq!(staging.observation().await.readers, 0);
+    assert_eq!(staging.protected_bases().await?.datasets().count(), 1);
     Ok(())
 }

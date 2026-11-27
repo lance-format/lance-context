@@ -166,9 +166,14 @@ impl AnnotationStaging {
         } else {
             state.views.install(selected)
         };
-        // Covered immutable lookups only prove frozen-publication transitions.
-        // Keep maintenance conservative even when it preserves logical rows.
-        state.immutable_publications = Arc::new(());
+        // The verified row-preserving rewrite/index installation changes no
+        // key membership or materialized cut. Preserve covered lookup answers,
+        // not their physical base: readers still pin their original snapshot.
+        // A separate body replacement has a different proof and stays
+        // conservative. Recovery also always creates a fresh lineage.
+        if maintenance == Maintenance::BodyCompaction {
+            state.immutable_publications = Arc::new(());
+        }
         Ok(())
     }
 }
