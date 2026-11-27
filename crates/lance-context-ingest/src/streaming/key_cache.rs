@@ -8,7 +8,7 @@
 //! tiers; lookups check RAM, then RocksDB.
 //!
 //! Insertion policy (never at send):
-//! - commit ACK: insert; removed again if that lane's fence reports Rejected,
+//! - commit ACK: never inserted (a committed record can still be Rejected),
 //! - Applied at a fence: insert every key of the lane's records,
 //! - warm: background scan of the canonical Turns table's key columns.
 //! Owner dedup hits are not inserted: the Applied reply does not carry them
@@ -34,10 +34,11 @@ pub type Key = u128;
 
 pub fn key(values: &[&str]) -> Key {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            hasher.update(&[0]);
-        }
+    // Length-prefix each value: separator joins are ambiguous
+    // (["a\0b","c"] vs ["a","b\0c"]).
+    hasher.update(&(values.len() as u64).to_le_bytes());
+    for value in values {
+        hasher.update(&(value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }
     hasher.digest128()
