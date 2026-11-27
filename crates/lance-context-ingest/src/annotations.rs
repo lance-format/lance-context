@@ -918,6 +918,16 @@ impl Service {
         (state, self.apply_backpressure().is_some())
     }
 
+    /// Explicit native index metadata inspection on a protected installed base.
+    /// May read metadata, but never scans body rows or creates indices. The
+    /// returned version/cut can lag catalog selection; coverage alone does not
+    /// establish that a particular query used an index effectively.
+    pub async fn inspect_installed_indices(
+        &self,
+    ) -> Result<lance_context_core::annotation_staging::IndexInspection> {
+        Ok(self.shared.staging.inspect_installed_indices().await?)
+    }
+
     /// Returns the last gate that blocked apply, cleared by successful progress.
     /// Capacity release alone does not clear it until the applier runs again.
     pub fn apply_backpressure(&self) -> Option<ApplyBackpressure> {
