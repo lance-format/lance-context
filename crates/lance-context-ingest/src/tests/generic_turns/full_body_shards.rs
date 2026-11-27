@@ -200,8 +200,11 @@ async fn http_check(
         bytes.len() > 128 << 10,
         "exercise a body larger than narrow JSON replies"
     );
-    let decoded = lance_context_wal::ipc::decode(bytes, spec.body_schema().clone())?;
-    assert_eq!(decoded, vec![expected.clone()]);
+    let key = spec.row_key(expected, 0, 4096)?;
+    let decoded = crate::http::annotations::full_body::decode(bytes.clone(), spec, &key)?;
+    assert_eq!(&decoded, expected);
+    let wrong_key = spec.business_key(&["other-session", "other-id"], 4096)?;
+    assert!(crate::http::annotations::full_body::decode(bytes, spec, &wrong_key).is_err());
     Ok(())
 }
 

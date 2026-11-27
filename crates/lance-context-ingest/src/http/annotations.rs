@@ -8,6 +8,7 @@ use lance_context_wal::replication::publication as p;
 mod body_read;
 #[cfg(feature = "service")]
 mod forward;
+pub mod full_body;
 mod owner;
 #[cfg(feature = "service")]
 pub use forward::Forwarder;
