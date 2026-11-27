@@ -119,26 +119,16 @@ impl Runtime {
     /// ONE fragment. Configure before running this owner. A max wait for the
     /// collect stage comes from `with_body_lookup_batch_wait`.
     pub fn with_owner_batch(self, options: super::owner_batch::Options) -> Result<Self> {
+        self.driver.service.enable_owner_batch(options)?;
+        Ok(self)
+    }
+
+    /// Disable the default owner batch pipeline before running this owner.
+    pub fn without_owner_batch(self) -> Result<Self> {
         let service = &self.driver.service;
-        ensure!(
-            service.is_single_body(),
-            "owner batch pipeline requires full-body ingestion"
-        );
-        ensure!(
-            service.shared.progress.borrow().through
-                == service.shared.results.lock().unwrap().base.through
-                && service.shared.frames.lock().unwrap().retained() == (0, 0),
-            "configure the owner batch pipeline before applying"
-        );
-        let owner = format!(
-            "{}-{}-{}",
-            service.ingress.scope.table,
-            service.ingress.scope.incarnation,
-            service.bucket()
-        );
-        let batch = super::owner_batch::WriteBatch::open(options, &owner)?;
-        *service.shared.write_batch.lock().unwrap() = Some(batch);
-        service.shared.batch_metrics.lock().unwrap().observed.enabled = true;
+        service.ensure_owner_batch_unstarted()?;
+        *service.shared.write_batch.lock().unwrap() = None;
+        service.shared.batch_metrics.lock().unwrap().observed.enabled = false;
         Ok(self)
     }
 
@@ -491,6 +481,12 @@ impl Runtime {
                 .head;
             let base = checkpoint::load(&service.ingress, &storage, version).await?;
             materializer::TurnIdIndex::validate_base(&base)?;
+        }
+        if service.is_single_body() {
+            // Single-body Turns owners run the streaming owner batch pipeline
+            // by default; `with_owner_batch` reconfigures it and
+            // `without_owner_batch` restores the resident-frame path.
+            service.enable_owner_batch(super::owner_batch::Options::default())?;
         }
         driver = driver.with_publication_limits(
             c.publication.max_records,

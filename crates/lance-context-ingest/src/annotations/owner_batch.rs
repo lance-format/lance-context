@@ -40,6 +40,7 @@ pub struct Options {
     /// Directory for write-batch spill files, normally on a caller PVC. A
     /// per-owner subdirectory is created and cleared at open. `None` keeps
     /// survivor lists in RAM (still keys-only, bodies remain in the WAL).
+    /// Defaults to `$TMPDIR/lance-context-owner-batch`.
     pub spill_dir: Option<PathBuf>,
     /// Spill the in-RAM survivor list once it exceeds this many bytes.
     pub spill_bytes: usize,
@@ -57,7 +58,9 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            spill_dir: None,
+            // Default spill target is the process temp directory; hosts
+            // should point this at a PVC via `with_owner_batch`.
+            spill_dir: Some(std::env::temp_dir().join("lance-context-owner-batch")),
             spill_bytes: 64 << 20,
             target_rows: 1 << 20,
             refetch_bytes: 256 << 20,
@@ -349,6 +352,44 @@ impl Metrics {
 }
 
 impl Service {
+    pub(super) fn ensure_owner_batch_unstarted(&self) -> Result<()> {
+        ensure!(
+            self.is_single_body(),
+            "owner batch pipeline requires full-body ingestion"
+        );
+        ensure!(
+            self.shared.progress.borrow().through
+                == self.shared.results.lock().unwrap().base.through
+                && self.shared.frames.lock().unwrap().retained() == (0, 0)
+                && self
+                    .shared
+                    .write_batch
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_none_or(|b| b.rows() == 0),
+            "configure the owner batch pipeline before applying"
+        );
+        Ok(())
+    }
+
+    /// Enable (or reconfigure) the pipeline before the owner applies.
+    pub(super) fn enable_owner_batch(&self, options: Options) -> Result<()> {
+        self.ensure_owner_batch_unstarted()?;
+        let owner = format!(
+            "{}-{}-{}",
+            self.ingress.scope.table,
+            self.ingress.scope.incarnation,
+            self.bucket()
+        );
+        // Drop the previous batch (and its spill directory) first.
+        *self.shared.write_batch.lock().unwrap() = None;
+        let batch = WriteBatch::open(options, &owner)?;
+        *self.shared.write_batch.lock().unwrap() = Some(batch);
+        self.shared.batch_metrics.lock().unwrap().observed.enabled = true;
+        Ok(())
+    }
+
     pub(super) fn owner_batch(&self) -> bool {
         self.shared.write_batch.lock().unwrap().is_some()
     }
