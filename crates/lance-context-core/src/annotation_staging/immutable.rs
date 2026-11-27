@@ -169,6 +169,23 @@ impl AnnotationStaging {
         rows: &[ImmutableRegistration<'_>],
         lookup: &ImmutableBase,
     ) -> Result<Option<(ApplyOutcome, usize)>> {
+        Ok(self
+            .register_immutable_committed_with_rows(after, through, rows, lookup)
+            .await?
+            .map(|(outcome, inserted)| (outcome, inserted.len())))
+    }
+
+    /// The same atomic registration, also returning the ordinals of the
+    /// source rows that became first creates (ascending). Empty unless
+    /// Applied. A streaming owner records exactly these rows as its write
+    /// batch; their bodies stay in the WAL until publication refetches them.
+    pub async fn register_immutable_committed_with_rows(
+        &self,
+        after: u64,
+        through: u64,
+        rows: &[ImmutableRegistration<'_>],
+        lookup: &ImmutableBase,
+    ) -> Result<Option<(ApplyOutcome, Vec<u32>)>> {
         self.require_immutable()?;
         let _mutation = self.mutation.lock().await;
         let mut state = self.state.write().await;
@@ -211,6 +228,11 @@ impl AnnotationStaging {
         }
         let outcome = match pending {
             PendingBatch::Values(values) => {
+                let mut survivors = values
+                    .values()
+                    .filter_map(|stored| stored.pending_turn.as_ref().map(|p| p.row))
+                    .collect::<Vec<_>>();
+                survivors.sort_unstable();
                 let inserted = values.len() as u64;
                 let observed = &mut state.immutable_apply;
                 observed.batches = observed.batches.saturating_add(1);
@@ -221,13 +243,13 @@ impl AnnotationStaging {
                     .saturating_add(rows.len() as u64 - inserted);
                 state.active.extend(values);
                 state.applied = through;
-                (ApplyOutcome::Applied, inserted as usize)
+                (ApplyOutcome::Applied, survivors)
             }
             PendingBatch::Rejected(rejection) => {
                 state.applied = through;
-                (ApplyOutcome::Rejected(rejection), 0)
+                (ApplyOutcome::Rejected(rejection), Vec::new())
             }
-            PendingBatch::Backpressure => (ApplyOutcome::Backpressure, 0),
+            PendingBatch::Backpressure => (ApplyOutcome::Backpressure, Vec::new()),
         };
         if changed_base && !matches!(outcome.0, ApplyOutcome::Backpressure) {
             state.immutable_lookup_reused = state.immutable_lookup_reused.saturating_add(1);
