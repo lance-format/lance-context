@@ -52,6 +52,7 @@ fn body() -> Result<RecordBatch> {
     )?)
 }
 
+// TurnLookup exists only with the materializer feature.
 #[cfg(feature = "materializer")]
 #[tokio::test]
 async fn key_scan_reports_native_work_for_early_hit() -> Result<()> {
@@ -81,6 +82,7 @@ async fn key_scan_reports_native_work_for_early_hit() -> Result<()> {
     Ok(())
 }
 
+// TurnLookup exists only with the materializer feature.
 #[cfg(feature = "materializer")]
 #[tokio::test]
 async fn key_scan_reports_native_work_for_missing_composite_key() -> Result<()> {
@@ -109,6 +111,7 @@ async fn key_scan_reports_native_work_for_missing_composite_key() -> Result<()> 
     Ok(())
 }
 
+// TurnLookup exists only with the materializer feature.
 #[cfg(feature = "materializer")]
 #[tokio::test]
 async fn key_scan_uses_existing_zone_maps_and_reads_uncovered_fragments() -> Result<()> {
