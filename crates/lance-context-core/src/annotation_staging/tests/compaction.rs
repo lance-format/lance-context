@@ -168,7 +168,7 @@ async fn compacted_base_preserves_active_updates_old_readers_and_later_publicati
         .await?;
     let mut before = before;
     before.installed_base.version = selected.version_id();
-    assert_eq!(staging.observation().await, before);
+    assert_eq!(stable(staging.observation().await), stable(before));
     let current_t = current(&staging, "T").await?;
     assert_eq!(current_t.status.as_deref(), Some("reviewed"));
     assert_eq!(current_t.score, Some(0.9));

@@ -97,6 +97,9 @@ struct Shared {
     source_generations: Arc<tokio::sync::Semaphore>,
     replay_cut: Mutex<Option<u64>>,
     ordered: tokio::sync::Mutex<()>,
+    /// Test-only cap on the full-body key window, in workspace bytes (0: none).
+    #[cfg(test)]
+    key_window_for_test: std::sync::atomic::AtomicUsize,
     progress: watch::Sender<Progress>,
     reclamation: Mutex<runtime::reclamation::Observation>,
     body_lookups: Mutex<BodyLookupObservation>,
@@ -125,6 +128,46 @@ struct Pending {
     // Input address and complete allocation size, when known at reception.
     input_allocation: Option<(usize, usize)>,
     _reservation: MergeReservation,
+    /// Decoded bodies were released after key extraction to widen a lookup
+    /// window. The record is durable in the WAL; it is re-fetched and decoded
+    /// again before it becomes the ordered head. Only keys stay resident.
+    keys_only: bool,
+}
+
+impl Pending {
+    /// Keep only keys. The decoded bodies and the input frame are released,
+    /// but `Vec<Created>` (owned turn/routing strings and default annotation
+    /// structs) stays resident. Those bytes are charged to the window's key
+    /// workspace, not the frame budget: `lookup_workspace` charges at least
+    /// 8x each key plus 512 bytes per key column, which covers the retained
+    /// row (checked by `prefetch::prepare` against `retained_key_bytes`),
+    /// and `KeyBound` caps a window's workspace at half the reserved lookup
+    /// budget. Peak transient decode is still admitted by `fetch` one record
+    /// at a time; the shared query takes its own lookup reservation.
+    fn drop_body(&mut self) {
+        if let mixed::Decoded::Creates { bodies, .. } = &mut self.decoded {
+            *bodies = Vec::new();
+        }
+        self.input_allocation = None;
+        self._reservation.shrink_to(0);
+        self.keys_only = true;
+    }
+
+    /// Heap and inline bytes still held by a keys-only record.
+    pub(super) fn retained_key_bytes(&self) -> usize {
+        match &self.decoded {
+            mixed::Decoded::Creates { rows, .. } => rows.iter().fold(
+                rows.capacity()
+                    .saturating_mul(std::mem::size_of::<mixed::Created>()),
+                |total, row| {
+                    total
+                        .saturating_add(row.turn.capacity())
+                        .saturating_add(row.rollout_id.capacity())
+                },
+            ),
+            mixed::Decoded::Patches(_) => 0,
+        }
+    }
 }
 
 pub struct Driver {
@@ -219,6 +262,12 @@ impl Service {
             .await?)
     }
 
+    /// Hold the ordered gate as a publisher install would.
+    #[cfg(test)]
+    pub(crate) async fn ordered_lock_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.shared.ordered.lock().await
+    }
+
     #[cfg(test)]
     pub(crate) fn apply_attempts(&self) -> u64 {
         self.shared
@@ -239,7 +288,7 @@ impl Service {
         &self.shared.phases
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(any(feature = "http", test))]
     pub(crate) fn ingress(&self) -> &Ingress {
         &self.ingress
     }
@@ -504,6 +553,8 @@ impl Service {
                 source_generations: Arc::new(tokio::sync::Semaphore::new(2)),
                 replay_cut: Mutex::new(None),
                 ordered: tokio::sync::Mutex::new(()),
+                #[cfg(test)]
+                key_window_for_test: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 apply_attempts: std::sync::atomic::AtomicU64::new(0),
                 progress,
@@ -995,9 +1046,13 @@ impl Driver {
                 outcome = self.step() => if let Err(error) = outcome { break Err(error); }
             }
             if self.service.shared.progress.borrow().through == before {
+                // Idle backoff still drives the retained successor lookup.
                 tokio::select! {
                     _ = &mut shutdown => break Ok(()),
-                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    _ = pipeline::drive(
+                        tokio::time::sleep(Duration::from_millis(5)),
+                        &mut self.ahead,
+                    ) => {}
                 }
             }
         };
@@ -1022,6 +1077,46 @@ impl Driver {
             return Ok(());
         }
         if self.pending.is_none() {
+            if let Some(stub) = self.lookahead.front().filter(|p| p.keys_only) {
+                // Rehydrate before popping: cancellation or admission pressure
+                // leaves the keys-only record (and its lookup coverage) intact.
+                let (index, meta) = (stub.index, stub.meta.clone());
+                let mut full = prefetch::fetch(service, index, meta.clone()).await?;
+                if full.is_none() {
+                    // The ordered head has priority over speculation. A later
+                    // speculative window (or resident bodies of this window's
+                    // tail) can hold the frame capacity this head needs, and
+                    // they cannot be published before the head applies:
+                    // waiting would hold-and-wait. Release reconstructible
+                    // state (the successor's bodies and query reservations;
+                    // tail bodies, keeping their keys, validated metadata and
+                    // this window's lookup) and retry once. Neither apply nor
+                    // publication progress advances here.
+                    self.ahead = None;
+                    for record in self.lookahead.iter_mut().skip(1) {
+                        if !record.keys_only {
+                            record.drop_body();
+                        }
+                    }
+                    full = prefetch::fetch(service, index, meta).await?;
+                }
+                let Some(full) = full else {
+                    // Only applied-but-unpublished frames remain; the
+                    // publisher can drain them.
+                    Self::record_pressure(
+                        service,
+                        &mut self.pressure_episode,
+                        ApplyBackpressure::ApplyMemory,
+                    );
+                    return Ok(());
+                };
+                {
+                    let mut observed = service.shared.body_lookups.lock().unwrap();
+                    observed.prefetch.body_refetches =
+                        observed.prefetch.body_refetches.saturating_add(1);
+                }
+                self.lookahead[0] = full;
+            }
             self.pending = self.lookahead.pop_front();
             if self.pending.is_none() {
                 self.lookup = prefetch::Lookup::default();
@@ -1144,6 +1239,7 @@ impl Driver {
             }
             if self.body_query.is_some()
                 && self.ahead.is_none()
+                && !prefetch::exceeds_key_window(service, pending)?
                 && self.staging_pressure.is_none()
                 && service.apply_backpressure().is_none()
                 && service.shared.narrow.session.native_memory().is_some()
@@ -1204,7 +1300,9 @@ impl Driver {
         }
         pipeline::tick(&mut self.ahead).await;
         let ordered_wait = service.shared.phases.enter(Phase::AnnotationOrderedWait);
-        let _ordered = service.shared.ordered.lock().await;
+        // The successor keeps scanning while this window waits for the
+        // ordered gate (e.g. behind publisher install).
+        let _ordered = pipeline::drive(service.shared.ordered.lock(), &mut self.ahead).await;
         ordered_wait.complete();
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {
             self.ahead = None;
@@ -1242,7 +1340,14 @@ impl Driver {
                 .phases
                 .measure(
                     Phase::AnnotationFullBodyApply,
-                    service.apply_bodies(after, pending, self.lookup.bodies.as_ref().unwrap()),
+                    // Keep the successor's key-only scan progressing while
+                    // this window applies. It was captured against an older
+                    // base; exactness still comes from apply-time staged and
+                    // covered-publication validation (stale => fresh lookup).
+                    pipeline::drive(
+                        service.apply_bodies(after, pending, self.lookup.bodies.as_ref().unwrap()),
+                        &mut self.ahead,
+                    ),
                 )
                 .await?
             {

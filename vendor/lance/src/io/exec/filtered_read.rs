@@ -350,7 +350,10 @@ struct FragmentStreamActivity(Arc<FilteredReadGlobalMetrics>);
 
 impl FragmentStreamActivity {
     fn start(metrics: Arc<FilteredReadGlobalMetrics>) -> Self {
-        let active = metrics.parallel_fragment_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        let active = metrics
+            .parallel_fragment_streams
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         metrics.parallel_fragment_streams_peak.set_max(active);
         Self(metrics)
     }
@@ -358,7 +361,9 @@ impl FragmentStreamActivity {
 
 impl Drop for FragmentStreamActivity {
     fn drop(&mut self) {
-        self.0.parallel_fragment_streams.fetch_sub(1, Ordering::Relaxed);
+        self.0
+            .parallel_fragment_streams
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -625,8 +630,10 @@ impl FilteredReadStream {
     ) -> Result<Self> {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
-        let base_schedulers =
-            base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options).with_native_memory(dataset.session().native_memory()));
+        let base_schedulers = base_schedulers.unwrap_or_else(|| {
+            Self::make_base_schedulers(&options)
+                .with_native_memory(dataset.session().native_memory())
+        });
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -674,28 +681,27 @@ impl FilteredReadStream {
 
         let global_metrics_clone = global_metrics.clone();
 
-        let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map({
-                let scan_range_after_filter = scan_range_after_filter.clone();
-                move |scoped_fragment| {
-                    let metrics = global_metrics_clone.clone();
-                    let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    let dataset = dataset.clone();
-                    let materialization_context = materialization_context.clone();
-                    SpawnedTask::spawn(lance_core::utils::tokio::scope_task(
-                        Self::read_fragment(
-                            dataset,
-                            scoped_fragment,
-                            metrics,
-                            limit,
-                            materialization_context,
-                            materialize_blob_v2_binary,
-                        )
-                        .in_current_span(),
-                    ))
-                    .map(|thread_result| thread_result.unwrap())
-                }
-            });
+        let fragment_streams = futures::stream::iter(scoped_fragments).map({
+            let scan_range_after_filter = scan_range_after_filter.clone();
+            move |scoped_fragment| {
+                let metrics = global_metrics_clone.clone();
+                let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                let dataset = dataset.clone();
+                let materialization_context = materialization_context.clone();
+                SpawnedTask::spawn(lance_core::utils::tokio::scope_task(
+                    Self::read_fragment(
+                        dataset,
+                        scoped_fragment,
+                        metrics,
+                        limit,
+                        materialization_context,
+                        materialize_blob_v2_binary,
+                    )
+                    .in_current_span(),
+                ))
+                .map(|thread_result| thread_result.unwrap())
+            }
+        });
         let task_stream = match threading_mode {
             FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => fragment_streams
                 .buffered(fragment_readahead)
@@ -710,10 +716,12 @@ impl FilteredReadStream {
                     let metrics = global_metrics.clone();
                     move |open| {
                         let activity = FragmentStreamActivity::start(metrics.clone());
-                        Ok::<_, Error>(futures::stream::once(open)
-                            .try_flatten()
-                            .finally(move || drop(activity))
-                            .boxed())
+                        Ok::<_, Error>(
+                            futures::stream::once(open)
+                                .try_flatten()
+                                .finally(move || drop(activity))
+                                .boxed(),
+                        )
                     }
                 })
                 .try_flatten_unordered(fragment_readahead)
@@ -799,7 +807,11 @@ impl FilteredReadStream {
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
-        ScanScheduler::new_with_native_memory(obj_store, scheduler_config, dataset.session().native_memory())
+        ScanScheduler::new_with_native_memory(
+            obj_store,
+            scheduler_config,
+            dataset.session().native_memory(),
+        )
     }
 
     /// Create the per-base scheduler cache for a read, sized like the scan

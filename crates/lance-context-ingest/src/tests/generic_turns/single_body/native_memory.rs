@@ -363,6 +363,15 @@ async fn two_window_queries_overlap_and_recheck_staging_in_order() -> Result<()>
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successor_lookup_completes_while_ordered_gate_is_held() -> Result<()> {
+    tokio::time::timeout(
+        DEADLINE,
+        two_windows_with_late_tail(false, false, WindowInput::HeldOrdered),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_window_old_misses_requery_after_prefix_publication() -> Result<()> {
     tokio::time::timeout(DEADLINE, two_windows(true, false)).await?
 }
@@ -423,6 +432,8 @@ async fn bounded_promotion_coalesces_records_committed_after_prefix_apply() -> R
 
 enum WindowInput {
     Full,
+    /// Full windows; the test holds the ordered gate after releasing reads.
+    HeldOrdered,
     Late,
     LateConcurrent,
     EmptyConcurrent,
@@ -435,7 +446,7 @@ async fn two_windows_with_late_tail(
     cancel: bool,
     schedule: WindowInput,
 ) -> Result<()> {
-    let late_tail = !matches!(schedule, WindowInput::Full);
+    let late_tail = !matches!(schedule, WindowInput::Full | WindowInput::HeldOrdered);
     let concurrent_refill = matches!(
         schedule,
         WindowInput::LateConcurrent | WindowInput::EmptyConcurrent
@@ -520,6 +531,15 @@ async fn two_windows_with_late_tail(
         &spec,
     )
     .await?;
+    // Form windows at a real key-workspace boundary: the cap admits exactly
+    // eight of the four-key backlog records (`PrefetchStop::KeyBound`), so the
+    // foreground, its successor and any late tail keep their intended shape
+    // under the widened full-body key window.
+    let record_keys = (0..input[2].num_rows())
+        .map(|row| spec.row_key(&input[2], row, 4096).map(|key| key.len()))
+        .collect::<Result<Vec<_>>>()?;
+    let window = 8 * spec.lookup_workspace(record_keys.into_iter())?;
+    runtime = runtime.with_body_key_window_for_test(window);
     let explicit_parallelism = !publish && !cancel && !late_tail;
     if explicit_parallelism {
         runtime =
@@ -541,7 +561,7 @@ async fn two_windows_with_late_tail(
     // successor that grows while A queries. B shares A's new keys; a lookup
     // captured before A applies must recheck staging or the published base.
     let initial_records = match schedule {
-        WindowInput::Full => 17,
+        WindowInput::Full | WindowInput::HeldOrdered => 17,
         WindowInput::EmptyConcurrent => 8,
         _ => 9,
     };
@@ -595,6 +615,12 @@ async fn two_windows_with_late_tail(
             );
         }
         assert_eq!(service.observation().await.0.applied, initial);
+        if !late_tail {
+            // Both windows were sealed by key workspace, not request count.
+            let observed = service.body_lookup_observation();
+            assert!(observed.prefetch.key_bound >= 2, "{observed:?}");
+            assert_eq!(observed.prefetch.request_bound, 0, "{observed:?}");
+        }
         if !concurrent_refill && !matches!(schedule, WindowInput::AfterPromotion) {
             assert_eq!(
                 service.body_lookup_observation().prefetch.requests,
@@ -655,7 +681,32 @@ async fn two_windows_with_late_tail(
                 1
             );
         }
-        if !cancel {
+        if !cancel && matches!(schedule, WindowInput::HeldOrdered) {
+            // Model a publisher install holding the ordered gate. The
+            // successor scan must finish while the foreground waits on it,
+            // without applying anything out of order.
+            let ordered = service.ordered_lock_for_test().await;
+            admission.pause_reads.store(false, Ordering::SeqCst);
+            admission.resume.notify_waiters();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                tokio::select! {
+                    result = &mut step => panic!("step escaped held ordered gate: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+                }
+                let observed = service.body_lookup_observation();
+                if observed.prefetched_lookups_completed == 1 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "successor stalled behind ordered gate: {observed:?}"
+                );
+            }
+            assert_eq!(service.observation().await.0.applied, initial);
+            drop(ordered);
+            step.await?;
+        } else if !cancel {
             admission.pause_reads.store(false, Ordering::SeqCst);
             admission.resume.notify_waiters();
             step.await?;

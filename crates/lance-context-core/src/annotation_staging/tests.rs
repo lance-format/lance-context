@@ -585,6 +585,16 @@ async fn commit(prepared: &PreparedAnnotations) -> Result<Arc<Dataset>> {
     ))
 }
 
+/// Stable observation state. `session_cache_reported_entries` is the shared
+/// Lance session cache's approximate entry gauge, which background cache
+/// activity can change; every other field is still compared exactly.
+fn stable(mut observation: Observation) -> Observation {
+    observation
+        .immutable_membership
+        .session_cache_reported_entries = None;
+    observation
+}
+
 async fn current(staging: &AnnotationStaging, turn: &str) -> Result<TurnAnnotation> {
     staging
         .capture(turn)
@@ -948,7 +958,7 @@ async fn retained_generation_and_reader_admission_bound_memory_until_released() 
     staging.apply(1, 2, "U", &patch).await?;
     let before = staging.observation().await;
     assert!(staging.apply(2, 3, "o'hara", &patch).await.is_err());
-    assert_eq!(staging.observation().await, before);
+    assert_eq!(stable(staging.observation().await), stable(before));
     let workspace = crate::MergeMemoryBudget::new(8 << 20);
     let prepared = frozen.prepare(&workspace, 8192).await?;
     staging

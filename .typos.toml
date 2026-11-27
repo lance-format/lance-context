@@ -1,6 +1,5 @@
 [files]
-# Preserve the vendored upstream source; its two-file correction is documented
-# separately instead of mixing unrelated upstream spelling changes into it.
+# Preserve all vendored upstream sources; their spelling stays upstream.
 extend-exclude = ["vendor/**"]
 
 [default.extend-words]

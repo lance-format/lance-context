@@ -694,7 +694,9 @@ impl CoreFieldDecoderStrategy {
     pub fn from_decoder_config(config: &DecoderConfig) -> Self {
         Self {
             validate_data: config.validate_on_decode,
-            decompressor_strategy: Arc::new(DefaultDecompressionStrategy::with_native_memory(config.native_memory.clone())),
+            decompressor_strategy: Arc::new(DefaultDecompressionStrategy::with_native_memory(
+                config.native_memory.clone(),
+            )),
             cache_repetition_index: config.cache_repetition_index,
         }
     }

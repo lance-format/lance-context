@@ -141,11 +141,18 @@ async fn exercise(cancel: bool) -> Result<()> {
     runtime.apply_once_for_test().await?;
     let observed = service.body_lookup_observation();
     assert_eq!(observed.completed_lookups, 1);
-    assert_eq!(observed.last_lookup_requests, 8);
-    assert_eq!(observed.prefetch.request_bound, 1);
+    // The window is no longer capped at eight requests: it spans the whole
+    // committed backlog, bounded by key workspace. Only the first eight keep
+    // decoded bodies resident; the rest are keys-only until re-read from WAL.
+    assert_eq!(observed.last_lookup_requests, 12);
+    assert_eq!(observed.prefetch.request_bound, 0);
+    assert_eq!(observed.prefetch.page_exhausted, 1);
+    assert_eq!(observed.prefetch.keys_only_records, 4);
+    assert_eq!(observed.prefetch.body_refetches, 0);
+    assert_eq!(observed.scans_started, 1);
     assert_eq!(
         observed.last_lookup_payload_bytes,
-        backlog[..8]
+        backlog[..12]
             .iter()
             .map(|(p, _)| p.body().len() as u64)
             .sum::<u64>()
@@ -155,8 +162,8 @@ async fn exercise(cancel: bool) -> Result<()> {
     let captured = tokio::time::timeout(DEADLINE, captured).await???;
     let window = &captured.data().window;
     assert_eq!(window.first_record, backlog[0].1);
-    assert_eq!(window.last_record, backlog[7].1);
-    assert_eq!(window.requests, 8);
+    assert_eq!(window.last_record, backlog[11].1);
+    assert_eq!(window.requests, 12);
     assert_eq!(window.payload_bytes, observed.last_lookup_payload_bytes);
     assert_eq!(captured.data().staged_keys, 0);
     assert_eq!(captured.data().keys.len(), 6);
@@ -164,7 +171,7 @@ async fn exercise(cancel: bool) -> Result<()> {
     assert_eq!(diagnostic_budget.reserved(), 0);
 
     if cancel {
-        // Seven admitted requests span two pages, but only the first applied.
+        // Eleven admitted requests span two pages, but only the first applied.
         // Dropping the owner must not persist the last observed page cursor.
         drop(runtime);
         drop(service);
@@ -172,17 +179,16 @@ async fn exercise(cancel: bool) -> Result<()> {
         assert!(service.observation().await.0.applied < backlog[0].1);
         finish(&c, &storage, &spec, &input, service, runtime, backlog).await?;
     } else {
-        for (_, index) in backlog.iter().take(8).skip(1) {
+        for (_, index) in backlog.iter().skip(1) {
             runtime.apply_once_for_test().await?;
             assert_eq!(service.observation().await.0.applied, *index);
         }
-        assert_eq!(service.body_lookup_observation().completed_lookups, 1);
-        runtime.apply_once_for_test().await?;
+        // One history scan covered all twelve requests; keys-only records
+        // were re-read from the durable WAL instead of held in memory.
         let observed = service.body_lookup_observation();
-        assert_eq!(observed.completed_lookups, 2);
-        assert_eq!(observed.last_lookup_requests, 4);
-        assert_eq!(observed.prefetch.page_exhausted, 1);
-        assert_eq!(service.observation().await.0.applied, backlog[8].1);
+        assert_eq!(observed.completed_lookups, 1);
+        assert_eq!(observed.scans_started, 1);
+        assert_eq!(observed.prefetch.body_refetches, 4);
         finish(&c, &storage, &spec, &input, service, runtime, backlog).await?;
     }
     c.shutdown().await
