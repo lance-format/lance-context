@@ -51,10 +51,12 @@ use crate::{
 };
 
 mod buffer;
+pub mod key_cache;
 mod lane;
 mod metrics;
 
 use buffer::Buffer;
+pub use key_cache::AppliedKeyCache;
 pub use metrics::{Metrics, MetricsSnapshot};
 
 /// One canonical producer lane of a physical shard.
@@ -90,6 +92,8 @@ pub struct Config {
     /// Concurrent `/applied` waits at a fence.
     pub applied_parallelism: usize,
     pub transient: Transient,
+    /// Optional applied-key cache consulted while splitting turns.
+    pub key_cache: Option<Arc<AppliedKeyCache>>,
 }
 
 /// Applied outcome of one lane's latest record at a fence. Records on one lane
@@ -157,6 +161,8 @@ struct Pending {
     latest: CommitReply,
     records: u64,
     rows: usize,
+    // Keys committed since the last fence; resolved to Applied/Rejected there.
+    keys: Vec<key_cache::Key>,
 }
 
 struct LaneSlot {
@@ -179,6 +185,8 @@ struct Shared {
     metrics: Arc<Metrics>,
     transient: Transient,
     stop: AtomicBool,
+    key_cache: Option<Arc<AppliedKeyCache>>,
+    key_columns: Vec<String>,
 }
 
 pub struct StreamingProducer {
@@ -230,6 +238,7 @@ impl StreamingProducer {
         for bucket in config.shards.keys() {
             buffer.register(*bucket);
         }
+        let key_columns = config.spec.primary_key().to_vec();
         let shared = Arc::new(Shared {
             spec: config.spec,
             limits: config.limits,
@@ -242,6 +251,8 @@ impl StreamingProducer {
             metrics,
             transient: config.transient,
             stop: AtomicBool::new(false),
+            key_cache: config.key_cache,
+            key_columns,
         });
         let mut lanes = Vec::new();
         let mut tasks = Vec::new();
@@ -291,11 +302,32 @@ impl StreamingProducer {
             batch.schema() == *self.shared.spec.body_schema(),
             "foreign turn body schema"
         );
+        let batch = self.drop_known(batch).await?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
         for (bucket, rows) in self.route(&batch)? {
             let part = arrow_select::take::take_record_batch(&batch, &rows)?;
             self.admit(bucket, part).await?;
         }
         Ok(())
+    }
+
+    /// Drop rows whose key the applied-key cache already holds, before they
+    /// are routed or buffered. Within-batch duplicates are left to the owner.
+    async fn drop_known(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        let Some(cache) = self.shared.key_cache.clone() else {
+            return Ok(batch);
+        };
+        let keys = key_cache::batch_keys(&batch, &self.shared.key_columns)?;
+        let found = tokio::task::spawn_blocking(move || cache.contains_many(&keys)).await??;
+        let hits = found.iter().filter(|hit| **hit).count();
+        if hits == 0 {
+            return Ok(batch);
+        }
+        self.shared.metrics.dropped_known(hits);
+        let keep = arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
+        Ok(arrow_select::filter::filter_record_batch(&batch, &keep)?)
     }
 
     fn route(&self, batch: &RecordBatch) -> Result<BTreeMap<u32, UInt32Array>> {
@@ -371,6 +403,7 @@ impl StreamingProducer {
                 pending
                     .as_ref()
                     .map(|p| (slot.clone(), p.latest.clone(), p.records, p.rows))
+                // keys stay in the slot until the outcome is known
             })
             .collect();
         use futures::StreamExt;
@@ -402,10 +435,20 @@ impl StreamingProducer {
         let mut fence = Fence::default();
         for result in results {
             let (slot, applied) = result?;
-            {
-                let mut pending = slot.pending.lock().unwrap();
-                // Nothing committed after the snapshot: sender lock held.
-                *pending = None;
+            // Nothing committed after the snapshot: sender lock held.
+            let keys = slot.pending.lock().unwrap().take().map(|p| p.keys).unwrap_or_default();
+            if let Some(cache) = self.shared.key_cache.clone() {
+                let applied_ok = applied.reply.completion.result == MutationResult::Applied;
+                tokio::task::spawn_blocking(move || {
+                    if applied_ok {
+                        cache.insert(&keys, key_cache::Reason::Applied)
+                    } else {
+                        // The latest outcome covers the lane's records since
+                        // the previous fence: drop their commit-time inserts.
+                        cache.remove(&keys)
+                    }
+                })
+                .await??;
             }
             fence
                 .shards
