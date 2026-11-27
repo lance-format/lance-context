@@ -621,7 +621,7 @@ fn recovered_sequence(
             .as_ref()
             .map(|last| {
                 mutations::validate(last, scope, _open)?;
-                Ok(last.completion.meta.sequence)
+                Ok::<_, anyhow::Error>(last.completion.meta.sequence)
             })
             .transpose()?;
         let committed = saved

@@ -546,8 +546,10 @@ impl Service {
                 frames: Mutex::new(mixed::frames::Window::default()),
                 staging,
                 results: Mutex::new(checkpoint::Results {
+                    // Restore each slot's persisted earliest unresolved
+                    // rejection so /applied keeps fencing later receipts.
+                    sticky: (0..outcomes.len()).map(|slot| snapshot.sticky(slot)).collect(),
                     base: snapshot,
-                    sticky: vec![None; outcomes.len()],
                     latest: outcomes,
                 }),
                 window: Mutex::new(window),
