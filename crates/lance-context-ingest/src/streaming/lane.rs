@@ -112,10 +112,8 @@ async fn commit(
     })
     .await?;
     shared.metrics.committed(started.elapsed(), bytes, rows);
-    if let Some(cache) = &shared.key_cache {
-        // Durably committed: later resends of these turns can be dropped.
-        cache.insert(&keys, super::key_cache::Reason::Commit)?;
-    }
+    // Commit-only keys never enter the skip cache: a committed record can
+    // still be Rejected. Keys are cached only after an Applied outcome.
     let mut pending = slot.pending.lock().unwrap();
     match pending.as_mut() {
         Some(p) => {
