@@ -6,6 +6,7 @@ use crate::annotations::{
 use crate::materializer::{Acquisition, Options};
 use crate::tests::annotation_runtime::{drained, run_owner};
 
+mod compaction;
 #[cfg(unix)]
 mod process;
 mod upload_failure;
