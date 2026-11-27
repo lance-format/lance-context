@@ -1,6 +1,50 @@
 //! Completed immutable-key lookup windows for one service lifetime.
 use super::*;
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefetchStop {
+    PageExhausted,
+    RequestBound,
+    ByteBound,
+    Admission,
+}
+
+/// Completed prefetch decisions, before lookup admission. These are selected
+/// inputs, not applied requests or completed native scans. This never waits for
+/// new arrivals beyond the captured source page.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct BodyPrefetchObservation {
+    pub preparations: u64,
+    pub requests: u64,
+    pub payload_bytes: u64,
+    pub last_requests: u64,
+    pub last_payload_bytes: u64,
+    pub last_stop: Option<PrefetchStop>,
+    pub page_exhausted: u64,
+    pub request_bound: u64,
+    pub byte_bound: u64,
+    pub admission: u64,
+}
+
+impl BodyPrefetchObservation {
+    pub(super) fn record(&mut self, requests: usize, bytes: u64, stop: PrefetchStop) {
+        self.preparations = self.preparations.saturating_add(1);
+        self.requests = self.requests.saturating_add(requests as u64);
+        self.payload_bytes = self.payload_bytes.saturating_add(bytes);
+        self.last_requests = requests as u64;
+        self.last_payload_bytes = bytes;
+        self.last_stop = Some(stop);
+        let count = match stop {
+            PrefetchStop::PageExhausted => &mut self.page_exhausted,
+            PrefetchStop::RequestBound => &mut self.request_bound,
+            PrefetchStop::ByteBound => &mut self.byte_bound,
+            PrefetchStop::Admission => &mut self.admission,
+        };
+        *count = count.saturating_add(1);
+    }
+}
+
 /// A native metric may be absent from a successful scan's execution plan.
 /// Keep its coverage separate from its total: a measured zero is a sample.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -18,13 +62,24 @@ impl LookupMetricObservation {
     }
 }
 
-/// Cumulative successful lookup windows, including probes whose captured base
-/// was subsequently replaced. Cached reuse and admission refusals add nothing.
-/// Failed/cancelled attempts remain visible in the existing lookup phase.
+/// Lookup totals count successful windows, including probes whose captured base
+/// was subsequently replaced. Cached reuse and admission refusals add no lookup
+/// totals; prefetch decisions and fallback attempts have separate counters.
+/// Failed/cancelled lookups remain visible in the existing lookup phase.
 /// A window entirely resolved by staging starts no native scan.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BodyLookupObservation {
     pub completed_lookups: u64,
+    /// Original requests/wire bytes covered by successful lookup windows.
+    /// Re-probes count again; these are not unique writes or publication ACKs.
+    pub lookup_requests: u64,
+    pub lookup_payload_bytes: u64,
+    pub last_lookup_requests: u64,
+    pub last_lookup_payload_bytes: u64,
+    /// Attempts releasing prefetched bodies before a head-only lookup. The
+    /// replacement lookup can still fail admission; this is not a success count.
+    pub lookahead_admission_fallbacks: u64,
+    pub prefetch: BodyPrefetchObservation,
     pub requested_keys: u64,
     /// Keys resolved from the same captured active/frozen view, without history I/O.
     pub staged_keys: u64,
@@ -53,6 +108,19 @@ pub struct BodyLookupObservation {
 }
 
 impl BodyLookupObservation {
+    pub(super) fn record_window(
+        &mut self,
+        value: &crate::turn_ingestion::TurnLookupObservation,
+        requests: usize,
+        bytes: u64,
+    ) {
+        self.record(value);
+        self.lookup_requests = self.lookup_requests.saturating_add(requests as u64);
+        self.lookup_payload_bytes = self.lookup_payload_bytes.saturating_add(bytes);
+        self.last_lookup_requests = requests as u64;
+        self.last_lookup_payload_bytes = bytes;
+    }
+
     pub(super) fn record(&mut self, value: &crate::turn_ingestion::TurnLookupObservation) {
         self.completed_lookups = self.completed_lookups.saturating_add(1);
         self.requested_keys = self

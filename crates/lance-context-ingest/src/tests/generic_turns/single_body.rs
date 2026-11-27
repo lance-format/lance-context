@@ -186,6 +186,17 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     assert_eq!(replayed.manifest().fragments, durable.manifest().fragments);
     let lookup = service.body_lookup_observation();
     assert_eq!(lookup.completed_lookups, 1);
+    assert_eq!(lookup.lookup_requests, 1);
+    assert_eq!(lookup.lookup_payload_bytes, encode_body(0)?.len() as u64);
+    assert_eq!(lookup.last_lookup_requests, 1);
+    assert_eq!(
+        lookup.last_lookup_payload_bytes,
+        lookup.lookup_payload_bytes
+    );
+    assert_eq!(lookup.prefetch.preparations, 1);
+    assert_eq!(lookup.prefetch.requests, 1);
+    assert_eq!(lookup.prefetch.payload_bytes, lookup.lookup_payload_bytes);
+    assert_eq!(lookup.prefetch.page_exhausted, 1);
     assert_eq!(lookup.scans_started, 1);
     assert_eq!(lookup.requested_keys, keys[0].len() as u64);
     assert!(lookup.projected_rows >= keys[0].len() as u64);
@@ -193,6 +204,8 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     assert!(lookup.native_summaries <= lookup.completed_lookups);
     assert_eq!(service.submit(&repeated, DEADLINE).await?, result);
     assert_eq!(service.body_lookup_observation().completed_lookups, 1);
+    assert_eq!(service.body_lookup_observation().lookup_requests, 1);
+    assert_eq!(service.body_lookup_observation().prefetch.preparations, 1);
     // More concurrent lanes than the frame budget can admit at once. Queued
     // decoded frames must leave capacity for their own historical existence
     // lookup, otherwise an all-duplicate burst can stop apply and publication.
