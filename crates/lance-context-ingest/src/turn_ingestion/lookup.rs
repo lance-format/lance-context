@@ -23,6 +23,12 @@ const ADMITTED_SCAN_READAHEAD: usize = 8;
 pub struct TurnLookupObservation {
     pub requested_keys: usize,
     pub staged_keys: usize,
+    /// Exact distinct requested keys found in the captured base, excluding
+    /// staged hits and projected cross-product candidates.
+    pub history_hits: usize,
+    /// Requested keys absent after a successful complete historical lookup.
+    /// Admission failures, errors and cancellation do not produce this count.
+    pub history_misses: usize,
     pub scans_started: u64,
     pub projected_rows: u64,
     pub projected_array_bytes: u64,
@@ -275,6 +281,8 @@ impl TurnIngestionSpec {
             }
         }
         drop(stream);
+        observation.history_hits = requested.len() - staged_keys - remaining;
+        observation.history_misses = remaining;
         // One snapshot for either completion path. Do not wait for cancelled
         // background work: these are observed plan metrics, not all store I/O.
         let mut stats = ExecutionSummaryCounts::default();

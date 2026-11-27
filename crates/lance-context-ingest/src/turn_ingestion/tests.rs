@@ -71,6 +71,8 @@ async fn key_scan_reports_native_work_for_early_hit() -> Result<()> {
     let observed = lookup.observation();
     assert_eq!(observed.scans_started, 1);
     assert_eq!(observed.projected_rows, 2);
+    assert_eq!(observed.history_hits, 1);
+    assert_eq!(observed.history_misses, 0);
     // Both duplicate rows arrive in one batch. Finding the requested key
     // drops the scan before polling EOF, but its actual work still counts.
     assert!(observed.lance_bytes_read.is_some_and(|bytes| bytes > 0));
@@ -97,6 +99,8 @@ async fn key_scan_reports_native_work_for_missing_composite_key() -> Result<()> 
         .expect("lookup workspace admitted");
     assert_eq!(lookup.get(&key), Some(false));
     let observed = lookup.observation();
+    assert_eq!(observed.history_hits, 0);
+    assert_eq!(observed.history_misses, 1);
     assert_eq!(observed.scans_started, 1);
     assert_eq!(observed.projected_rows, 0);
     assert_eq!(observed.fragments_scanned, Some(1));

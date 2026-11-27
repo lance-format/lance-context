@@ -167,6 +167,7 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     assert_eq!(recovered.installed_base.version, selected.manifest.version);
     assert_eq!(recovered.installed_base.source, selected.source);
     assert_eq!(recovered.materialized, selected.through);
+    assert_eq!(recovered.immutable_apply.batches, 0);
     let (stop, task) = run_owner(runtime);
     assert_eq!(
         service
@@ -199,13 +200,21 @@ async fn full_body_rf3_first_create_drains_reads_and_recovers_without_auxiliary_
     assert_eq!(lookup.prefetch.page_exhausted, 1);
     assert_eq!(lookup.scans_started, 1);
     assert_eq!(lookup.requested_keys, keys[0].len() as u64);
+    assert_eq!(lookup.history_hits, keys[0].len() as u64);
+    assert_eq!(lookup.history_misses, 0);
     assert!(lookup.projected_rows >= keys[0].len() as u64);
     assert!(lookup.projected_array_bytes > 0);
     assert!(lookup.native_summaries <= lookup.completed_lookups);
+    let applied = service.observation().await.0.immutable_apply;
+    assert_eq!(applied.batches, 1);
+    assert_eq!(applied.rows, input[0].num_rows() as u64);
+    assert_eq!(applied.inserted_rows, 0);
+    assert_eq!(applied.duplicate_rows, applied.rows);
     assert_eq!(service.submit(&repeated, DEADLINE).await?, result);
     assert_eq!(service.body_lookup_observation().completed_lookups, 1);
     assert_eq!(service.body_lookup_observation().lookup_requests, 1);
     assert_eq!(service.body_lookup_observation().prefetch.preparations, 1);
+    assert_eq!(service.observation().await.0.immutable_apply, applied);
     // More concurrent lanes than the frame budget can admit at once. Queued
     // decoded frames must leave capacity for their own historical existence
     // lookup, otherwise an all-duplicate burst can stop apply and publication.

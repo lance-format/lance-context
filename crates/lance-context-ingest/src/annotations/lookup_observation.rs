@@ -83,6 +83,10 @@ pub struct BodyLookupObservation {
     pub requested_keys: u64,
     /// Keys resolved from the same captured active/frozen view, without history I/O.
     pub staged_keys: u64,
+    /// Exact distinct keys per successful window, after composite matching.
+    /// Re-probes count again; these are not applied or globally unique rows.
+    pub history_hits: u64,
+    pub history_misses: u64,
     pub scans_started: u64,
     /// Returned key columns, including candidates removed by composite matching.
     /// These are not physical storage bytes or all scanned source rows.
@@ -127,6 +131,10 @@ impl BodyLookupObservation {
             .requested_keys
             .saturating_add(value.requested_keys as u64);
         self.staged_keys = self.staged_keys.saturating_add(value.staged_keys as u64);
+        self.history_hits = self.history_hits.saturating_add(value.history_hits as u64);
+        self.history_misses = self
+            .history_misses
+            .saturating_add(value.history_misses as u64);
         self.scans_started = self.scans_started.saturating_add(value.scans_started);
         self.projected_rows = self.projected_rows.saturating_add(value.projected_rows);
         self.projected_array_bytes = self

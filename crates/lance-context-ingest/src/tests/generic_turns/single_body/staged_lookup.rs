@@ -62,6 +62,11 @@ async fn exercise() -> Result<()> {
     }
     assert_eq!(service.body_lookup_observation().scans_started, 1);
     assert_eq!(service.body_lookup_observation().staged_keys, 2);
+    assert_eq!(service.body_lookup_observation().history_hits, 0);
+    assert_eq!(service.body_lookup_observation().history_misses, 2);
+    let applied = service.observation().await.0.immutable_apply;
+    assert_eq!((applied.batches, applied.rows), (2, 4));
+    assert_eq!((applied.inserted_rows, applied.duplicate_rows), (2, 2));
     assert_eq!(service.selected_full_body(DEADLINE).await?.rows, Some(0));
     assert_eq!(service.observation().await.0.installed_base, initial);
 
@@ -80,6 +85,11 @@ async fn exercise() -> Result<()> {
     assert_eq!(result.result, MutationResult::Applied);
     assert_eq!(service.body_lookup_observation().scans_started, 2);
     assert_eq!(service.body_lookup_observation().staged_keys, 6);
+    assert_eq!(service.body_lookup_observation().history_hits, 0);
+    assert_eq!(service.body_lookup_observation().history_misses, 4);
+    let applied = service.observation().await.0.immutable_apply;
+    assert_eq!((applied.batches, applied.rows), (4, 10));
+    assert_eq!((applied.inserted_rows, applied.duplicate_rows), (4, 6));
     assert_eq!(service.selected_full_body(DEADLINE).await?.rows, Some(0));
     assert_eq!(service.observation().await.0.installed_base, initial);
     for (row, original) in [
@@ -118,6 +128,15 @@ async fn exercise() -> Result<()> {
     assert_eq!(after.scans_started, before.scans_started + 1);
     assert_eq!(after.native_summaries, before.native_summaries + 1);
     assert_eq!(after.staged_keys, before.staged_keys);
+    assert_eq!(after.history_hits, before.history_hits + 2);
+    assert_eq!(after.history_misses, before.history_misses);
+    assert_eq!(
+        after.requested_keys,
+        after.staged_keys + after.history_hits + after.history_misses
+    );
+    let applied = service.observation().await.0.immutable_apply;
+    assert_eq!((applied.batches, applied.rows), (5, 12));
+    assert_eq!((applied.inserted_rows, applied.duplicate_rows), (4, 8));
     // A materialized key is no longer a staged hit; the original body wins.
     let key = spec.row_key(&input[0], 0, 4096)?;
     assert_eq!(
