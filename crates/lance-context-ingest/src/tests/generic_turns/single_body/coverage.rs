@@ -113,11 +113,13 @@ async fn exercise() -> Result<()> {
     c.shutdown().await
 }
 
+#[cfg(feature = "service")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn selected_body_covers_selected_pending_publication_but_not_acked_suffix() -> Result<()> {
     tokio::time::timeout(DEADLINE, pending_publication()).await?
 }
 
+#[cfg(feature = "service")]
 async fn pending_publication() -> Result<()> {
     use crate::tests::annotation_runtime::lost_prepare::proxy::Proxy;
 
