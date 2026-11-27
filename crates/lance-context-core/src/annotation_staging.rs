@@ -140,8 +140,9 @@ enum PendingBatch {
 
 struct State {
     base: Arc<views::Base>,
-    // Local to this staging instance. Verified frozen publications preserve
-    // this lineage; maintenance starts a new one. It is not a durable epoch.
+    // Local to this staging instance. Verified frozen publications and native
+    // row-preserving rewrite/index installs preserve this lineage. Separate
+    // body replacements reset it. It is not a durable epoch or a physical pin.
     immutable_publications: Arc<()>,
     immutable_lookup_reused: u64,
     immutable_lookup_invalidated: u64,

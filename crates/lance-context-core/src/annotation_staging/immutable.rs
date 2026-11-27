@@ -117,7 +117,9 @@ impl AnnotationStaging {
     /// rechecked under the mutation gate, so concurrent lanes and replay keep
     /// the first source row. A staged-covered lookup also includes every key
     /// published through its captured applied cut. It survives only verified
-    /// publications on this instance's lineage up to that cut. `None` requires
+    /// publications on this instance's lineage up to that cut, including
+    /// verified row-preserving rewrite/index installs that keep the same cut.
+    /// Its original physical base stays pinned. `None` requires
     /// a fresh lookup for the SAME request, without advancing its WAL position.
     /// Backpressure also leaves the entire request unapplied.
     pub async fn register_immutable_committed(

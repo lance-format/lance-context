@@ -30,3 +30,13 @@ duplicate counts: request results and WAL progress still require publication
 even when no body file is added. Neither a version increment nor a completed
 lookup alone establishes that explanation. Keep table, shard, owner and
 observation-window identity when comparing these counters with installed rows.
+
+A lookup that captured active/frozen membership can survive verified native
+compaction or index installation: neither changes logical key membership or the
+materialized cut. It keeps its original dataset and reader permit for physical
+snapshot protection. Ordered apply still checks active/frozen keys and rejects
+the lookup if publication has passed its captured applied cut. Plain captures,
+separate body replacements and a newly recovered staging instance retain their
+conservative invalidation behavior. The caller must validate the row-preserving
+rewrite and exact fenced publication; a `Rewrite` operation name or matching row
+count alone does not establish that proof.
