@@ -64,6 +64,28 @@ barrier. Forwarding ingresses route that key by its configured session component
 `Service::get_turn` returns the original body and separate current annotations;
 a body's own `score` column is not overwritten by an annotation score.
 
+For a single full-body table provisioned with `bootstrap::provision_body_shard`,
+the owner and forwarding routers expose
+`POST /api/v1/annotations/{table}/read-body`. Send a JSON point request such as
+`{"turn":"[\"session-1\",\"turn-1\"]"}`. Construct that tuple with the table's
+`TurnIngestionSpec::business_key`; forwarding uses its configured routing
+column, so the component names and order belong to the application schema.
+
+A found row returns HTTP 200 with an Arrow IPC file
+(`application/vnd.apache.arrow.file`) containing one row in the original body
+schema. The owner reads its compatible applied staging/Lance view, including
+acknowledged rows awaiting publication, and checks its owner fence before
+returning. It does not scan the WAL on the point-read path. A missing row returns
+HTTP 204 with no body; memory pressure or an unavailable owner returns HTTP 503.
+The application's authentication boundary still applies to these routes.
+
+The owner admits read/encoding workspace and output backing before reading,
+and retains that admission through response consumption. Forwarders stream the
+owner's Arrow bytes without decoding or re-encoding them. A client can validate
+the response schema, row count and exact requested key with
+`http::annotations::full_body::decode`; the client must bound and admit its own
+input/decode memory and retain that admission while using the result.
+
 `Service::selected_body` and the HTTP `selected-body` route return the exact
 managed body snapshot and covered WAL cut, scoped by cluster, layout, physical
 table, incarnation, group and shard. `DurableMutationClient::selected_body`
