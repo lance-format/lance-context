@@ -264,7 +264,7 @@ impl Service {
         after: u64,
         pending: &Pending,
         lookup: &Lookup,
-    ) -> Result<Option<ApplyOutcome>> {
+    ) -> Result<Option<(ApplyOutcome, usize)>> {
         let mixed::Decoded::Creates { rows, .. } = &pending.decoded else {
             bail!("immutable body cannot apply patches")
         };
@@ -284,7 +284,7 @@ impl Service {
         Ok(self
             .shared
             .staging
-            .register_immutable_committed(after, pending.index, &rows, &lookup.base)
+            .register_immutable_committed_with_count(after, pending.index, &rows, &lookup.base)
             .await?)
     }
 

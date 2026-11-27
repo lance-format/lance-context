@@ -157,11 +157,13 @@ impl AnnotationStaging {
         let lineage = state.immutable_publications.clone();
         drop(state);
         if self.immutable_body {
+            let warming = self.published_values.begin_publication_warming();
             for key in generation.values.keys() {
                 self.published_values
                     .remember_immutable(key, &lineage, generation.through)
                     .await;
             }
+            warming.complete();
         } else {
             self.published_values
                 .remember(&generation.values, generation.through)

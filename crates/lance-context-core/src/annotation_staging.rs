@@ -26,7 +26,7 @@ mod patch_lookup;
 mod preserve_id;
 mod publication;
 mod published_values;
-pub use published_values::MembershipObservation;
+pub use published_values::{MembershipObservation, MembershipWarmObservation};
 mod registration;
 mod registration_lookup;
 mod status_filter;

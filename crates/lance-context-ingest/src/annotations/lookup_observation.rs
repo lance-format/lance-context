@@ -79,6 +79,15 @@ impl LookupMetricObservation {
 /// A window resolved by staging or committed membership starts no native scan.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BodyLookupObservation {
+    /// Full-body Applied batches with an actual first-create count of zero.
+    /// Byte totals count frame admissions, not live memory, freed bytes or RSS.
+    pub all_duplicate_batches: u64,
+    pub all_duplicate_rows: u64,
+    /// Coverage of the known-capacity, within-frame deduplicated Arrow total.
+    pub all_duplicate_known_arrow_batches: u64,
+    pub all_duplicate_arrow_backing_bytes: u64,
+    /// Final retained apply reservation; includes conservative bookkeeping.
+    pub all_duplicate_reservation_bytes: u64,
     pub completed_lookups: u64,
     /// Original requests/wire bytes covered by successful lookup windows.
     /// Re-probes count again; these are not unique writes or publication ACKs.

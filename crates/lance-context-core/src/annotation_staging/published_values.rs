@@ -5,7 +5,7 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use std::borrow::Cow;
 
 mod membership;
-pub use membership::MembershipObservation;
+pub use membership::{MembershipObservation, MembershipWarmObservation};
 
 #[derive(Clone)]
 pub(super) struct PublishedValues {

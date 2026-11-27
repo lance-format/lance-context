@@ -140,6 +140,7 @@ pub struct Driver {
     prefetched_reused: bool,
     body_batch_wait: Duration,
     body_batch_deadline: Option<tokio::time::Instant>,
+    pressure_episode: Option<(ApplyBackpressure, crate::materializer::observation::Guard)>,
 }
 
 /// Connect an authorized ingress without opening Lance or creating an applier.
@@ -526,6 +527,7 @@ impl Service {
             prefetched_reused: false,
             body_batch_wait: Duration::ZERO,
             body_batch_deadline: None,
+            pressure_episode: None,
         };
         Ok((service, driver))
     }
@@ -956,6 +958,31 @@ impl Service {
 }
 
 impl Driver {
+    fn record_pressure(
+        service: &Service,
+        episode: &mut Option<(ApplyBackpressure, crate::materializer::observation::Guard)>,
+        reason: ApplyBackpressure,
+    ) {
+        if episode
+            .as_ref()
+            .is_none_or(|(current, _)| *current != reason)
+        {
+            if let Some((_, timing)) = episode.take() {
+                timing.complete();
+            }
+            let phase = match reason {
+                ApplyBackpressure::ApplyMemory => Phase::AnnotationApplyMemoryPressure,
+                ApplyBackpressure::SourceWindow => Phase::AnnotationSourceWindowPressure,
+                ApplyBackpressure::Staging => Phase::AnnotationStagingPressure,
+            };
+            *episode = Some((reason, service.shared.phases.enter(phase)));
+        }
+        service
+            .shared
+            .progress
+            .send_modify(|p| p.backpressure = Some(reason));
+    }
+
     /// No detached tasks: the caller owns and joins this driver. A storage or
     /// protocol failure stops it and makes readers fail instead of serving stale
     /// values. Pressure alone retains the decoded batch for the next attempt.
@@ -1045,10 +1072,11 @@ impl Driver {
                     "foreign annotation source"
                 );
                 let Some(pending) = prefetch::fetch(service, index, meta).await? else {
-                    service
-                        .shared
-                        .progress
-                        .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
+                    Self::record_pressure(
+                        service,
+                        &mut self.pressure_episode,
+                        ApplyBackpressure::ApplyMemory,
+                    );
                     return Ok(());
                 };
                 self.pending = Some(pending);
@@ -1166,21 +1194,25 @@ impl Driver {
                 }
             }
             if self.lookup.bodies.is_none() {
-                service
-                    .shared
-                    .progress
-                    .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
+                Self::record_pressure(
+                    service,
+                    &mut self.pressure_episode,
+                    ApplyBackpressure::ApplyMemory,
+                );
                 return Ok(());
             }
         }
         pipeline::tick(&mut self.ahead).await;
+        let ordered_wait = service.shared.phases.enter(Phase::AnnotationOrderedWait);
         let _ordered = service.shared.ordered.lock().await;
+        ordered_wait.complete();
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {
             self.ahead = None;
-            service
-                .shared
-                .progress
-                .send_modify(|p| p.backpressure = Some(ApplyBackpressure::SourceWindow));
+            Self::record_pressure(
+                service,
+                &mut self.pressure_episode,
+                ApplyBackpressure::SourceWindow,
+            );
             return Ok(());
         }
         let observed = service.shared.staging.observation().await;
@@ -1203,12 +1235,21 @@ impl Driver {
             .shared
             .apply_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut full_body_inserted_rows = None;
         let applied = if service.is_single_body() {
             match service
-                .apply_bodies(after, pending, self.lookup.bodies.as_ref().unwrap())
+                .shared
+                .phases
+                .measure(
+                    Phase::AnnotationFullBodyApply,
+                    service.apply_bodies(after, pending, self.lookup.bodies.as_ref().unwrap()),
+                )
                 .await?
             {
-                Some(applied) => applied,
+                Some((applied, inserted)) => {
+                    full_body_inserted_rows = Some(inserted);
+                    applied
+                }
                 None => {
                     if self.prefetched_lookup {
                         let mut observed = service.shared.body_lookups.lock().unwrap();
@@ -1304,56 +1345,83 @@ impl Driver {
             ApplyOutcome::Backpressure => {
                 self.ahead = None;
                 self.staging_pressure = Some(capacity);
-                service
-                    .shared
-                    .progress
-                    .send_modify(|p| p.backpressure = Some(ApplyBackpressure::Staging));
+                Self::record_pressure(
+                    service,
+                    &mut self.pressure_episode,
+                    ApplyBackpressure::Staging,
+                );
                 return Ok(());
             }
         };
-        if self.prefetched_lookup && !self.prefetched_reused {
-            self.prefetched_reused = true;
-            let mut observed = service.shared.body_lookups.lock().unwrap();
-            observed.prefetched_lookups_reused =
-                observed.prefetched_lookups_reused.saturating_add(1);
-        }
         // No await between applying the batch, retaining its outcome, and
         // publishing progress to waiters. Cancellation cannot split this handoff.
-        let pending = self.pending.take().unwrap();
-        if let mixed::Decoded::Creates { bodies, rows } = pending.decoded {
-            // Release decoded narrow rows before returning transient decode
-            // credit. The retained body frame keeps every shared IPC allocation.
-            drop(rows);
-            if result == MutationResult::Applied {
-                service.shared.frames.lock().unwrap().record_with_spec(
-                    pending.index,
-                    bodies,
-                    pending._reservation,
-                    pending.meta.body_bytes as usize,
-                    pending.input_allocation,
-                    ingress.turn_spec.clone(),
-                );
-            }
-        }
-        self.staging_pressure = None;
-        let slot = slot(&pending.meta, ingress.client.producer_slots())?;
         service
             .shared
-            .window
-            .lock()
-            .unwrap()
-            .record(pending.index, pending.meta.clone());
-        service.shared.results.lock().unwrap().latest[slot] = Some(Completed {
-            index: pending.index,
-            meta: pending.meta,
-            result,
-        });
-        service.shared.progress.send_replace(Progress {
-            through: pending.index,
-            stopped: false,
-            backpressure: None,
-        });
-        Ok(())
+            .phases
+            .blocking(Phase::AnnotationApplyHandoff, || {
+                if self.prefetched_lookup && !self.prefetched_reused {
+                    self.prefetched_reused = true;
+                    let mut observed = service.shared.body_lookups.lock().unwrap();
+                    observed.prefetched_lookups_reused =
+                        observed.prefetched_lookups_reused.saturating_add(1);
+                }
+                let pending = self.pending.take().unwrap();
+                if let mixed::Decoded::Creates { bodies, rows } = pending.decoded {
+                    let input_rows = rows.len() as u64;
+                    // Release decoded narrow rows before returning transient decode
+                    // credit. The retained body frame keeps every shared IPC allocation.
+                    drop(rows);
+                    if result == MutationResult::Applied {
+                        let retained = service.shared.frames.lock().unwrap().record_with_spec(
+                            pending.index,
+                            bodies,
+                            pending._reservation,
+                            pending.meta.body_bytes as usize,
+                            pending.input_allocation,
+                            ingress.turn_spec.clone(),
+                        );
+                        if full_body_inserted_rows == Some(0) {
+                            let mut observed = service.shared.body_lookups.lock().unwrap();
+                            observed.all_duplicate_batches =
+                                observed.all_duplicate_batches.saturating_add(1);
+                            observed.all_duplicate_rows =
+                                observed.all_duplicate_rows.saturating_add(input_rows);
+                            observed.all_duplicate_reservation_bytes = observed
+                                .all_duplicate_reservation_bytes
+                                .saturating_add(retained.reservation_bytes as u64);
+                            if let Some(bytes) = retained.arrow_backing_bytes {
+                                observed.all_duplicate_known_arrow_batches =
+                                    observed.all_duplicate_known_arrow_batches.saturating_add(1);
+                                observed.all_duplicate_arrow_backing_bytes = observed
+                                    .all_duplicate_arrow_backing_bytes
+                                    .saturating_add(bytes as u64);
+                            }
+                        }
+                    }
+                }
+                self.staging_pressure = None;
+                let slot = slot(&pending.meta, ingress.client.producer_slots())?;
+                service
+                    .shared
+                    .window
+                    .lock()
+                    .unwrap()
+                    .record(pending.index, pending.meta.clone());
+                service.shared.results.lock().unwrap().latest[slot] = Some(Completed {
+                    index: pending.index,
+                    meta: pending.meta,
+                    result,
+                });
+                service.shared.progress.send_replace(Progress {
+                    through: pending.index,
+                    stopped: false,
+                    backpressure: None,
+                });
+                if let Some((_, timing)) = self.pressure_episode.take() {
+                    timing.complete();
+                }
+                Ok(())
+            })
     }
 }
 

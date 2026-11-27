@@ -1,7 +1,10 @@
 //! Disposable positive membership in the existing bounded Session cache.
 use super::*;
 use lance_core::memory::{self, NativeMemoryKind, NativeReservation};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
+};
 
 /// Process-local cache activity; neither application nor publication progress.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -19,11 +22,92 @@ pub struct MembershipObservation {
     pub warms: u64,
     /// Optional warming skipped because backing memory could not be admitted.
     pub refusals: u64,
+    /// Batch-level optional warming inside immutable apply and publication.
+    /// These intervals are children of their caller's apply/install phase.
+    pub apply_warming: MembershipWarmObservation,
+    pub publication_warming: MembershipWarmObservation,
     /// Entire shared Session cache, not this membership namespace.
     pub session_cache_capacity_bytes: Option<usize>,
     /// Backend's cheap approximate entry count across the shared cache.
     /// Zero can also mean unsupported; this is not resident membership size.
     pub session_cache_reported_entries: Option<usize>,
+}
+
+/// One timer per warming loop, including resident probes and skipped warms.
+/// Finished elapsed includes cancellation/unwind, but excludes active work.
+/// Counts are sampled independently; never add these times to parent phases.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MembershipWarmObservation {
+    pub started: u64,
+    pub completed: u64,
+    pub cancelled: u64,
+    pub active: u64,
+    pub elapsed_micros: u64,
+    pub max_elapsed_micros: u64,
+}
+
+#[derive(Default)]
+struct WarmCounters {
+    started: AtomicU64,
+    completed: AtomicU64,
+    cancelled: AtomicU64,
+    elapsed_micros: AtomicU64,
+    max_elapsed_micros: AtomicU64,
+}
+
+impl WarmCounters {
+    fn observation(&self) -> MembershipWarmObservation {
+        let started = self.started.load(Ordering::Relaxed);
+        let completed = self.completed.load(Ordering::Relaxed);
+        let cancelled = self.cancelled.load(Ordering::Relaxed);
+        MembershipWarmObservation {
+            started,
+            completed,
+            cancelled,
+            active: started.saturating_sub(completed.saturating_add(cancelled)),
+            elapsed_micros: self.elapsed_micros.load(Ordering::Relaxed),
+            max_elapsed_micros: self.max_elapsed_micros.load(Ordering::Relaxed),
+        }
+    }
+
+    fn enter(&self) -> WarmGuard<'_> {
+        self.started.fetch_add(1, Ordering::Relaxed);
+        WarmGuard {
+            counters: self,
+            started: Instant::now(),
+            completed: false,
+        }
+    }
+}
+
+pub(in crate::annotation_staging) struct WarmGuard<'a> {
+    counters: &'a WarmCounters,
+    started: Instant,
+    completed: bool,
+}
+
+impl WarmGuard<'_> {
+    pub(in crate::annotation_staging) fn complete(mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for WarmGuard<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        self.counters
+            .elapsed_micros
+            .fetch_add(elapsed, Ordering::Relaxed);
+        self.counters
+            .max_elapsed_micros
+            .fetch_max(elapsed, Ordering::Relaxed);
+        let finished = if self.completed {
+            &self.counters.completed
+        } else {
+            &self.counters.cancelled
+        };
+        finished.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -36,6 +120,8 @@ pub(super) struct Counters {
     miss_future_cut: AtomicU64,
     warms: AtomicU64,
     refusals: AtomicU64,
+    apply_warming: WarmCounters,
+    publication_warming: WarmCounters,
 }
 
 enum Probe {
@@ -79,6 +165,14 @@ impl CacheKey for MemberKey<'_> {
 }
 
 impl PublishedValues {
+    pub(in crate::annotation_staging) fn begin_apply_warming(&self) -> WarmGuard<'_> {
+        self.membership.apply_warming.enter()
+    }
+
+    pub(in crate::annotation_staging) fn begin_publication_warming(&self) -> WarmGuard<'_> {
+        self.membership.publication_warming.enter()
+    }
+
     async fn resident_member(&self, key: &str, lineage: &Arc<()>, through: u64) -> Probe {
         let Some(cache) = &self.cache else {
             return Probe::Disabled;
@@ -171,6 +265,8 @@ impl PublishedValues {
             miss_future_cut,
             warms: self.membership.warms.load(Ordering::Relaxed),
             refusals: self.membership.refusals.load(Ordering::Relaxed),
+            apply_warming: self.membership.apply_warming.observation(),
+            publication_warming: self.membership.publication_warming.observation(),
             session_cache_capacity_bytes: self.cache.as_ref().and_then(LanceCache::capacity_bytes),
             session_cache_reported_entries: self.cache.as_ref().map(LanceCache::approx_size),
         }

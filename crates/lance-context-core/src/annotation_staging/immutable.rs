@@ -152,6 +152,23 @@ impl AnnotationStaging {
         rows: &[ImmutableRegistration<'_>],
         lookup: &ImmutableBase,
     ) -> Result<Option<ApplyOutcome>> {
+        Ok(self
+            .register_immutable_committed_with_count(after, through, rows, lookup)
+            .await?
+            .map(|(outcome, _)| outcome))
+    }
+
+    /// The same atomic registration with its actual first-create count.
+    /// The count is zero for rejected/backpressured attempts; only Applied
+    /// makes it meaningful for duplicate-batch observation. This is not a
+    /// separate application or a second asynchronously sampled observation.
+    pub async fn register_immutable_committed_with_count(
+        &self,
+        after: u64,
+        through: u64,
+        rows: &[ImmutableRegistration<'_>],
+        lookup: &ImmutableBase,
+    ) -> Result<Option<(ApplyOutcome, usize)>> {
         self.require_immutable()?;
         let _mutation = self.mutation.lock().await;
         let mut state = self.state.write().await;
@@ -170,6 +187,7 @@ impl AnnotationStaging {
             let lineage = state.immutable_publications.clone();
             let materialized = state.materialized;
             drop(state);
+            let warming = self.published_values.begin_apply_warming();
             for row in rows.iter().filter(|row| row.exists_in_base) {
                 let state = self.state.read().await;
                 // Covered staged hits are only durable after their generation
@@ -186,6 +204,7 @@ impl AnnotationStaging {
                         .await;
                 }
             }
+            warming.complete();
             // The mutation gate still excludes publication/apply. Cancellation
             // during optional warming leaves this request wholly unapplied.
             state = self.state.write().await;
@@ -202,15 +221,15 @@ impl AnnotationStaging {
                     .saturating_add(rows.len() as u64 - inserted);
                 state.active.extend(values);
                 state.applied = through;
-                ApplyOutcome::Applied
+                (ApplyOutcome::Applied, inserted as usize)
             }
             PendingBatch::Rejected(rejection) => {
                 state.applied = through;
-                ApplyOutcome::Rejected(rejection)
+                (ApplyOutcome::Rejected(rejection), 0)
             }
-            PendingBatch::Backpressure => ApplyOutcome::Backpressure,
+            PendingBatch::Backpressure => (ApplyOutcome::Backpressure, 0),
         };
-        if changed_base && !matches!(outcome, ApplyOutcome::Backpressure) {
+        if changed_base && !matches!(outcome.0, ApplyOutcome::Backpressure) {
             state.immutable_lookup_reused = state.immutable_lookup_reused.saturating_add(1);
         }
         Ok(Some(outcome))
