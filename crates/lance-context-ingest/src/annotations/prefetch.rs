@@ -55,6 +55,11 @@ pub(super) async fn source_page(
         source_read::Value::Page { page, closure } => (page, closure),
         source_read::Value::CursorAhead => {
             ensure!(observed.applied < after, "invalid lagging source cursor");
+            if service.is_single_body() {
+                let mut observed = service.shared.body_lookups.lock().unwrap();
+                let count = &mut observed.prefetch.source_cursor_ahead;
+                *count = count.saturating_add(1);
+            }
             // A replica behind our cursor cannot prove catch-up.
             return Ok(None);
         }
@@ -78,6 +83,20 @@ pub(super) async fn source_page(
             "unordered annotation source page"
         );
         previous = *index;
+    }
+    if service.is_single_body() && page.entries.is_empty() {
+        // A bounded metadata page can be empty before the observed end because
+        // it filtered other tables/buckets. Count validated responses, including
+        // initial driver reads; these are not the prefetch-decision denominator.
+        let mut lookup = service.shared.body_lookups.lock().unwrap();
+        let count = if replay_cut.is_some_and(|cut| page.through >= cut) {
+            &mut lookup.prefetch.source_empty_at_replay_cut
+        } else if page.through < observed.applied {
+            &mut lookup.prefetch.source_empty_with_remaining_metadata
+        } else {
+            &mut lookup.prefetch.source_empty_at_local_end
+        };
+        *count = count.saturating_add(1);
     }
     Ok(Some(page))
 }

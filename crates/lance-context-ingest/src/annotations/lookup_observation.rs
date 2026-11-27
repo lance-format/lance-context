@@ -26,6 +26,15 @@ pub struct BodyPrefetchObservation {
     pub request_bound: u64,
     pub byte_bound: u64,
     pub admission: u64,
+    /// Validated empty ReadSource responses with more locally applied metadata
+    /// beyond the page cursor. That metadata need not match this table/bucket.
+    pub source_empty_with_remaining_metadata: u64,
+    /// Empty responses at this replica's observed end, not quorum catch-up.
+    pub source_empty_at_local_end: u64,
+    /// Empty responses at the consumer's fixed publication-recovery cut.
+    pub source_empty_at_replay_cut: u64,
+    /// ReadSource responses from a replica behind the requested cursor.
+    pub source_cursor_ahead: u64,
 }
 
 impl BodyPrefetchObservation {
