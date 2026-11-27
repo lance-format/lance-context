@@ -60,10 +60,12 @@ async fn typed_owner(
                 turn_id_index: Some(crate::materializer::TurnIdIndex {
                     min_rows: 1,
                     index_type,
+                    ..Default::default()
                 }),
                 compaction: compact.then_some(crate::materializer::SmallFileCompaction {
                     target_file_bytes: 64 << 10,
                     min_fragments: 2,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

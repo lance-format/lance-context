@@ -149,10 +149,14 @@ small-file compaction rewrites covered fragments, the Rewrite commit withdraws
 those fragments from the ZoneMap's coverage (native Lance, stable row IDs only),
 reads of them fall back to an exact scan, and the next maintenance turn rebuilds
 coverage for the uncovered fragments only. Segments whose coverage was fully
-withdrawn are retired by that build. Compaction therefore never waits for, or is
-blocked by, the ZoneMap. This exemption applies only to ZoneMap segments named
-`lance_context_turn_id` on stable-row-ID tables; every other address-domain
-index still requires an eager remap.
+withdrawn are retired by that build, so a rewrite needs no ZoneMap remap.
+Compaction is still subject to its other checks (uniform coverage across the
+task, stable row IDs, no other address index needing an eager remap), and the
+rewrite and a concurrent index build still serialize through the publication
+fence. The exemption uses the same typed predicate as native compaction
+(`withdraws_zone_map_coverage`: decoded `ZoneMapIndexDetails`,
+`index_version == 0`); every other address-domain index still requires an
+eager remap.
 
 Build and merge use the existing bounds: at most 128 fragments and 1,048,576
 rows per build, four-way tiered merges of similarly sized segments through
@@ -177,7 +181,58 @@ ignored by default; 32 fragments x 16,384 rows; production predicate; native
 
 When fragments' key ranges overlap, ZoneMap prunes nothing and adds index
 load time. It is worth enabling only if the table's fragments have mostly
-disjoint key ranges. Compaction concatenates fragments without sorting by key,
-so it does not create that property. These are synthetic local measurements,
-not real-traffic or capacity results. Per-key zone hit counts are not exposed
-by native Lance and are not reported.
+disjoint key ranges. By default compaction concatenates fragments without
+sorting by key, so it does not create that property. These are synthetic local
+measurements, not real-traffic or capacity results. Per-key zone hit counts are
+not exposed by native Lance and are not reported.
+
+### Clustered compaction for the full-body dedup lookup
+
+Sessions arrive interleaved, so every appended full-body fragment spans almost
+the whole `session_id` range and no ZoneMap can prune it. Full-body Turns shards
+enable both dedup indexes by default when the caller leaves them unset (and the
+publication budget covers the index workspace): a Bloom filter on `id`
+(`index_type: "bloomfilter"`, prunes per zone independent of layout) plus
+write-time clustering (compaction `sort_by` = routing column then key, and the
+routing ZoneMap). The equivalent explicit settings, with ZoneMap on `id`:
+
+```json
+{
+  "compaction": { "target_file_bytes": 134217728, "min_fragments": 4,
+                  "sort_by": ["session_id", "id"] },
+  "turn_id_index": { "min_rows": 65536, "index_type": "zonemap",
+                     "routing_zonemap": true }
+}
+```
+
+- `compaction.sort_by` rewrites each bounded task's rows in that key order
+  (then by stable row ID), using a vendored Lance `CompactionOptions::sort_by`
+  (Lance 14 has no compaction sort key). Every row keeps its stable row ID and
+  created/updated versions, carried as a permutation. The sort runs inside the
+  task's admitted compaction workspace (pool = 2 x `target_file_bytes`) and
+  spills to the temporary directory beyond it. A sorted rewrite always
+  re-encodes and records no address moves, so it is used only on stable-row-ID
+  tables without blob columns whose indices need no address remap (BTree
+  address segments, system indices); other tables keep source order.
+- `turn_id_index.routing_zonemap` keeps a ZoneMap named
+  `lance_context_turn_routing` on the spec's routing column, with the same
+  bounded build/merge policy as the turn-ID ZoneMap. A rewrite withdraws its
+  coverage of the rewritten fragments; the next maintenance turn rebuilds it
+  over the sorted output. Full-body shards accept `zonemap` or `bloomfilter` turn indexing, not BTree.
+- `lookup_existing` emits the routing column's `IN (...)` first. Lance parses
+  `IN` into a `SargableQuery::IsIn` that ZoneMap answers per zone, so fragments
+  and zones outside the requested sessions are skipped before decode; the `id`
+  membership and the exact composite check still follow.
+
+`clustered_zonemap_lookup` (16 interleaved appends of 512 sessions, 256-row
+zones) asserts the effect with the lookup's `fragments_scanned`/`rows_scanned`:
+the unclustered table scans all 16 fragments and 8,192 rows with a ZoneMap; the
+sorted, re-indexed table scans at most 4 fragments and 2,048 rows for a 4-session
+window.
+
+The win is limited to the compacted share of the table. Recent appended
+fragments that compaction has not yet rewritten remain interleaved and are
+scanned in full, as are rewritten fragments until their ZoneMap coverage is
+rebuilt. Sorting is per task, so separate tasks' outputs still overlap; each
+task's fragments are internally narrow, and a lookup scans about one fragment
+per requested session per task.

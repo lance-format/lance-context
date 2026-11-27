@@ -198,10 +198,19 @@ impl TurnIngestionSpec {
                 values.insert(value.into_owned());
             }
         }
-        let predicate = self
+        // Lead with the routing column. On a table clustered by it (sorted
+        // compaction) its ZoneMap answers `IN` per zone and skips whole
+        // fragments; the other members still refine, and exact composite
+        // membership is checked below. Conjunct order does not change results.
+        let routing = self.routing_column();
+        let mut members = self
             .primary_key
             .iter()
             .zip(column_values)
+            .collect::<Vec<_>>();
+        members.sort_by_key(|(name, _)| name.as_str() != routing);
+        let predicate = members
+            .into_iter()
             .map(|(name, values)| {
                 let values = values
                     .into_iter()

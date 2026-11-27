@@ -13,22 +13,48 @@ pub(super) enum Key {
     Session,
     Turn,
     Status,
+    /// ZoneMap on a turn table's routing column (its spec's `routing_column`,
+    /// e.g. `session_id`). Only managed as ZoneMap segments.
+    Routing,
 }
 impl Key {
+    /// Fixed column for BTree keys. Use [`Self::column_in`] for ZoneMap keys.
     pub(super) fn column(self) -> &'static str {
         match self {
             Self::Session => "rollout_id",
             Self::Turn => "id",
             Self::Status => "status",
+            Self::Routing => "session_id",
         }
     }
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::Session => NAME,
-            Self::Turn => "lance_context_turn_id",
+            Self::Turn => lance_context_core::native_compaction::TURN_ID_INDEX_NAME,
             Self::Status => "lance_context_annotation_status",
+            Self::Routing => lance_context_core::native_compaction::TURN_ROUTING_INDEX_NAME,
         }
     }
+    /// The indexed column in this dataset. The routing column comes from the
+    /// turn ingestion specification bound in the schema metadata.
+    pub(super) fn column_in(self, dataset: &Dataset) -> Result<String> {
+        match self {
+            Self::Routing => routing_column(dataset)?
+                .context("routing ZoneMap requires a turn table with its routing column"),
+            key => Ok(key.column().to_owned()),
+        }
+    }
+}
+
+/// The spec routing column, when this dataset binds a turn specification and
+/// physically holds that column (mixed narrow tables may not).
+pub(super) fn routing_column(dataset: &Dataset) -> Result<Option<String>> {
+    let schema = arrow_schema::Schema::from(dataset.schema());
+    let Some(spec) = crate::turn_ingestion::TurnIngestionSpec::from_schema(&schema)? else {
+        return Ok(None);
+    };
+    let column = spec.routing_column().to_owned();
+    Ok(dataset.schema().field(&column).is_some().then_some(column))
 }
 const MAX_ROWS: usize = 1 << 20;
 pub(super) const WORKSPACE: usize = 512 << 20;
@@ -127,6 +153,11 @@ pub(super) enum Action {
     },
     /// Native concatenation of turn-ID ZoneMap segments.
     MergeZoneMap(Vec<IndexMetadata>),
+    /// Turn-ID Bloom-filter segment; same retirement as [`Self::BuildZoneMap`].
+    BuildBloomFilter {
+        fragments: Vec<u32>,
+        empty_sources: Vec<Uuid>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -138,8 +169,8 @@ struct Change {
 }
 
 pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: Key) -> Result<()> {
-    if matches!(key, Key::Turn) && is_zonemap(index) {
-        return validate_turn_zonemap(dataset, index);
+    if matches!(key, Key::Routing) || (matches!(key, Key::Turn) && is_skipping(index)) {
+        return validate_turn_zonemap(dataset, index, key);
     }
     let field = dataset
         .schema()
@@ -166,28 +197,37 @@ pub(super) fn validate_metadata(dataset: &Dataset, index: &IndexMetadata, key: K
     Ok(())
 }
 
-/// Exact native type of the details Lance writes for a ZoneMap segment.
-const ZONEMAP_DETAILS: &str = "lance.table.ZoneMapIndexDetails";
-
+/// The typed ZoneMap predicate shared with native compaction (#986):
+/// protobuf-decoded `ZoneMapIndexDetails` and `index_version == 0`.
 pub(super) fn is_zonemap(index: &IndexMetadata) -> bool {
-    index.index_details.as_ref().is_some_and(|details| {
-        details
-            .type_url
-            .rsplit_once('/')
-            .is_some_and(|(_, name)| name == ZONEMAP_DETAILS)
-    })
+    lance_context_core::native_compaction::withdraws_zone_map_coverage(index)
 }
 
-/// A turn-ID ZoneMap answers in the address domain and is never remapped. A
-/// stable-row-ID rewrite withdraws its rewritten fragments, so a segment may
-/// legitimately cover nothing until its owner retires it.
-fn validate_turn_zonemap(dataset: &Dataset, index: &IndexMetadata) -> Result<()> {
+/// Typed version-0 Bloom filter, also withdrawn (not remapped) by a rewrite.
+pub(super) fn is_bloom_filter(index: &IndexMetadata) -> bool {
+    lance_context_core::native_compaction::withdraws_bloom_filter_coverage(index)
+}
+
+/// A managed skipping segment (ZoneMap or Bloom filter): address domain,
+/// withdrawn by rewrites, rebuilt per uncovered fragment.
+pub(super) fn is_skipping(index: &IndexMetadata) -> bool {
+    is_zonemap(index) || is_bloom_filter(index)
+}
+
+/// A turn-ID or routing ZoneMap answers in the address domain and is never
+/// remapped. A stable-row-ID rewrite withdraws its rewritten fragments, so a
+/// segment may legitimately cover nothing until its owner retires it.
+fn validate_turn_zonemap(dataset: &Dataset, index: &IndexMetadata, key: Key) -> Result<()> {
     let field = dataset
         .schema()
-        .field(Key::Turn.column())
-        .context("missing id column")?;
+        .field(&key.column_in(dataset)?)
+        .context("missing turn ZoneMap column")?;
     ensure!(
-        index.name == Key::Turn.name()
+        (if matches!(key, Key::Routing) {
+            is_zonemap(index)
+        } else {
+            is_skipping(index)
+        }) && index.name == key.name()
             && index.fields == vec![field.id]
             && index.covering_fields.is_empty()
             && !index.uuid.is_nil()
@@ -299,6 +339,10 @@ pub(super) fn spawn_action(
             | Action::BuildZoneMap {
                 fragments,
                 empty_sources,
+            }
+            | Action::BuildBloomFilter {
+                fragments,
+                empty_sources,
             } => (fragments.iter().copied().collect(), empty_sources.clone()),
             Action::Merge(segments) | Action::MergeZoneMap(segments) => (
                 segments
@@ -310,7 +354,7 @@ pub(super) fn spawn_action(
         };
         let native_phase = match key {
             Key::Session => Phase::NativeSessionIndex,
-            Key::Turn => Phase::NativeTurnIdIndex,
+            Key::Turn | Key::Routing => Phase::NativeTurnIdIndex,
             Key::Status => Phase::NativeStatusIndex,
         };
         let native = async {
@@ -358,14 +402,15 @@ pub(super) fn spawn_action(
                 }
                 Action::BuildZoneMap { fragments, .. } => {
                     ensure!(
-                        matches!(key, Key::Turn),
-                        "ZoneMap is only managed for turn IDs"
+                        matches!(key, Key::Turn | Key::Routing),
+                        "ZoneMap is only managed for turn IDs and routing"
                     );
-                    // Zones are computed per fragment from the `id` column only;
+                    // Zones are computed per fragment from the key column only;
                     // no payload projection is read. Each segment owns its UUID.
+                    let column = key.column_in(&dataset)?;
                     Ok(dataset
                         .create_index_builder(
-                            &[key.column()],
+                            &[column.as_str()],
                             IndexType::ZoneMap,
                             &ScalarIndexParams::for_builtin(
                                 lance_index::scalar::BuiltinIndexType::ZoneMap,
@@ -381,10 +426,31 @@ pub(super) fn spawn_action(
                 }
                 Action::MergeZoneMap(segments) => {
                     ensure!(
-                        matches!(key, Key::Turn),
-                        "ZoneMap is only managed for turn IDs"
+                        matches!(key, Key::Turn | Key::Routing),
+                        "ZoneMap is only managed for turn IDs and routing"
                     );
                     Ok(dataset.merge_existing_index_segments(segments).await?)
+                }
+                Action::BuildBloomFilter { fragments, .. } => {
+                    ensure!(
+                        matches!(key, Key::Turn),
+                        "Bloom filters are only managed for turn IDs"
+                    );
+                    // Per-zone filters over `id` only; exact membership is
+                    // still decided by the full filter after the scan.
+                    Ok(dataset
+                        .create_index_builder(
+                            &[key.column()],
+                            IndexType::BloomFilter,
+                            &ScalarIndexParams::for_builtin(
+                                lance_index::scalar::BuiltinIndexType::BloomFilter,
+                            ),
+                        )
+                        .name(key.name().to_owned())
+                        .replace(true)
+                        .fragments(fragments)
+                        .execute_uncommitted()
+                        .await?)
                 }
             }
         };
@@ -419,11 +485,27 @@ pub(super) fn spawn_action(
 /// its native pages. Every covered physical ID column and row mapping must
 /// still be identical. Annotation columns and newly appended fragments may
 /// differ. Publication continues to use the exact-snapshot descriptor decoder.
+#[cfg(test)]
 pub(super) async fn rebase_turn(
     source: &Dataset,
     target: &Dataset,
     descriptors: &p::Descriptors,
 ) -> Result<p::Descriptors> {
+    rebase_key(source, target, descriptors, Key::Turn).await
+}
+
+/// Certify an immutable turn key result (`id` or the routing column) at a later
+/// snapshot, under the same physical-input checks as the turn-ID rebase.
+pub(super) async fn rebase_key(
+    source: &Dataset,
+    target: &Dataset,
+    descriptors: &p::Descriptors,
+    key: Key,
+) -> Result<p::Descriptors> {
+    ensure!(
+        matches!(key, Key::Turn | Key::Routing),
+        "only immutable turn keys can be rebased"
+    );
     ensure!(
         source.uri() == target.uri()
             && source.schema() == target.schema()
@@ -431,11 +513,11 @@ pub(super) async fn rebase_turn(
         "ID index snapshot binding changed"
     );
     let Operation::CreateIndex { new_indices, .. } =
-        operation_for(source, descriptors, Key::Turn).await?
+        operation_for(source, descriptors, key).await?
     else {
         unreachable!("index descriptor decoder returns CreateIndex")
     };
-    let id = source.schema().field_id("id")?;
+    let id = source.schema().field_id(&key.column_in(source)?)?;
     let index = &new_indices[0];
     for fragment_id in index.fragment_bitmap.as_ref().unwrap().iter() {
         let original = source
@@ -484,7 +566,7 @@ pub(super) async fn rebase_turn(
     let rebased = p::Descriptors::lance_index(Bytes::from(serde_json::to_vec(&change)?))?;
     // Source index UUIDs and coverage must also still match. This rejects a
     // competing consolidation or overlapping index installation.
-    operation_for(target, &rebased, Key::Turn).await?;
+    operation_for(target, &rebased, key).await?;
     Ok(rebased)
 }
 
@@ -598,6 +680,7 @@ async fn decode_operation(
     let key = match expected {
         Some(key) => key,
         None if index.name == Key::Turn.name() => Key::Turn,
+        None if index.name == Key::Routing.name() => Key::Routing,
         None if index.name == Key::Status.name() => Key::Status,
         None => anyhow::bail!("unsupported annotation index"),
     };
@@ -632,8 +715,9 @@ async fn decode_operation(
             "index publication mixes row domains"
         );
         ensure!(
-            is_zonemap(old) == is_zonemap(&index),
-            "index publication mixes BTree and ZoneMap segments"
+            is_zonemap(old) == is_zonemap(&index)
+                && is_bloom_filter(old) == is_bloom_filter(&index),
+            "index publication mixes BTree, ZoneMap and Bloom-filter segments"
         );
         ensure!(
             old.uuid != index.uuid,
@@ -662,10 +746,10 @@ async fn decode_operation(
         // CreateIndex does not retire it implicitly: a fresh catch-up build
         // may remove only proven-empty sources at this exact snapshot. For
         // turn IDs this happens when a rewrite withdrew a whole ZoneMap segment.
-        if matches!(key, Key::Turn) && is_zonemap(&index) {
+        if matches!(key, Key::Turn | Key::Routing) && is_skipping(&index) {
             ensure!(
                 index.dataset_version == dataset.version().version,
-                "invalid empty turn-ID ZoneMap replacement"
+                "invalid empty turn skipping-index replacement"
             );
         } else {
             ensure!(

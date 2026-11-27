@@ -57,6 +57,7 @@ async fn exercise(selected: bool) -> Result<()> {
             compaction: Some(materializer::SmallFileCompaction {
                 target_file_bytes: 64 << 10,
                 min_fragments: 2,
+                ..Default::default()
             }),
             ..Default::default()
         },

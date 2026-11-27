@@ -33,6 +33,8 @@ pub(crate) use session_index::scan_fragments as session_scan_fragments;
 pub use session_index::SessionIndex;
 pub use status_index::StatusIndex;
 pub use turn_id_index::{TurnIdIndex, TurnIdIndexType};
+/// Shared admission each managed native index build reserves.
+pub const INDEX_WORKSPACE: usize = session_index::WORKSPACE;
 
 /// Resolve this from the authorized namespace, never from an append request.
 #[derive(Clone)]
