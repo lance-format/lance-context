@@ -269,6 +269,13 @@ impl Service {
             .await?)
     }
 
+    /// Return the current catalog-selected manifest and its durable data cut.
+    /// This does not wait for a caller's writes. An external source checkpoint
+    /// must compare `through` with the fixed maximum acknowledged mutation
+    /// `Completed::index` for its table/group/shard, after those writes finish.
+    /// General apply progress can include control records that require no new
+    /// publication. A selected pending publication is validated against its
+    /// retained preparation; this result grants no physical retention lease.
     pub async fn selected_full_body(&self, deadline: Duration) -> Result<SelectedBody> {
         ensure!(self.is_single_body(), "not a single body service");
         tokio::time::timeout(deadline, async {

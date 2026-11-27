@@ -7,6 +7,7 @@ use crate::materializer::{Acquisition, Options};
 use crate::tests::annotation_runtime::{drained, run_owner};
 
 mod compaction;
+mod coverage;
 mod cross_page;
 #[cfg(unix)]
 mod process;
