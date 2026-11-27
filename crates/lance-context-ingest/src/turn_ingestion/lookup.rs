@@ -322,7 +322,7 @@ impl TurnIngestionSpec {
         let indexed = indexed_key_columns(&base, &self.primary_key).await?;
         observation.indexed_key_columns = indexed;
         if indexed > 0 {
-            scan.use_scalar_index(true).prefilter(true);
+            scan.use_scalar_index(true);
         }
         let readahead = if base.session().native_memory().is_some() {
             // These are scanner targets, not a replacement for admission of
