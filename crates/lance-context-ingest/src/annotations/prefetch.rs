@@ -14,6 +14,7 @@ pub(super) struct Lookup {
     pub(super) registrations: Option<RegistrationLookup>,
     pub(super) patches: Option<PatchLookup>,
     pub(super) bodies: Option<single_body::Lookup>,
+    pub(super) body_stop: Option<PrefetchStop>,
 }
 
 /// Read committed metadata only. The caller retains the returned page; neither
@@ -198,7 +199,11 @@ pub(super) async fn prepare(
         // Accumulate whole admitted records, rather than repeatedly scanning
         // history for arbitrary 2048-key chunks. The apply budget bounds frames
         // and the subsequent shared key-only query independently.
-        let mut bytes = head.meta.body_bytes;
+        // A deferred speculative window may be topped up at promotion. Its
+        // already-admitted tail still consumes the same wire-byte bound.
+        let mut bytes = queued.iter().fold(head.meta.body_bytes, |bytes, pending| {
+            bytes.saturating_add(pending.meta.body_bytes)
+        });
         let stop = loop {
             if queued.len() + 1 >= MAX_REQUESTS {
                 break PrefetchStop::RequestBound;
@@ -240,7 +245,10 @@ pub(super) async fn prepare(
             .prefetch
             .record(queued.len() + 1, bytes, stop);
         // Driver refreshes this on stale-base detection as well as initially.
-        return Ok(Lookup::default());
+        return Ok(Lookup {
+            body_stop: Some(stop),
+            ..Lookup::default()
+        });
     }
     if head.meta.body_bytes > MAX_PAYLOAD_BYTES
         || head.decoded.rows() > MAX_ROWS
@@ -329,5 +337,6 @@ pub(super) async fn prepare(
         registrations,
         patches,
         bodies: None,
+        body_stop: None,
     })
 }

@@ -14,7 +14,7 @@ pub(super) struct Query {
     native_running: Arc<AtomicBool>,
     requests: usize,
     bytes: u64,
-    speculative: bool,
+    pub(super) speculative: bool,
     started: bool,
 }
 
@@ -99,7 +99,8 @@ pub(super) struct Window {
     pub(super) head: Pending,
     pub(super) tail: VecDeque<Pending>,
     pub(super) page: Page,
-    pub(super) query: Query,
+    pub(super) query: Option<Query>,
+    cut: Option<u64>,
 }
 
 pub(super) struct Ahead {
@@ -134,15 +135,27 @@ impl Ahead {
                 };
                 page.entries.remove(0);
                 let mut tail = VecDeque::new();
-                prefetch::prepare(&service, &head, &mut page, &mut tail, cut).await?;
-                let Some(query) = Query::new(&service, &head, &tail, true)? else {
-                    return Ok(None);
+                let prepared =
+                    prefetch::prepare(&service, &head, &mut page, &mut tail, cut).await?;
+                // Do not seal a short successor query at the first temporary
+                // source gap. Current apply can release producer lanes while
+                // these admitted inputs wait; promotion can include their next
+                // committed requests in the same bounded historical scan.
+                let deferred = matches!(prepared.body_stop, Some(PrefetchStop::PageExhausted));
+                let query = if deferred {
+                    None
+                } else {
+                    let Some(query) = Query::new(&service, &head, &tail, true)? else {
+                        return Ok(None);
+                    };
+                    Some(query)
                 };
                 Ok(Some(Window {
                     head,
                     tail,
                     page,
                     query,
+                    cut,
                 }))
             })),
             result: None,
@@ -158,24 +171,54 @@ impl Ahead {
             }
         }
         if let Some(Ok(Some(window))) = self.result.as_mut() {
-            window.query.poll(cx);
+            let Some(query) = window.query.as_mut() else {
+                return;
+            };
+            query.poll(cx);
             if !self.overlap_recorded
                 && current.is_some_and(|query| query.native_running.load(Ordering::Relaxed))
-                && window.query.native_running.load(Ordering::Relaxed)
+                && query.native_running.load(Ordering::Relaxed)
             {
                 self.overlap_recorded = true;
-                let mut observed = window.query.service.shared.body_lookups.lock().unwrap();
+                let mut observed = query.service.shared.body_lookups.lock().unwrap();
                 observed.history_query_overlaps = observed.history_query_overlaps.saturating_add(1);
             }
         }
     }
 
-    pub(super) async fn ready(&mut self) -> Result<Option<Window>> {
+    pub(super) async fn ready(&mut self, service: &Service) -> Result<Option<Window>> {
         // Promote the decoded window without waiting for its query. It becomes
         // foreground and may overlap the following window's query in turn.
-        futures::future::poll_fn(|cx| {
+        futures::future::poll_fn(|cx| loop {
             self.poll(cx, None);
-            self.result.take().map_or(Poll::Pending, Poll::Ready)
+            let Some(result) = self.result.take() else {
+                return Poll::Pending;
+            };
+            match result {
+                Ok(Some(mut window)) if window.query.is_none() => {
+                    let service = service.clone();
+                    // Retain the refill future in Ahead, not in this call's
+                    // stack. Cancellation of step must preserve both admitted
+                    // records and the next source cursor for the same driver.
+                    self.loading = Some(Box::pin(async move {
+                        prefetch::prepare(
+                            &service,
+                            &window.head,
+                            &mut window.page,
+                            &mut window.tail,
+                            window.cut,
+                        )
+                        .await?;
+                        let Some(query) = Query::new(&service, &window.head, &window.tail, false)?
+                        else {
+                            return Ok(None);
+                        };
+                        window.query = Some(query);
+                        Ok(Some(window))
+                    }));
+                }
+                result => return Poll::Ready(result),
+            }
         })
         .await
     }

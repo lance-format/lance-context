@@ -356,6 +356,57 @@ async fn two_window_cancelled_native_queries_recover_the_whole_durable_suffix() 
 }
 
 async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
+    two_windows_with_late_tail(publish, cancel, WindowInput::Full).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_ahead_window_coalesces_later_committed_requests_before_scanning() -> Result<()> {
+    tokio::time::timeout(
+        DEADLINE,
+        two_windows_with_late_tail(false, false, WindowInput::Late),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_partial_ahead_window_recovers_later_committed_requests() -> Result<()> {
+    tokio::time::timeout(
+        DEADLINE,
+        two_windows_with_late_tail(false, true, WindowInput::Late),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_partial_ahead_refill_resumes_on_the_same_driver() -> Result<()> {
+    tokio::time::timeout(
+        DEADLINE,
+        two_windows_with_late_tail(false, false, WindowInput::CancelRefill),
+    )
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_ahead_refill_queries_the_published_prefix() -> Result<()> {
+    tokio::time::timeout(
+        DEADLINE,
+        two_windows_with_late_tail(true, false, WindowInput::Late),
+    )
+    .await?
+}
+
+enum WindowInput {
+    Full,
+    Late,
+    CancelRefill,
+}
+
+async fn two_windows_with_late_tail(
+    publish: bool,
+    cancel: bool,
+    schedule: WindowInput,
+) -> Result<()> {
+    let late_tail = !matches!(schedule, WindowInput::Full);
     let input = bodies()?;
     let spec = TurnIngestionSpec::new(
         input[0].schema(),
@@ -442,9 +493,11 @@ async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
     for slot in 2..16 {
         lanes.push(producer(&service, slot).await?);
     }
-    // Two full windows and one successor. B shares A's new keys; a lookup
+    // Either two full windows and one successor, or a full window and a short
+    // successor that grows while A queries. B shares A's new keys; a lookup
     // captured before A applies must recheck staging or the published base.
-    for i in 0..17 {
+    let initial_records = if late_tail { 9 } else { 17 };
+    for i in 0..initial_records {
         let prepared = request(
             &service,
             &lanes[i % lanes.len()],
@@ -474,8 +527,13 @@ async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
                 result = &mut step => panic!("native lookup escaped read gate: {result:?}"),
                 _ = tokio::time::sleep(Duration::from_millis(5)) => {},
             }
-            if service.body_lookup_observation().history_query_overlaps == 1
-                && admission.entered.load(Ordering::SeqCst) >= 2
+            let observed = service.body_lookup_observation();
+            if (late_tail
+                && observed.prefetch.requests >= 9
+                && admission.entered.load(Ordering::SeqCst) >= 1)
+                || (!late_tail
+                    && observed.history_query_overlaps == 1
+                    && admission.entered.load(Ordering::SeqCst) >= 2)
             {
                 break;
             }
@@ -487,11 +545,41 @@ async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
             );
         }
         assert_eq!(service.observation().await.0.applied, initial);
-        assert_eq!(service.body_lookup_observation().prefetch.requests, 16);
         assert_eq!(
-            service.body_lookup_observation().prefetched_lookups_started,
-            1
+            service.body_lookup_observation().prefetch.requests,
+            if late_tail { 9 } else { 16 }
         );
+        if late_tail {
+            // These requests become durable after the short ahead page was
+            // captured, while the foreground query still owns its read gate.
+            // Promotion should include them in the same bounded lookup.
+            for i in 9..16 {
+                let prepared = request(
+                    &service,
+                    &lanes[i % lanes.len()],
+                    (i / lanes.len() + 1) as u64,
+                    encode(if i == 15 { 3 } else { 2 })?,
+                )
+                .await?;
+                let response = c
+                    .client
+                    .request_routed(Request::Append {
+                        group: 10,
+                        batch: prepared.batch.clone(),
+                    })
+                    .await?;
+                let Reply::Commit(Outcome::Committed(Applied::Accepted { index })) = response.reply
+                else {
+                    bail!("late test backlog was not quorum durable")
+                };
+                backlog.push((prepared, index));
+            }
+        } else {
+            assert_eq!(
+                service.body_lookup_observation().prefetched_lookups_started,
+                1
+            );
+        }
         if !cancel {
             admission.pause_reads.store(false, Ordering::SeqCst);
             admission.resume.notify_waiters();
@@ -505,7 +593,7 @@ async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
             service
                 .body_lookup_observation()
                 .prefetched_lookups_cancelled,
-            1
+            if late_tail { 0 } else { 1 }
         );
         admission.pause_reads.store(false, Ordering::SeqCst);
         admission.resume.notify_waiters();
@@ -522,16 +610,29 @@ async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
             while service.observation().await.0.materialized < backlog[7].1 {
                 runtime.publish_once_for_test().await?;
             }
-            runtime.apply_once_for_test().await?;
+            if !late_tail {
+                runtime.apply_once_for_test().await?;
+                assert_eq!(service.observation().await.0.applied, backlog[7].1);
+                assert_eq!(
+                    service.body_lookup_observation().prefetched_lookups_stale,
+                    1
+                );
+            }
+        }
+        if matches!(schedule, WindowInput::CancelRefill) {
+            {
+                // The short ahead window is already loaded. Promotion must
+                // fetch the later WAL page; cancel at that I/O yield and resume
+                // the same driver, without a restart to hide lost in-memory state.
+                let step = runtime.apply_once_for_test();
+                tokio::pin!(step);
+                assert!(futures::poll!(&mut step).is_pending());
+            }
             assert_eq!(service.observation().await.0.applied, backlog[7].1);
-            assert_eq!(
-                service.body_lookup_observation().prefetched_lookups_stale,
-                1
-            );
         }
         runtime.apply_once_for_test().await?;
         assert_eq!(service.observation().await.0.applied, backlog[8].1);
-        if !publish {
+        if !publish && !late_tail {
             assert_eq!(
                 service.body_lookup_observation().prefetched_lookups_reused,
                 1
@@ -541,7 +642,14 @@ async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
                 0
             );
         }
+        let observation = service.clone();
         finish_two_windows(&c, &storage, &spec, &input, service, runtime, &backlog).await?;
+        if late_tail {
+            let observed = observation.body_lookup_observation();
+            eprintln!("late-tail lookup windows: {observed:?}");
+            assert_eq!(observed.completed_lookups, 2);
+            assert_eq!(observed.last_lookup_requests, 8);
+        }
     }
     drop(storage);
     tokio::time::timeout(DEADLINE, async {

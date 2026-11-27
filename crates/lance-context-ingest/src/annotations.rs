@@ -997,12 +997,13 @@ impl Driver {
                         ahead.after == after,
                         "speculative window lost its ordered prefix"
                     );
-                    if let Some(window) = ahead.ready().await? {
+                    if let Some(window) = ahead.ready(service).await? {
                         self.pending = Some(window.head);
                         self.lookahead = window.tail;
                         self.source_page = Some(window.page);
-                        self.body_query = Some(window.query);
-                        self.prefetched_lookup = true;
+                        self.prefetched_lookup =
+                            window.query.as_ref().is_some_and(|query| query.speculative);
+                        self.body_query = window.query;
                     }
                     self.ahead = None;
                 }
