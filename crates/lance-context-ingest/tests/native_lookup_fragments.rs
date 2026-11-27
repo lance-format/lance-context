@@ -331,7 +331,7 @@ async fn explicit_lookup_parallelism_preserves_membership_and_admission() -> Res
     assert_eq!(expected, [Some(true), Some(true), Some(true), Some(false)]);
     drop(ordinary);
     for (task_partitions, fragment_readahead) in
-        [(1, 1), (8, 8), (16, 8), (32, 8), (8, 16), (8, 32)]
+        [(1, 1), (8, 8), (16, 8), (128, 128), (8, 16), (8, 32)]
     {
         let found = spec
             .lookup_existing_with_parallelism(
@@ -364,7 +364,7 @@ async fn explicit_lookup_parallelism_preserves_membership_and_admission() -> Res
         task_partitions: 32,
         fragment_readahead: 8,
     };
-    for (task_partitions, fragment_readahead) in [(0, 8), (33, 8), (8, 0), (8, 33)] {
+    for (task_partitions, fragment_readahead) in [(0, 8), (8, 0)] {
         assert!(spec
             .lookup_existing_with_parallelism(
                 base.clone(),

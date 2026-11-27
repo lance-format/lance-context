@@ -48,8 +48,10 @@ exact composite membership, all-hit early exit and native observation. It change
 only eligible plain unordered FilteredReadExec nodes. Indexed inputs, row-stream
 inputs and scans with before/after-filter ranges retain their original options;
 inspect actual `scan_partitions` rather than assuming a requested setting took
-effect. No Lance OSS change is needed. Values outside `1..=32` or a missing native
-pool are rejected. Key-workspace refusal remains `None`; native refusal is an
+effect. No Lance OSS change is needed. Zero values or a missing native
+pool are rejected. The initial 8/16/32 measurement matrix is not an API ceiling;
+actual read/decode allocations still require native pool admission.
+Key-workspace refusal remains `None`; native refusal is an
 error and never a successful miss. There is no added retry.
 
 The native task partitions consume one shared task stream, so P partitions are
@@ -70,7 +72,7 @@ cloud network bytes or cumulative task wait with CPU time. Allow resources to
 finish releasing before interpreting pool counters. Record concurrent host
 activity: global shared-pool deltas are not exclusive costs of this query.
 
-The native regression covers six settings over 32 real local Lance fragments,
+The native regression covers six settings (including P/F=128/128) over 32 real local Lance fragments,
 including a missing key (requiring full coverage), ordinary default equivalence,
 invalid options, missing native pool, key-budget refusal, native refusal,
 deterministic cancellation during a gated read and an all-hit result before an

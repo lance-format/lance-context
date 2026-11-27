@@ -35,8 +35,8 @@ pub struct TurnLookupParallelism {
 impl TurnLookupParallelism {
     fn validate(self, base: &Dataset) -> Result<()> {
         ensure!(
-            (1..=32).contains(&self.task_partitions) && (1..=32).contains(&self.fragment_readahead),
-            "body lookup parallelism must be within 1..=32"
+            self.task_partitions > 0 && self.fragment_readahead > 0,
+            "body lookup parallelism must be nonzero"
         );
         ensure!(
             base.session().native_memory().is_some(),
@@ -174,7 +174,8 @@ impl TurnIngestionSpec {
     /// This does not open a table, retain a GC lease, change owner defaults or
     /// create a separate memory pool. The caller must bind a captured key set to
     /// this exact base and retain its original host pool. Native refusal remains
-    /// an error, never a successful miss. Values must be within 1..=32.
+    /// an error, never a successful miss. Values must be nonzero; actual
+    /// read/decode allocations remain admitted by the caller's native pool.
     pub async fn lookup_existing_with_parallelism(
         &self,
         base: Arc<Dataset>,
