@@ -16,6 +16,71 @@ pub(super) struct Lookup {
     pub(super) bodies: Option<single_body::Lookup>,
 }
 
+/// Read committed metadata only. The caller retains the returned page; neither
+/// this RPC nor its `through` cursor advances application progress.
+pub(super) async fn source_page(
+    service: &Service,
+    after: u64,
+    replay_cut: Option<u64>,
+) -> Result<Option<lance_context_wal::replication::Page>> {
+    let ingress = &service.ingress;
+    let group = service.group()?;
+    let response = service
+        .shared
+        .phases
+        .measure(
+            Phase::AnnotationObserve,
+            ingress.client.request_routed(Request::ReadSource {
+                group,
+                request: source_read::Request {
+                    table: ingress.scope.table,
+                    bucket: service.bucket(),
+                    after,
+                    limit: 32,
+                },
+            }),
+        )
+        .await?;
+    let Reply::Source(observed) = response.reply else {
+        bail!("annotation source page unavailable");
+    };
+    ensure!(
+        observed.cluster == ingress.scope.cluster
+            && observed.layout == ingress.scope.layout
+            && observed.group == group,
+        "foreign committed annotation source"
+    );
+    let (mut page, closure) = match observed.value {
+        source_read::Value::Page { page, closure } => (page, closure),
+        source_read::Value::CursorAhead => {
+            ensure!(observed.applied < after, "invalid lagging source cursor");
+            // A replica behind our cursor cannot prove catch-up.
+            return Ok(None);
+        }
+    };
+    // Page and closure share one durable applied state, which may be old.
+    // Validate before fetching any payload or changing the retained cursor.
+    service.check_source_closure(closure.as_deref())?;
+    if let Some(cut) = replay_cut {
+        page.through = page.through.min(cut);
+        page.entries.retain(|(index, _)| *index <= cut);
+    }
+    ensure!(
+        page.through >= after && page.through <= observed.applied,
+        "invalid annotation source cursor"
+    );
+    ensure!(page.entries.len() <= 32, "oversized annotation source page");
+    let mut previous = after;
+    for (index, _) in &page.entries {
+        ensure!(
+            *index > previous && *index <= page.through,
+            "unordered annotation source page"
+        );
+        previous = *index;
+    }
+    Ok(Some(page))
+}
+
 pub(super) async fn fetch(
     service: &Service,
     index: u64,
@@ -127,6 +192,7 @@ pub(super) async fn prepare(
     head: &Pending,
     page: &mut lance_context_wal::replication::Page,
     queued: &mut VecDeque<Pending>,
+    replay_cut: Option<u64>,
 ) -> Result<Lookup> {
     if service.is_single_body() {
         // Accumulate whole admitted records, rather than repeatedly scanning
@@ -139,6 +205,19 @@ pub(super) async fn prepare(
             }
             if bytes >= MAX_PAYLOAD_BYTES {
                 break PrefetchStop::ByteBound;
+            }
+            if page.entries.is_empty() {
+                if replay_cut.is_some_and(|cut| page.through >= cut) {
+                    break PrefetchStop::PageExhausted;
+                }
+                let Some(next) = source_page(service, page.through, replay_cut).await? else {
+                    break PrefetchStop::PageExhausted;
+                };
+                // Replace only after validation. On cancellation the old page
+                // and every admitted input remain available to this driver.
+                *page = next;
+                // One empty response ends this window, even if it advances
+                // past control/foreign records. Do not poll for future writes.
             }
             let Some((index, meta)) = page.entries.first().cloned() else {
                 break PrefetchStop::PageExhausted;

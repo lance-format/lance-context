@@ -991,61 +991,9 @@ impl Driver {
                 self.source_page = None;
             }
             if self.source_page.is_none() {
-                let response = service
-                    .shared
-                    .phases
-                    .measure(
-                        Phase::AnnotationObserve,
-                        ingress.client.request_routed(Request::ReadSource {
-                            group: service.group()?,
-                            request: source_read::Request {
-                                table: ingress.scope.table,
-                                bucket: service.bucket(),
-                                after,
-                                limit: 32,
-                            },
-                        }),
-                    )
-                    .await?;
-                let Reply::Source(observed) = response.reply else {
-                    bail!("annotation source page unavailable");
+                let Some(page) = prefetch::source_page(service, after, replay_cut).await? else {
+                    return Ok(());
                 };
-                ensure!(
-                    observed.cluster == ingress.scope.cluster
-                        && observed.layout == ingress.scope.layout
-                        && observed.group == service.group()?,
-                    "foreign committed annotation source"
-                );
-                let (mut page, closure) = match observed.value {
-                    source_read::Value::Page { page, closure } => (page, closure),
-                    source_read::Value::CursorAhead => {
-                        ensure!(observed.applied < after, "invalid lagging source cursor");
-                        // A replica behind our cursor cannot prove catch-up.
-                        // Keep application progress and all authority checks.
-                        return Ok(());
-                    }
-                };
-                // This is a possibly old committed prefix, not a fresh quorum
-                // receipt. Page and closure share one durable applied state;
-                // check the base before fetching or advancing the cursor.
-                service.check_source_closure(closure.as_deref())?;
-                if let Some(cut) = replay_cut {
-                    page.through = page.through.min(cut);
-                    page.entries.retain(|(index, _)| *index <= cut);
-                }
-                ensure!(
-                    page.through >= after && page.through <= observed.applied,
-                    "invalid annotation source cursor"
-                );
-                ensure!(page.entries.len() <= 32, "oversized annotation source page");
-                let mut previous = after;
-                for (index, _) in &page.entries {
-                    ensure!(
-                        *index > previous && *index <= page.through,
-                        "unordered annotation source page"
-                    );
-                    previous = *index;
-                }
                 // Retain bounded committed metadata. Payload read-ahead has
                 // separate admission; a page is not application progress.
                 self.source_page = Some(page);
@@ -1076,6 +1024,7 @@ impl Driver {
                     self.pending.as_ref().unwrap(),
                     self.source_page.as_mut().unwrap(),
                     &mut self.lookahead,
+                    replay_cut,
                 )
                 .await?;
             } else {
