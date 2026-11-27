@@ -26,6 +26,7 @@ mod lookup_observation;
 #[cfg(feature = "service")]
 pub mod metadata_upload;
 pub mod mixed;
+mod pipeline;
 mod prefetch;
 #[cfg(all(feature = "service", feature = "lance-io-metrics"))]
 pub mod read_io;
@@ -130,6 +131,10 @@ pub struct Driver {
     lookup: prefetch::Lookup,
     source_page: Option<lance_context_wal::replication::Page>,
     staging_pressure: Option<(u64, usize, usize)>,
+    body_query: Option<pipeline::Query>,
+    ahead: Option<pipeline::Ahead>,
+    prefetched_lookup: bool,
+    prefetched_reused: bool,
 }
 
 /// Connect an authorized ingress without opening Lance or creating an applier.
@@ -508,6 +513,10 @@ impl Service {
             lookup: prefetch::Lookup::default(),
             source_page: None,
             staging_pressure: None,
+            body_query: None,
+            ahead: None,
+            prefetched_lookup: false,
+            prefetched_reused: false,
         };
         Ok((service, driver))
     }
@@ -980,6 +989,23 @@ impl Driver {
             self.pending = self.lookahead.pop_front();
             if self.pending.is_none() {
                 self.lookup = prefetch::Lookup::default();
+                self.body_query = None;
+                self.prefetched_lookup = false;
+                self.prefetched_reused = false;
+                if let Some(ahead) = self.ahead.as_mut() {
+                    ensure!(
+                        ahead.after == after,
+                        "speculative window lost its ordered prefix"
+                    );
+                    if let Some(window) = ahead.ready().await? {
+                        self.pending = Some(window.head);
+                        self.lookahead = window.tail;
+                        self.source_page = Some(window.page);
+                        self.body_query = Some(window.query);
+                        self.prefetched_lookup = true;
+                    }
+                    self.ahead = None;
+                }
             }
         }
         if self.pending.is_none() {
@@ -1058,14 +1084,35 @@ impl Driver {
             };
         if missing_body_lookup {
             self.lookup.bodies = None;
-            let mut keys = Vec::new();
-            for record in std::iter::once(pending).chain(self.lookahead.iter()) {
-                let mixed::Decoded::Creates { rows, .. } = &record.decoded else {
-                    bail!("immutable body cannot contain patches")
-                };
-                keys.extend(rows.iter().map(|row| row.turn.as_str()));
+            if self.body_query.is_none() {
+                self.body_query = pipeline::Query::new(service, pending, &self.lookahead, false)?;
             }
-            self.lookup.bodies = service.lookup_bodies(&keys).await?;
+            if self.body_query.is_some()
+                && self.ahead.is_none()
+                && self.staging_pressure.is_none()
+                && service.apply_backpressure().is_none()
+                && service.shared.narrow.session.native_memory().is_some()
+            {
+                if let Some(page) = &self.source_page {
+                    let through = self.lookahead.back().unwrap_or(pending).index;
+                    self.ahead = Some(pipeline::Ahead::new(
+                        service,
+                        through,
+                        page.clone(),
+                        replay_cut,
+                    ));
+                }
+            }
+            if let Some(query) = self.body_query.as_mut() {
+                self.lookup.bodies = pipeline::resolve(query, &mut self.ahead).await?;
+                self.body_query = None;
+            }
+            if self.lookup.bodies.is_none() {
+                // Speculation must never prevent the ordered head or publisher
+                // from obtaining capacity. The original source page is intact.
+                self.ahead = None;
+                self.prefetched_lookup = false;
+            }
             if self.lookup.bodies.is_none() && !self.lookahead.is_empty() {
                 {
                     let mut observed = service.shared.body_lookups.lock().unwrap();
@@ -1084,11 +1131,11 @@ impl Driver {
                 while let Some(record) = self.lookahead.pop_back() {
                     page.entries.insert(0, (record.index, record.meta));
                 }
-                let mixed::Decoded::Creates { rows, .. } = &pending.decoded else {
-                    unreachable!()
-                };
-                let keys = rows.iter().map(|row| row.turn.as_str()).collect::<Vec<_>>();
-                self.lookup.bodies = service.lookup_bodies(&keys).await?;
+                self.body_query = pipeline::Query::new(service, pending, &self.lookahead, false)?;
+                if let Some(query) = self.body_query.as_mut() {
+                    self.lookup.bodies = pipeline::resolve(query, &mut self.ahead).await?;
+                    self.body_query = None;
+                }
             }
             if self.lookup.bodies.is_none() {
                 service
@@ -1097,18 +1144,11 @@ impl Driver {
                     .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
                 return Ok(());
             }
-            service.shared.body_lookups.lock().unwrap().record_window(
-                self.lookup.bodies.as_ref().unwrap().keys.observation(),
-                self.lookahead.len() + 1,
-                self.lookahead
-                    .iter()
-                    .fold(pending.meta.body_bytes, |bytes, next| {
-                        bytes.saturating_add(next.meta.body_bytes)
-                    }),
-            );
         }
+        pipeline::tick(&mut self.ahead).await;
         let _ordered = service.shared.ordered.lock().await;
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {
+            self.ahead = None;
             service
                 .shared
                 .progress
@@ -1142,6 +1182,13 @@ impl Driver {
             {
                 Some(applied) => applied,
                 None => {
+                    if self.prefetched_lookup {
+                        let mut observed = service.shared.body_lookups.lock().unwrap();
+                        observed.prefetched_lookups_stale =
+                            observed.prefetched_lookups_stale.saturating_add(1);
+                    }
+                    self.prefetched_lookup = false;
+                    self.ahead = None;
                     self.lookup.bodies = None;
                     return Ok(());
                 }
@@ -1227,6 +1274,7 @@ impl Driver {
             ApplyOutcome::Applied => MutationResult::Applied,
             ApplyOutcome::Rejected(rejected) => MutationResult::Rejected(rejected),
             ApplyOutcome::Backpressure => {
+                self.ahead = None;
                 self.staging_pressure = Some(capacity);
                 service
                     .shared
@@ -1235,6 +1283,12 @@ impl Driver {
                 return Ok(());
             }
         };
+        if self.prefetched_lookup && !self.prefetched_reused {
+            self.prefetched_reused = true;
+            let mut observed = service.shared.body_lookups.lock().unwrap();
+            observed.prefetched_lookups_reused =
+                observed.prefetched_lookups_reused.saturating_add(1);
+        }
         // No await between applying the batch, retaining its outcome, and
         // publishing progress to waiters. Cancellation cannot split this handoff.
         let pending = self.pending.take().unwrap();

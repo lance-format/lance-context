@@ -8,6 +8,7 @@ use lance_datafusion::exec::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
@@ -56,6 +57,7 @@ pub struct TurnLookup {
 /// A bounded input window, before capturing the base and doing any native I/O.
 pub(crate) struct PreparedTurnLookup {
     pub(crate) keys: BTreeMap<String, bool>,
+    pub(crate) native_running: Option<Arc<AtomicBool>>,
     workspace: MergeReservation,
     started: Instant,
 }
@@ -149,6 +151,7 @@ impl TurnIngestionSpec {
         };
         Ok(Some(PreparedTurnLookup {
             keys: keys.iter().map(|key| ((*key).to_owned(), false)).collect(),
+            native_running: None,
             workspace: reservation,
             started,
         }))
@@ -167,6 +170,7 @@ impl TurnIngestionSpec {
         );
         let PreparedTurnLookup {
             keys: mut requested,
+            native_running,
             workspace: reservation,
             started,
         } = prepared;
@@ -230,6 +234,9 @@ impl TurnIngestionSpec {
             .batch_readahead(readahead)
             .fragment_readahead(readahead);
         observation.scans_started = 1;
+        // The owner uses this lifetime only to observe overlap of two native
+        // lookup futures. It carries no validity or publication authority.
+        let _activity = NativeActivity::start(native_running);
         // Keep the scanner's plan so an all-hit early exit can report work
         // without polling to EOF just to trigger its completion callback.
         // Preserve Scanner::execution_options and the logical schema adapter.
@@ -302,5 +309,24 @@ impl TurnIngestionSpec {
             observation,
             _workspace: reservation,
         })
+    }
+}
+
+struct NativeActivity(Option<Arc<AtomicBool>>);
+
+impl NativeActivity {
+    fn start(active: Option<Arc<AtomicBool>>) -> Self {
+        if let Some(active) = &active {
+            active.store(true, Ordering::Relaxed);
+        }
+        Self(active)
+    }
+}
+
+impl Drop for NativeActivity {
+    fn drop(&mut self) {
+        if let Some(active) = &self.0 {
+            active.store(false, Ordering::Relaxed);
+        }
     }
 }

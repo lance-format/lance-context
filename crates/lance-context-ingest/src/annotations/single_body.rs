@@ -185,7 +185,26 @@ impl Service {
         is_schema(&self.ingress.schema)
     }
 
-    pub(super) async fn lookup_bodies(&self, keys: &[&str]) -> Result<Option<Lookup>> {
+    pub(super) fn prepare_body_lookup(
+        &self,
+        keys: &[&str],
+    ) -> Result<Option<crate::turn_ingestion::PreparedTurnLookup>> {
+        self.ingress
+            .turn_spec
+            .as_ref()
+            .context("missing body spec")?
+            .prepare_lookup(
+                keys,
+                self.lookup_budget
+                    .as_ref()
+                    .context("missing body lookup budget")?,
+            )
+    }
+
+    pub(super) async fn lookup_prepared_bodies(
+        &self,
+        mut prepared: crate::turn_ingestion::PreparedTurnLookup,
+    ) -> Result<Option<Lookup>> {
         self.shared
             .phases
             .measure(Phase::AnnotationRegistrationLookup, async {
@@ -194,15 +213,6 @@ impl Service {
                     .turn_spec
                     .as_ref()
                     .context("missing body spec")?;
-                let Some(mut prepared) = spec.prepare_lookup(
-                    keys,
-                    self.lookup_budget
-                        .as_ref()
-                        .context("missing body lookup budget")?,
-                )?
-                else {
-                    return Ok(None);
-                };
                 let Some(base) = self
                     .shared
                     .staging

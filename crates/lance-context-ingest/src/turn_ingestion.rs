@@ -16,6 +16,7 @@ const SPEC_KEY: &str = "lance-context.turn-ingestion-spec.v1";
 
 #[cfg(feature = "materializer")]
 mod lookup;
+pub(crate) use lookup::PreparedTurnLookup;
 #[cfg(feature = "materializer")]
 pub use lookup::{TurnLookup, TurnLookupObservation};
 

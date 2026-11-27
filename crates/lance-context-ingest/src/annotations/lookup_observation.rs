@@ -80,6 +80,18 @@ pub struct BodyLookupObservation {
     /// Attempts releasing prefetched bodies before a head-only lookup. The
     /// replacement lookup can still fail admission; this is not a success count.
     pub lookahead_admission_fallbacks: u64,
+    /// Successor windows whose native lookup was observed active while the
+    /// current native lookup was also active. Not a count of physical I/O.
+    pub history_query_overlaps: u64,
+    pub prefetched_lookups_started: u64,
+    pub prefetched_lookups_completed: u64,
+    /// Completed speculative lookups accepted by ordered apply at least once.
+    pub prefetched_lookups_reused: u64,
+    /// Speculative results rejected by the existing captured-base check.
+    pub prefetched_lookups_stale: u64,
+    /// Prepared speculative queries dropped before completion, including
+    /// admission pressure and owner cancellation. Their WAL positions remain.
+    pub prefetched_lookups_cancelled: u64,
     pub prefetch: BodyPrefetchObservation,
     pub requested_keys: u64,
     /// Keys resolved from the same captured active/frozen view, without history I/O.
