@@ -125,7 +125,8 @@ impl PublishedValues {
             self.membership.refusals.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        let Ok(mut reservation) = memory::try_reserve(&self.memory, NativeMemoryKind::Index, bytes)
+        let Ok(mut reservation) =
+            memory::try_reserve_cache(&self.memory, NativeMemoryKind::Index, bytes)
         else {
             self.membership.refusals.fetch_add(1, Ordering::Relaxed);
             return;

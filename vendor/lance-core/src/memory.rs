@@ -41,6 +41,17 @@ pub trait NativeMemoryPool: Send + Sync + Debug {
         kind: NativeMemoryKind,
         bytes: usize,
     ) -> Result<Box<dyn NativeMemoryReservation>>;
+
+    /// Admit optional cache retention separately from required processing.
+    /// Hosts may decline without reclaiming live backing; the caller must skip
+    /// caching on refusal. The default preserves existing pool behavior.
+    fn try_reserve_cache(
+        &self,
+        kind: NativeMemoryKind,
+        bytes: usize,
+    ) -> Result<Box<dyn NativeMemoryReservation>> {
+        self.try_reserve(kind, bytes)
+    }
 }
 
 pub type NativeMemory = Option<Arc<dyn NativeMemoryPool>>;
@@ -73,6 +84,14 @@ impl NativeMemoryPool for KindMemoryPool {
     ) -> Result<Box<dyn NativeMemoryReservation>> {
         self.pool.try_reserve(self.kind, bytes)
     }
+
+    fn try_reserve_cache(
+        &self,
+        _kind: NativeMemoryKind,
+        bytes: usize,
+    ) -> Result<Box<dyn NativeMemoryReservation>> {
+        self.pool.try_reserve_cache(self.kind, bytes)
+    }
 }
 
 pub async fn reserve_read(memory: &NativeMemory, bytes: usize) -> Result<NativeReservation> {
@@ -95,6 +114,19 @@ pub fn try_reserve(
         .as_ref()
         .filter(|_| bytes != 0)
         .map(|memory| memory.try_reserve(kind, bytes))
+        .transpose()
+}
+
+/// Admit optional cache backing. Refusal must not fail the owning operation.
+pub fn try_reserve_cache(
+    memory: &NativeMemory,
+    kind: NativeMemoryKind,
+    bytes: usize,
+) -> Result<NativeReservation> {
+    memory
+        .as_ref()
+        .filter(|_| bytes != 0)
+        .map(|memory| memory.try_reserve_cache(kind, bytes))
         .transpose()
 }
 
