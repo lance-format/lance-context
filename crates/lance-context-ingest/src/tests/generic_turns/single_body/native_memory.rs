@@ -378,18 +378,18 @@ async fn two_windows(publish: bool, cancel: bool) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partial_ahead_window_coalesces_later_committed_requests_before_scanning() -> Result<()> {
-    tokio::time::timeout(
-        DEADLINE,
-        two_windows_with_late_tail(false, false, WindowInput::Late),
-    )
-    .await?
+    for schedule in [WindowInput::LateConcurrent, WindowInput::EmptyConcurrent] {
+        tokio::time::timeout(DEADLINE, two_windows_with_late_tail(false, false, schedule))
+            .await??;
+    }
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_partial_ahead_window_recovers_later_committed_requests() -> Result<()> {
     tokio::time::timeout(
         DEADLINE,
-        two_windows_with_late_tail(false, true, WindowInput::Late),
+        two_windows_with_late_tail(false, true, WindowInput::LateConcurrent),
     )
     .await?
 }
@@ -424,6 +424,8 @@ async fn bounded_promotion_coalesces_records_committed_after_prefix_apply() -> R
 enum WindowInput {
     Full,
     Late,
+    LateConcurrent,
+    EmptyConcurrent,
     CancelRefill,
     AfterPromotion,
 }
@@ -434,6 +436,10 @@ async fn two_windows_with_late_tail(
     schedule: WindowInput,
 ) -> Result<()> {
     let late_tail = !matches!(schedule, WindowInput::Full);
+    let concurrent_refill = matches!(
+        schedule,
+        WindowInput::LateConcurrent | WindowInput::EmptyConcurrent
+    );
     let input = bodies()?;
     let spec = TurnIngestionSpec::new(
         input[0].schema(),
@@ -522,7 +528,7 @@ async fn two_windows_with_late_tail(
                 fragment_readahead: 16,
             })?;
     }
-    if matches!(schedule, WindowInput::AfterPromotion) {
+    if concurrent_refill || matches!(schedule, WindowInput::AfterPromotion) {
         runtime = runtime.with_body_lookup_batch_wait(Duration::from_secs(1))?;
     }
     let initial = service.observation().await.0.applied;
@@ -534,7 +540,11 @@ async fn two_windows_with_late_tail(
     // Either two full windows and one successor, or a full window and a short
     // successor that grows while A queries. B shares A's new keys; a lookup
     // captured before A applies must recheck staging or the published base.
-    let initial_records = if late_tail { 9 } else { 17 };
+    let initial_records = match schedule {
+        WindowInput::Full => 17,
+        WindowInput::EmptyConcurrent => 8,
+        _ => 9,
+    };
     for i in 0..initial_records {
         let prepared = request(
             &service,
@@ -567,7 +577,9 @@ async fn two_windows_with_late_tail(
             }
             let observed = service.body_lookup_observation();
             if (late_tail
-                && observed.prefetch.requests >= 9
+                && observed.prefetch.requests >= initial_records as u64
+                && (!matches!(schedule, WindowInput::EmptyConcurrent)
+                    || observed.prefetch.source_empty_at_local_end > 0)
                 && admission.entered.load(Ordering::SeqCst) >= 1)
                 || (!late_tail
                     && observed.history_query_overlaps == 1
@@ -583,15 +595,19 @@ async fn two_windows_with_late_tail(
             );
         }
         assert_eq!(service.observation().await.0.applied, initial);
-        assert_eq!(
-            service.body_lookup_observation().prefetch.requests,
-            if late_tail { 9 } else { 16 }
-        );
+        if !concurrent_refill && !matches!(schedule, WindowInput::AfterPromotion) {
+            assert_eq!(
+                service.body_lookup_observation().prefetch.requests,
+                if late_tail { 9 } else { 16 }
+            );
+        }
         if late_tail && !matches!(schedule, WindowInput::AfterPromotion) {
             // These requests become durable after the short ahead page was
             // captured, while the foreground query still owns its read gate.
-            // Promotion should include them in the same bounded lookup.
-            for i in 9..16 {
+            // With a configured wait, the successor must include these in one
+            // query before A is released, even if Ahead initially saw no head.
+            // Default-zero mode still tops up at promotion.
+            for i in initial_records..16 {
                 let prepared = request(
                     &service,
                     &lanes[i % lanes.len()],
@@ -612,6 +628,27 @@ async fn two_windows_with_late_tail(
                 };
                 backlog.push((prepared, index));
             }
+            if concurrent_refill {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    tokio::select! {
+                        result = &mut step => panic!("foreground escaped native gate: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+                    }
+                    let observed = service.body_lookup_observation();
+                    if observed.history_query_overlaps == 1
+                        && admission.entered.load(Ordering::SeqCst) >= 2
+                    {
+                        assert_eq!(observed.prefetched_lookups_started, 1);
+                        assert_eq!(service.observation().await.0.applied, initial);
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "late successor did not overlap: {observed:?}"
+                    );
+                }
+            }
         } else if !late_tail {
             assert_eq!(
                 service.body_lookup_observation().prefetched_lookups_started,
@@ -631,7 +668,11 @@ async fn two_windows_with_late_tail(
             service
                 .body_lookup_observation()
                 .prefetched_lookups_cancelled,
-            if late_tail { 0 } else { 1 }
+            if late_tail && !concurrent_refill {
+                0
+            } else {
+                1
+            }
         );
         admission.pause_reads.store(false, Ordering::SeqCst);
         admission.resume.notify_waiters();

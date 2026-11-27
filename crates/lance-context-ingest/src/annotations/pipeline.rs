@@ -112,73 +112,140 @@ pub(super) struct Window {
 
 pub(super) struct Ahead {
     pub(super) after: u64,
-    loading: Option<BoxFuture<'static, Result<Option<Window>>>>,
-    result: Option<Result<Option<Window>>>,
+    service: Service,
+    cut: Option<u64>,
+    batch_wait: Duration,
+    loading: Option<BoxFuture<'static, Result<Loaded>>>,
+    result: Option<Result<Loaded>>,
+    retry_at: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     overlap_recorded: bool,
 }
 
+enum Loaded {
+    /// No matching committed input yet. Retain the validated metadata cursor,
+    /// not an application position or a claim that upstream input is exhausted.
+    Gap(Page),
+    Unavailable,
+    Ready(Box<Window>),
+}
+
 impl Ahead {
-    pub(super) fn new(service: &Service, after: u64, mut page: Page, cut: Option<u64>) -> Self {
-        let service = service.clone();
+    pub(super) fn new(
+        service: &Service,
+        after: u64,
+        page: Page,
+        cut: Option<u64>,
+        batch_wait: Duration,
+    ) -> Self {
         Self {
             after,
-            loading: Some(Box::pin(async move {
-                if page.entries.is_empty() {
-                    if cut.is_some_and(|cut| page.through >= cut) {
-                        return Ok(None);
-                    }
-                    let Some(next) = prefetch::source_page(&service, page.through, cut).await?
-                    else {
-                        return Ok(None);
-                    };
-                    page = next;
-                }
-                let Some((index, meta)) = page.entries.first().cloned() else {
-                    return Ok(None);
-                };
-                ensure!(index > after, "unordered speculative source window");
-                let Some(head) = prefetch::fetch(&service, index, meta).await? else {
-                    return Ok(None);
-                };
-                page.entries.remove(0);
-                let mut tail = VecDeque::new();
-                let prepared =
-                    prefetch::prepare(&service, &head, &mut page, &mut tail, cut).await?;
-                // Do not seal a short successor query at the first temporary
-                // source gap. Current apply can release producer lanes while
-                // these admitted inputs wait; promotion can include their next
-                // committed requests in the same bounded historical scan.
-                let deferred = matches!(prepared.body_stop, Some(PrefetchStop::PageExhausted))
-                    && cut.is_none_or(|cut| page.through < cut);
-                let query = if deferred {
-                    None
-                } else {
-                    let Some(query) = Query::new(&service, &head, &tail, true)? else {
-                        return Ok(None);
-                    };
-                    Some(query)
-                };
-                Ok(Some(Window {
-                    head,
-                    tail,
-                    page,
-                    query,
-                    cut,
-                }))
-            })),
+            service: service.clone(),
+            cut,
+            batch_wait,
+            loading: Some(Self::load(service.clone(), after, page, cut, batch_wait)),
             result: None,
+            retry_at: None,
             overlap_recorded: false,
         }
     }
 
-    pub(super) fn poll(&mut self, cx: &mut Context<'_>, current: Option<&Query>) {
-        if let Some(loading) = self.loading.as_mut() {
-            if let Poll::Ready(result) = loading.as_mut().poll(cx) {
-                self.loading = None;
-                self.result = Some(result);
+    fn load(
+        service: Service,
+        after: u64,
+        mut page: Page,
+        cut: Option<u64>,
+        batch_wait: Duration,
+    ) -> BoxFuture<'static, Result<Loaded>> {
+        Box::pin(async move {
+            if page.entries.is_empty() {
+                if cut.is_some_and(|cut| page.through >= cut) {
+                    return Ok(Loaded::Unavailable);
+                }
+                let Some(next) = prefetch::source_page(&service, page.through, cut).await? else {
+                    return Ok(Loaded::Gap(page));
+                };
+                page = next;
             }
+            let Some((index, meta)) = page.entries.first().cloned() else {
+                return Ok(Loaded::Gap(page));
+            };
+            ensure!(index > after, "unordered speculative source window");
+            let Some(head) = prefetch::fetch(&service, index, meta).await? else {
+                return Ok(Loaded::Unavailable);
+            };
+            page.entries.remove(0);
+            let mut tail = VecDeque::new();
+            let prepared = prefetch::prepare(&service, &head, &mut page, &mut tail, cut).await?;
+            // A configured wait lets the successor collect later commits
+            // and start its query while the foreground is still running.
+            // Keep one absolute deadline inside this retained future, so
+            // cancellation of Driver::step cannot restart the wait.
+            let deferred = matches!(prepared.body_stop, Some(PrefetchStop::PageExhausted))
+                && cut.is_none_or(|cut| page.through < cut);
+            if deferred && !batch_wait.is_zero() {
+                let deadline = tokio::time::Instant::now() + batch_wait;
+                prefetch::coalesce(&service, &head, &mut page, &mut tail, cut, deadline).await?;
+            }
+            // Without an opt-in wait, preserve promotion-time batching
+            // rather than launching a one-record query at each source gap.
+            let query = if deferred && batch_wait.is_zero() {
+                None
+            } else {
+                let Some(query) = Query::new(&service, &head, &tail, true)? else {
+                    return Ok(Loaded::Unavailable);
+                };
+                Some(query)
+            };
+            Ok(Loaded::Ready(Box::new(Window {
+                head,
+                tail,
+                page,
+                query,
+                cut,
+            })))
+        })
+    }
+
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>, current: Option<&Query>) {
+        loop {
+            if let Some(loading) = self.loading.as_mut() {
+                if let Poll::Ready(result) = loading.as_mut().poll(cx) {
+                    self.loading = None;
+                    self.result = Some(result);
+                }
+            }
+            if !self.batch_wait.is_zero()
+                && current.is_some_and(|query| query.future.is_some())
+                && self.service.apply_backpressure().is_none()
+                && matches!(self.result, Some(Ok(Loaded::Gap(_))))
+            {
+                let retry = self.retry_at.get_or_insert_with(|| {
+                    // Reuse the configured batching cadence for an empty
+                    // successor throughout a potentially long native scan.
+                    Box::pin(tokio::time::sleep(
+                        self.batch_wait.max(Duration::from_millis(5)),
+                    ))
+                });
+                if retry.as_mut().poll(cx).is_ready() {
+                    let Some(Ok(Loaded::Gap(page))) = self.result.take() else {
+                        unreachable!("checked source gap")
+                    };
+                    self.retry_at = None;
+                    self.loading = Some(Self::load(
+                        self.service.clone(),
+                        self.after,
+                        page,
+                        self.cut,
+                        self.batch_wait,
+                    ));
+                    // Poll the new read now to register its waker. There is
+                    // still only one successor and no retained payload at a gap.
+                    continue;
+                }
+            }
+            break;
         }
-        if let Some(Ok(Some(window))) = self.result.as_mut() {
+        if let Some(Ok(Loaded::Ready(window))) = self.result.as_mut() {
             let Some(query) = window.query.as_mut() else {
                 return;
             };
@@ -207,7 +274,7 @@ impl Ahead {
                 return Poll::Pending;
             };
             match result {
-                Ok(Some(mut window)) if window.query.is_none() => {
+                Ok(Loaded::Ready(mut window)) if window.query.is_none() => {
                     let service = service.clone();
                     let deadline = tokio::time::Instant::now() + batch_wait;
                     // Retain the refill future in Ahead, not in this call's
@@ -225,13 +292,15 @@ impl Ahead {
                         .await?;
                         let Some(query) = Query::new(&service, &window.head, &window.tail, false)?
                         else {
-                            return Ok(None);
+                            return Ok(Loaded::Unavailable);
                         };
                         window.query = Some(query);
-                        Ok(Some(window))
+                        Ok(Loaded::Ready(window))
                     }));
                 }
-                result => return Poll::Ready(result),
+                Ok(Loaded::Ready(window)) => return Poll::Ready(Ok(Some(*window))),
+                Ok(Loaded::Gap(_) | Loaded::Unavailable) => return Poll::Ready(Ok(None)),
+                Err(error) => return Poll::Ready(Err(error)),
             }
         })
         .await

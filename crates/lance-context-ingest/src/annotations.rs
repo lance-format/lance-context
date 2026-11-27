@@ -1127,6 +1127,7 @@ impl Driver {
                         through,
                         page.clone(),
                         replay_cut,
+                        self.body_batch_wait,
                     ));
                 }
             }
