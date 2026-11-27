@@ -19,6 +19,7 @@ mod body;
 mod cold_points;
 mod compaction;
 mod immutable;
+mod manifest_fragments;
 mod manifest_rows;
 mod patch_lookup;
 mod preserve_id;
@@ -30,6 +31,7 @@ mod status_filter;
 mod views;
 pub use body::{BodySnapshot, TurnBodySource, TurnRead, BODY_SNAPSHOT_PROPERTY};
 pub use immutable::{ImmutableBase, ImmutableBodyRead, ImmutableRegistration};
+pub use manifest_fragments::{FragmentSummary, SmallFragmentSummary};
 pub use manifest_rows::manifest_rows;
 pub use patch_lookup::PatchLookup;
 pub use publication::{
@@ -178,6 +180,9 @@ pub struct InstalledBase {
     pub rows: Option<u64>,
     /// True for full immutable bodies; false for the annotation dataset.
     pub immutable_body: bool,
+    /// Optional loaded-manifest diagnostics. Ordinary observations omit the
+    /// traversal; populated only by `observation_with_manifest`.
+    pub fragment_summary: Option<FragmentSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -695,8 +700,19 @@ impl AnnotationStaging {
     }
 
     pub async fn observation(&self) -> Observation {
+        self.observe(false).await
+    }
+
+    /// Summarize only loaded fragment metadata. No file listing, data scan or
+    /// index metadata I/O. Captures the same base as the reported version/cut;
+    /// traversal happens after releasing the staging lock.
+    pub async fn observation_with_manifest(&self) -> Observation {
+        self.observe(true).await
+    }
+
+    async fn observe(&self, include_manifest: bool) -> Observation {
         let state = self.state.read().await;
-        Observation {
+        let mut observation = Observation {
             applied: state.applied,
             materialized: state.materialized,
             immutable_lookup_reused: state.immutable_lookup_reused,
@@ -706,6 +722,7 @@ impl AnnotationStaging {
                 version: state.base.version_id(),
                 rows: state.base.rows,
                 immutable_body: self.immutable_body,
+                fragment_summary: None,
             },
             active_entries: state.active.len(),
             frozen_entries: state.frozen.as_ref().map_or(0, |f| f.values.len()),
@@ -714,7 +731,14 @@ impl AnnotationStaging {
             retained_metadata_bytes: publication::METADATA_BUDGET
                 - self.metadata.available_permits(),
             readers: self.limits.readers - self.readers.available_permits(),
+        };
+        let base = include_manifest.then(|| state.base.clone());
+        drop(state);
+        if let Some(base) = base {
+            observation.installed_base.fragment_summary =
+                Some(FragmentSummary::from(base.manifest()));
         }
+        observation
     }
 }
 
