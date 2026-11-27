@@ -52,6 +52,8 @@ pub use producer_replacement::{ProducerReplacement, ProducerReplacementFenced};
 #[cfg(feature = "materializer")]
 pub mod reader;
 pub mod receipt;
+#[cfg(feature = "streaming-producer")]
+pub mod streaming;
 pub mod turn_ingestion;
 #[cfg(feature = "worker")]
 pub mod worker;
