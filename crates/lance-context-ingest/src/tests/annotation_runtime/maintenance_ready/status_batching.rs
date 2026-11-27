@@ -42,8 +42,10 @@ async fn scenario(min_rows: usize, expect_maintenance: bool, competing_id: bool)
             min_source_bytes: 1,
             max_records: 1,
             max_batch_wait: Duration::from_secs(5),
-            turn_id_index: (indexing && competing_id)
-                .then_some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+            turn_id_index: (indexing && competing_id).then_some(crate::materializer::TurnIdIndex {
+                min_rows: 1,
+                ..Default::default()
+            }),
             status_index: indexing.then_some(crate::materializer::StatusIndex {
                 min_rows,
                 ..Default::default()

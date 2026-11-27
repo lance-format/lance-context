@@ -1,4 +1,5 @@
-//! Bounded ID indexing for the current annotation table, using native BTree files.
+//! Bounded ID indexing for the current annotation table, using native BTree or
+//! ZoneMap segments.
 use super::*;
 use lance::index::DatasetIndexExt;
 use lance_table::format::IndexMetadata;
@@ -9,16 +10,35 @@ pub(crate) const MAX_BUILD_ROWS: usize = 1 << 20;
 const MAX_MERGE_ROWS: usize = 16 * MAX_BUILD_ROWS;
 const MERGE_FAN_IN: usize = 4;
 
+/// Native structure for the managed turn-ID existence lookup.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnIdIndexType {
+    /// Exact stable-row-ID BTree segments (the existing behaviour).
+    #[default]
+    Btree,
+    /// Per-fragment min/max zones over the canonical key. A zone match is only
+    /// a candidate; the existing exact `id` filter still decides membership.
+    /// Compaction withdraws rewritten fragments, which are then rebuilt.
+    Zonemap,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TurnIdIndex {
     /// Leave a smaller cold tail to native filtered scans until it reaches this
     /// many rows. This bounds when to start a build, not native allocator usage.
     pub min_rows: usize,
+    /// Native index structure. Changing it requires a fresh table binding: a
+    /// table never mixes BTree and ZoneMap turn-ID segments.
+    pub index_type: TurnIdIndexType,
 }
 impl Default for TurnIdIndex {
     fn default() -> Self {
-        Self { min_rows: 64 << 10 }
+        Self {
+            min_rows: 64 << 10,
+            index_type: TurnIdIndexType::Btree,
+        }
     }
 }
 
@@ -45,6 +65,10 @@ impl TurnIdIndex {
     // with every new tail. A merge covers at most sixteen million rows. Large
     // shards can still accumulate capped segments; this is not a scale-out policy.
     fn merge(segments: Vec<(IndexMetadata, usize)>) -> Option<Action> {
+        Self::merge_tier(segments).map(Action::Merge)
+    }
+
+    fn merge_tier(segments: Vec<(IndexMetadata, usize)>) -> Option<Vec<IndexMetadata>> {
         let mut tiers: BTreeMap<usize, Vec<IndexMetadata>> = BTreeMap::new();
         for (index, rows) in segments {
             let mut ceiling = 1;
@@ -57,7 +81,7 @@ impl TurnIdIndex {
             let tier = tiers.entry(ceiling).or_default();
             tier.push(index);
             if tier.len() == MERGE_FAN_IN {
-                return Some(Action::Merge(std::mem::take(tier)));
+                return Some(std::mem::take(tier));
             }
         }
         None
@@ -70,8 +94,10 @@ impl TurnIdIndex {
             .iter()
             .map(|f| Ok((u32::try_from(f.id)?, f.physical_rows.unwrap())))
             .collect::<Result<_>>()?;
+        let zonemap = self.index_type == TurnIdIndexType::Zonemap;
         let mut covered = BTreeSet::new();
         let mut segments = Vec::new();
+        let mut empty_sources = Vec::new();
         for index in dataset
             .load_indices()
             .await?
@@ -79,8 +105,22 @@ impl TurnIdIndex {
             .filter(|i| i.name == Key::Turn.name())
         {
             session_index::validate_metadata(dataset, index, Key::Turn)?;
+            ensure!(
+                session_index::is_zonemap(index) == zonemap,
+                "turn ID index type differs from the table's existing segments"
+            );
+            let coverage = index.fragment_bitmap.as_ref().unwrap();
+            // A rewrite withdraws a ZoneMap segment's rewritten fragments. A
+            // fully withdrawn segment is retired by the next build; it is never
+            // merged, so its obsolete zone files are not read again.
+            if zonemap && coverage.is_empty() {
+                if empty_sources.len() < 64 {
+                    empty_sources.push(index.uuid);
+                }
+                continue;
+            }
             let mut rows = 0usize;
-            for id in index.fragment_bitmap.as_ref().unwrap().iter() {
+            for id in coverage.iter() {
                 ensure!(
                     covered.insert(id),
                     "turn ID segments have overlapping coverage"
@@ -95,7 +135,11 @@ impl TurnIdIndex {
             }
             segments.push((index.clone(), rows));
         }
-        if let Some(action) = Self::merge(segments) {
+        if zonemap {
+            if let Some(tier) = Self::merge_tier(segments) {
+                return Ok(Some(Action::MergeZoneMap(tier)));
+            }
+        } else if let Some(action) = Self::merge(segments) {
             return Ok(Some(action));
         }
         let mut selected = Vec::new();
@@ -109,6 +153,16 @@ impl TurnIdIndex {
             if selected.len() == 128 {
                 break;
             }
+        }
+        if zonemap {
+            // Rebuild only uncovered fragments, including any a rewrite just
+            // withdrew. Bounded by the same row/fragment limits as BTree.
+            return Ok((!selected.is_empty()
+                && (rows >= self.min_rows || selected.len() == 128 || !empty_sources.is_empty()))
+            .then_some(Action::BuildZoneMap {
+                fragments: selected,
+                empty_sources,
+            }));
         }
         Ok((rows >= self.min_rows || selected.len() == 128).then_some(Action::Build(selected)))
     }
@@ -148,6 +202,9 @@ pub(super) async fn prepare(
         session_index::prepare_action(publisher, dataset, action, Key::Turn).await?,
     ))
 }
+
+#[cfg(test)]
+mod profile;
 
 #[cfg(test)]
 mod tests {

@@ -54,10 +54,15 @@ impl Preparation {
                 .iter()
                 .map(|fragment| coverage.contains(fragment.id as u32));
             let first = covered.next().context("empty background compaction")?;
+            // A covered turn-ID ZoneMap is withdrawn by the Rewrite commit and
+            // rebuilt later; it needs no remap. Other address indexes still do.
+            let withdrawn =
+                lance_context_core::native_compaction::rewrite_withdraws_coverage(&current, index);
             if covered.any(|value| value != first)
                 || lance_index::is_system_index(index)
                 || (first
                     && index.results_are_row_addrs()
+                    && !withdrawn
                     && (!index.supports_eager_remap() || result.row_addrs.is_none()))
             {
                 return Ok(None);

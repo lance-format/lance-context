@@ -43,8 +43,10 @@ async fn exercise(status_index: bool) -> Result<()> {
                 min_source_bytes: 1,
                 max_records: 1,
                 max_batch_wait: Duration::from_secs(5),
-                turn_id_index: (!status_index)
-                    .then_some(crate::materializer::TurnIdIndex { min_rows: 1 }),
+                turn_id_index: (!status_index).then_some(crate::materializer::TurnIdIndex {
+                    min_rows: 1,
+                    ..Default::default()
+                }),
                 status_index: status_index.then_some(crate::materializer::StatusIndex {
                     min_rows: 1,
                     ..Default::default()
