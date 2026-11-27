@@ -107,6 +107,12 @@ pub struct BodyLookupObservation {
     pub projected_array_bytes: u64,
     pub elapsed_us: u64,
     pub max_elapsed_us: u64,
+    pub first_result_us: LookupMetricObservation,
+    pub parallel_scan_queries: u64,
+    pub last_scan_partitions: usize,
+    /// Native fragment task producers, not physical I/O or decoded batches.
+    pub last_fragment_streams_peak: Option<usize>,
+    pub max_fragment_streams_peak: usize,
     /// Completed lookups with native plan metrics sampled at completion,
     /// including all-hit early exits. Totals exclude later background work
     /// and staging-only resolutions; they are not all object-store I/O.
@@ -155,6 +161,15 @@ impl BodyLookupObservation {
             .saturating_add(value.projected_array_bytes);
         self.elapsed_us = self.elapsed_us.saturating_add(value.elapsed_us);
         self.max_elapsed_us = self.max_elapsed_us.max(value.elapsed_us);
+        self.first_result_us.record(value.first_result_us);
+        self.parallel_scan_queries = self
+            .parallel_scan_queries
+            .saturating_add(u64::from(value.scan_partitions > 1));
+        self.last_scan_partitions = value.scan_partitions;
+        self.last_fragment_streams_peak = value.fragment_streams_peak;
+        self.max_fragment_streams_peak = self
+            .max_fragment_streams_peak
+            .max(value.fragment_streams_peak.unwrap_or(0));
         self.fragments_scanned.record(value.fragments_scanned);
         self.ranges_scanned.record(value.ranges_scanned);
         self.rows_scanned.record(value.rows_scanned);

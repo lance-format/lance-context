@@ -96,6 +96,12 @@ async fn bounded_native_readahead_keeps_exact_keys_and_releases_admission() -> R
         assert_eq!(result.get(key), Some(expected));
     }
     assert_eq!(result.observation().fragments_scanned, Some(20));
+    assert_eq!(result.observation().scan_partitions, 8);
+    assert!(result
+        .observation()
+        .fragment_streams_peak
+        .is_some_and(|peak| (2..=8).contains(&peak)));
+    assert!(result.observation().first_result_us.is_some());
     eprintln!("bounded native readahead scan: {:?}", result.observation());
     drop(result);
     // An all-hit lookup cancels its unfinished scan. Its borrowed buffers must

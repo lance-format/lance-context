@@ -31,7 +31,7 @@ use datafusion_physical_expr::projection::project_ordering;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Gauge, MetricsSet, Time};
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use lance_arrow::{DataTypeExt, RecordBatchExt};
@@ -326,6 +326,8 @@ pub struct FilteredReadGlobalMetrics {
     fragments_scanned: Count,
     ranges_scanned: Count,
     rows_scanned: Count,
+    parallel_fragment_streams: AtomicUsize,
+    parallel_fragment_streams_peak: Gauge,
     io_metrics: IoMetrics,
 }
 
@@ -335,8 +337,28 @@ impl FilteredReadGlobalMetrics {
             fragments_scanned: metrics.new_count(FRAGMENTS_SCANNED_METRIC, 0),
             ranges_scanned: metrics.new_count(RANGES_SCANNED_METRIC, 0),
             rows_scanned: metrics.new_count(ROWS_SCANNED_METRIC, 0),
+            parallel_fragment_streams: AtomicUsize::new(0),
+            parallel_fragment_streams_peak: metrics.new_gauge("parallel_fragment_streams_peak", 0),
             io_metrics: IoMetrics::new(metrics, 0),
         }
+    }
+}
+
+// Counts owned fragment task producers, from open through stream exhaustion or
+// cancellation. This is not a count of physical I/O or already-issued decodes.
+struct FragmentStreamActivity(Arc<FilteredReadGlobalMetrics>);
+
+impl FragmentStreamActivity {
+    fn start(metrics: Arc<FilteredReadGlobalMetrics>) -> Self {
+        let active = metrics.parallel_fragment_streams.fetch_add(1, Ordering::Relaxed) + 1;
+        metrics.parallel_fragment_streams_peak.set_max(active);
+        Self(metrics)
+    }
+}
+
+impl Drop for FragmentStreamActivity {
+    fn drop(&mut self) {
+        self.0.parallel_fragment_streams.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -673,9 +695,30 @@ impl FilteredReadStream {
                     ))
                     .map(|thread_result| thread_result.unwrap())
                 }
-            })
-            .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+            });
+        let task_stream = match threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => fragment_streams
+                .buffered(fragment_readahead)
+                .try_flatten()
+                .boxed(),
+            FilteredReadThreadingMode::MultiplePartitions(_) => fragment_streams
+                // Include opening and reading in the same bounded inner stream.
+                // A slow fragment must not prevent other fragments from supplying
+                // tasks. Each scoped fragment is still visited exactly once and
+                // every partition consumes the same shared scheduler/task stream.
+                .map({
+                    let metrics = global_metrics.clone();
+                    move |open| {
+                        let activity = FragmentStreamActivity::start(metrics.clone());
+                        Ok::<_, Error>(futures::stream::once(open)
+                            .try_flatten()
+                            .finally(move || drop(activity))
+                            .boxed())
+                    }
+                })
+                .try_flatten_unordered(fragment_readahead)
+                .boxed(),
+        };
 
         // A batch never spans fragments, so a plan touching many fragments
         // with few rows each emits one tiny batch per fragment. Fragments

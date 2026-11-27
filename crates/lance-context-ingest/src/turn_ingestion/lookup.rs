@@ -1,11 +1,17 @@
 //! Bounded composite-key probes against the full body dataset.
 use super::*;
+use datafusion_physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
-use lance::{dataset::scanner::DatasetRecordBatchStream, Dataset};
+use lance::{
+    dataset::scanner::DatasetRecordBatchStream,
+    io::exec::filtered_read::{FilteredReadExec, FilteredReadThreadingMode},
+    Dataset,
+};
 use lance_context_core::{MergeMemoryBudget, MergeReservation};
 use lance_datafusion::exec::{
     collect_execution_metrics, execute_plan, ExecutionSummaryCounts, LanceExecutionOptions,
 };
+use lance_datafusion::utils::MetricsExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::atomic::{AtomicBool, Ordering},
@@ -34,6 +40,14 @@ pub struct TurnLookupObservation {
     pub projected_rows: u64,
     pub projected_array_bytes: u64,
     pub elapsed_us: u64,
+    /// Time since window preparation to the first returned key batch, including
+    /// planning/waiting; absent for empty or staging-only results.
+    pub first_result_us: Option<usize>,
+    /// Maximum native scan partition count in this query's plan, not physical I/O.
+    pub scan_partitions: usize,
+    /// Peak owned fragment task producers in a parallel native scan, including
+    /// opening files. Excludes already-issued decode and physical I/O lifetimes.
+    pub fragment_streams_peak: Option<usize>,
     pub lance_bytes_read: Option<usize>,
     pub lance_requests: Option<usize>,
     pub lance_indices_loaded: Option<usize>,
@@ -233,6 +247,9 @@ impl TurnIngestionSpec {
         scan.batch_size(SCAN_BATCH_ROWS)
             .batch_readahead(readahead)
             .fragment_readahead(readahead);
+        if readahead > 1 {
+            scan.scan_in_order(false);
+        }
         observation.scans_started = 1;
         // The owner uses this lifetime only to observe overlap of two native
         // lookup futures. It carries no validity or publication authority.
@@ -241,6 +258,11 @@ impl TurnIngestionSpec {
         // without polling to EOF just to trigger its completion callback.
         // Preserve Scanner::execution_options and the logical schema adapter.
         let plan = scan.create_plan().await?;
+        let plan = if readahead > 1 {
+            parallel_membership_scan(plan, readahead)?
+        } else {
+            plan
+        };
         let mut stream = DatasetRecordBatchStream::new(execute_plan(
             plan.clone(),
             LanceExecutionOptions {
@@ -250,6 +272,13 @@ impl TurnIngestionSpec {
             },
         )?);
         while let Some(batch) = stream.try_next().await? {
+            observation.first_result_us.get_or_insert_with(|| {
+                started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(usize::MAX)
+            });
             observation.projected_rows = observation
                 .projected_rows
                 .saturating_add(batch.num_rows() as u64);
@@ -294,6 +323,7 @@ impl TurnIngestionSpec {
         // background work: these are observed plan metrics, not all store I/O.
         let mut stats = ExecutionSummaryCounts::default();
         collect_execution_metrics(plan.as_ref(), &mut stats);
+        collect_scan_activity(plan.as_ref(), &mut observation);
         drop(plan);
         observation.lance_bytes_read = Some(stats.bytes_read);
         observation.lance_requests = Some(stats.requests);
@@ -309,6 +339,69 @@ impl TurnIngestionSpec {
             observation,
             _workspace: reservation,
         })
+    }
+}
+
+/// Membership needs no row order. Use the native shared task stream so each
+/// fragment is scanned once, with bounded readers and streaming result merging.
+/// Keep indexed/row-stream/ranged reads on their original execution path: their
+/// selectors can require a particular input partition or logical row order.
+fn parallel_membership_scan(
+    plan: Arc<dyn ExecutionPlan>,
+    partitions: usize,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+        if read.index_input().is_some()
+            || read.row_stream_input().is_some()
+            || read.options().scan_range_before_filter.is_some()
+            || read.options().scan_range_after_filter.is_some()
+        {
+            return Ok(plan);
+        }
+        return Ok(Arc::new(FilteredReadExec::try_new(
+            read.dataset().clone(),
+            read.options()
+                .clone()
+                .with_threading_mode(FilteredReadThreadingMode::MultiplePartitions(partitions)),
+            None,
+        )?));
+    }
+    let children = plan
+        .children()
+        .iter()
+        .map(|child| parallel_membership_scan((*child).clone(), partitions))
+        .collect::<Result<Vec<_>>>()?;
+    if children.is_empty() {
+        Ok(plan)
+    } else {
+        Ok(plan.with_new_children(children)?)
+    }
+}
+
+fn collect_scan_activity(plan: &dyn ExecutionPlan, observation: &mut TurnLookupObservation) {
+    if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+        let partitions = match read.options().threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
+            FilteredReadThreadingMode::MultiplePartitions(n) => n,
+        };
+        observation.scan_partitions = observation.scan_partitions.max(partitions);
+        if partitions > 1 {
+            if let Some(metrics) = read.metrics() {
+                for (name, gauge) in metrics.iter_gauges() {
+                    if name.as_ref() == "parallel_fragment_streams_peak" {
+                        observation.fragment_streams_peak = Some(
+                            observation
+                                .fragment_streams_peak
+                                .unwrap_or(0)
+                                .max(gauge.value()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for child in plan.children() {
+        collect_scan_activity(child.as_ref(), observation);
     }
 }
 
