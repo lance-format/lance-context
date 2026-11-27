@@ -22,6 +22,7 @@ use tokio::sync::watch;
 mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
+mod lookup_observation;
 #[cfg(feature = "service")]
 pub(crate) mod metadata_upload;
 pub mod mixed;
@@ -36,6 +37,7 @@ mod status_filter;
 mod window;
 pub mod wire;
 pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
+pub use lookup_observation::{BodyLookupObservation, LookupMetricObservation};
 pub use shard::Shard;
 pub use window::SourceObservation;
 
@@ -93,6 +95,7 @@ struct Shared {
     ordered: tokio::sync::Mutex<()>,
     progress: watch::Sender<Progress>,
     reclamation: Mutex<runtime::reclamation::Observation>,
+    body_lookups: Mutex<BodyLookupObservation>,
     phases: Arc<crate::materializer::observation::Counters>,
 }
 
@@ -106,6 +109,7 @@ pub struct Service {
     limits: Limits,
     shared: Arc<Shared>,
     apply_budget: Arc<MergeMemoryBudget>,
+    lookup_budget: Option<Arc<MergeMemoryBudget>>,
 }
 
 struct Pending {
@@ -334,11 +338,15 @@ impl Service {
             layout.group_for_bucket(shard.bucket)?;
         }
         ensure!(
-            spec.is_none() || (mixed && shard.is_some()),
-            "generic turns require an explicit mixed shard"
+            spec.is_none() || shard.is_some(),
+            "generic turns require an explicit shard"
         );
         let schema = if let Some(spec) = spec {
-            shard.unwrap().turn_schema(spec, limits)?
+            if mixed {
+                shard.unwrap().turn_schema(spec, limits)?
+            } else {
+                single_body::wire_schema(spec, limits, shard.unwrap())?
+            }
         } else if let Some(shard) = shard {
             shard.wire_schema(limits, mixed)?
         } else if mixed {
@@ -347,7 +355,11 @@ impl Service {
             wire::schema(limits)
         };
         let contract = if let Some(spec) = spec {
-            shard.unwrap().turn_contract(&binding, spec, limits)?
+            if mixed {
+                shard.unwrap().turn_contract(&binding, spec, limits)?
+            } else {
+                single_body::contract(&binding, spec, limits, shard.unwrap())?
+            }
         } else if let Some(shard) = shard {
             shard.contract(&binding, limits, mixed)?
         } else if mixed {
@@ -363,6 +375,18 @@ impl Service {
         ensure!(!Arc::ptr_eq(&budget, apply_budget)
             && decode_workspace(&contract, limits, contract.max_record_bytes as usize)? <= apply_budget.limit(),
             "annotation apply needs independent reserved workspace so waiting uploads cannot block it");
+        if let Some(spec) = spec.filter(|_| !mixed) {
+            let (frames, lookup) = single_body::budget_parts(apply_budget.limit())?;
+            ensure!(decode_workspace(&contract, limits, contract.max_record_bytes as usize)? <= frames,
+                "single body record exceeds frame workspace after reserving historical lookup capacity");
+            ensure!(
+                spec.lookup_workspace(std::iter::repeat_n(
+                    limits.value_bytes,
+                    contract.max_rows as usize
+                ))? <= lookup,
+                "single body maximum key batch exceeds reserved historical lookup capacity"
+            );
+        }
         Ingress::connect_with_schema(client, layout, binding, budget, contract, schema).await
     }
 
@@ -388,6 +412,18 @@ impl Service {
         let (base, snapshot) = checkpoint::open(&ingress, storage, body.as_ref(), bucket).await?;
         let narrow_schema: arrow_schema::Schema = base.schema().into();
         let stored_spec = crate::turn_ingestion::TurnIngestionSpec::from_schema(&narrow_schema)?;
+        let immutable = single_body::is_schema(&ingress.schema);
+        // Read-ahead must not occupy the capacity needed to apply its own head.
+        // These two budgets partition, rather than increase, configured apply memory.
+        let (apply_budget, lookup_budget) = if immutable {
+            let (frames, lookup) = single_body::budget_parts(apply_budget.limit())?;
+            (
+                MergeMemoryBudget::new(frames),
+                Some(MergeMemoryBudget::new(lookup)),
+            )
+        } else {
+            (apply_budget, None)
+        };
         ensure!(
             stored_spec.as_ref().map(|s| s.fingerprint()).transpose()?
                 == ingress
@@ -398,14 +434,26 @@ impl Service {
             "selected narrow table has a foreign ingestion specification"
         );
         ensure!(
-            body.is_some() == (ingress.scope.contract.policy == WritePolicy::TurnIngestion),
+            body.is_some()
+                == (ingress.scope.contract.policy == WritePolicy::TurnIngestion && !immutable),
             "body storage differs from the ingestion contract"
         );
         if let Some(storage) = &body {
             mixed::open_body(storage, &base, &ingress.scope.incarnation.to_string()).await?;
         }
         let through = snapshot.through;
-        let staging = AnnotationStaging::new(
+        let constructor = if immutable {
+            AnnotationStaging::new_immutable_body
+        } else {
+            AnnotationStaging::new
+        };
+        if immutable {
+            ensure!(
+                narrow_schema == *single_body::storage_schema(ingress.turn_spec.as_ref().unwrap())?,
+                "foreign full body schema"
+            );
+        }
+        let staging = constructor(
             base,
             StagingScope {
                 table_instance: ingress.scope.incarnation.to_string(),
@@ -427,6 +475,7 @@ impl Service {
             shard,
             limits,
             apply_budget,
+            lookup_budget,
             shared: Arc::new(Shared {
                 narrow: storage.clone(),
                 body,
@@ -445,6 +494,7 @@ impl Service {
                 apply_attempts: std::sync::atomic::AtomicU64::new(0),
                 progress,
                 reclamation: Mutex::new(Default::default()),
+                body_lookups: Mutex::new(Default::default()),
                 phases: Arc::default(),
             }),
         };
@@ -637,7 +687,14 @@ impl Service {
         let bucket = self.bucket();
         let spec = self.ingress.turn_spec.clone();
         tokio::task::spawn_blocking(move || {
-            let decoded = if mixed {
+            let decoded = if single_body::is_schema(&schema) {
+                single_body::decode(
+                    body.clone(),
+                    schema,
+                    upload.scope.contract.max_rows,
+                    value_bytes,
+                )?
+            } else if mixed {
                 mixed::wire::decode(
                     body.clone(),
                     schema,
@@ -1020,6 +1077,58 @@ impl Driver {
             }
         }
         let pending = self.pending.as_ref().unwrap();
+        let missing_body_lookup = service.is_single_body()
+            && match &pending.decoded {
+                mixed::Decoded::Creates { rows, .. } => {
+                    self.lookup.bodies.as_ref().is_none_or(|lookup| {
+                        rows.iter().any(|row| lookup.keys.get(&row.turn).is_none())
+                    })
+                }
+                _ => true,
+            };
+        if missing_body_lookup {
+            self.lookup.bodies = None;
+            let mut keys = Vec::new();
+            for record in std::iter::once(pending).chain(self.lookahead.iter()) {
+                let mixed::Decoded::Creates { rows, .. } = &record.decoded else {
+                    bail!("immutable body cannot contain patches")
+                };
+                keys.extend(rows.iter().map(|row| row.turn.as_str()));
+            }
+            self.lookup.bodies = service.lookup_bodies(&keys).await?;
+            if self.lookup.bodies.is_none() && !self.lookahead.is_empty() {
+                // A head-only query must also release future decoded inputs.
+                // Otherwise they can keep native admission full when no
+                // applied prefix exists for the publisher to drain. Restore
+                // their already validated metadata in order before dropping
+                // bodies/reservations; neither the page cut nor ACK advances.
+                let page = self
+                    .source_page
+                    .as_mut()
+                    .context("lookahead lost its committed source page")?;
+                while let Some(record) = self.lookahead.pop_back() {
+                    page.entries.insert(0, (record.index, record.meta));
+                }
+                let mixed::Decoded::Creates { rows, .. } = &pending.decoded else {
+                    unreachable!()
+                };
+                let keys = rows.iter().map(|row| row.turn.as_str()).collect::<Vec<_>>();
+                self.lookup.bodies = service.lookup_bodies(&keys).await?;
+            }
+            if self.lookup.bodies.is_none() {
+                service
+                    .shared
+                    .progress
+                    .send_modify(|p| p.backpressure = Some(ApplyBackpressure::ApplyMemory));
+                return Ok(());
+            }
+            service
+                .shared
+                .body_lookups
+                .lock()
+                .unwrap()
+                .record(self.lookup.bodies.as_ref().unwrap().keys.observation());
+        }
         let _ordered = service.shared.ordered.lock().await;
         if !service.shared.window.lock().unwrap().admits(&pending.meta) {
             service
@@ -1048,79 +1157,92 @@ impl Driver {
             .shared
             .apply_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let applied = match &pending.decoded {
-            mixed::Decoded::Patches(rows) => {
-                let mutations = rows
-                    .iter()
-                    .map(|m| Mutation {
-                        turn: &m.turn,
-                        patch: &m.patch,
-                    })
-                    .collect::<Vec<_>>();
-                service
-                    .shared
-                    .phases
-                    .measure(Phase::AnnotationPatch, async {
-                        match &self.lookup.patches {
-                            Some(lookup) => {
-                                service
-                                    .shared
-                                    .staging
-                                    .apply_committed_with_lookup(
-                                        after,
-                                        pending.index,
-                                        &mutations,
-                                        lookup,
-                                    )
-                                    .await
-                            }
-                            _ => {
-                                service
-                                    .shared
-                                    .staging
-                                    .apply_committed(after, pending.index, &mutations)
-                                    .await
-                            }
-                        }
-                    })
-                    .await?
+        let applied = if service.is_single_body() {
+            match service
+                .apply_bodies(after, pending, self.lookup.bodies.as_ref().unwrap())
+                .await?
+            {
+                Some(applied) => applied,
+                None => {
+                    self.lookup.bodies = None;
+                    return Ok(());
+                }
             }
-            mixed::Decoded::Creates { rows, .. } => {
-                let registrations = rows
-                    .iter()
-                    .map(|r| lance_context_core::annotation_staging::Registration {
-                        turn: &r.turn,
-                        rollout_id: &r.rollout_id,
-                        annotation: &r.annotation,
-                    })
-                    .collect::<Vec<_>>();
-                service
-                    .shared
-                    .phases
-                    .measure(Phase::AnnotationCreate, async {
-                        match &self.lookup.registrations {
-                            Some(lookup) => {
-                                service
-                                    .shared
-                                    .staging
-                                    .register_committed_with_lookup(
-                                        after,
-                                        pending.index,
-                                        &registrations,
-                                        lookup,
-                                    )
-                                    .await
+        } else {
+            match &pending.decoded {
+                mixed::Decoded::Patches(rows) => {
+                    let mutations = rows
+                        .iter()
+                        .map(|m| Mutation {
+                            turn: &m.turn,
+                            patch: &m.patch,
+                        })
+                        .collect::<Vec<_>>();
+                    service
+                        .shared
+                        .phases
+                        .measure(Phase::AnnotationPatch, async {
+                            match &self.lookup.patches {
+                                Some(lookup) => {
+                                    service
+                                        .shared
+                                        .staging
+                                        .apply_committed_with_lookup(
+                                            after,
+                                            pending.index,
+                                            &mutations,
+                                            lookup,
+                                        )
+                                        .await
+                                }
+                                _ => {
+                                    service
+                                        .shared
+                                        .staging
+                                        .apply_committed(after, pending.index, &mutations)
+                                        .await
+                                }
                             }
-                            _ => {
-                                service
-                                    .shared
-                                    .staging
-                                    .register_committed(after, pending.index, &registrations)
-                                    .await
+                        })
+                        .await?
+                }
+                mixed::Decoded::Creates { rows, .. } => {
+                    let registrations = rows
+                        .iter()
+                        .map(|r| lance_context_core::annotation_staging::Registration {
+                            turn: &r.turn,
+                            rollout_id: &r.rollout_id,
+                            annotation: &r.annotation,
+                        })
+                        .collect::<Vec<_>>();
+                    service
+                        .shared
+                        .phases
+                        .measure(Phase::AnnotationCreate, async {
+                            match &self.lookup.registrations {
+                                Some(lookup) => {
+                                    service
+                                        .shared
+                                        .staging
+                                        .register_committed_with_lookup(
+                                            after,
+                                            pending.index,
+                                            &registrations,
+                                            lookup,
+                                        )
+                                        .await
+                                }
+                                _ => {
+                                    service
+                                        .shared
+                                        .staging
+                                        .register_committed(after, pending.index, &registrations)
+                                        .await
+                                }
                             }
-                        }
-                    })
-                    .await?
+                        })
+                        .await?
+                }
             }
         };
         let result = match applied {

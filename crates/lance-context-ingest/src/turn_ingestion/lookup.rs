@@ -13,7 +13,6 @@ use std::{
 
 const MAX_KEY_BYTES: usize = 64 << 10;
 const SCAN_BATCH_ROWS: usize = 2048;
-
 #[cfg(test)]
 mod tests;
 
@@ -24,6 +23,7 @@ mod tests;
 #[derive(Clone, Debug, Default)]
 pub struct TurnLookupObservation {
     pub requested_keys: usize,
+    pub staged_keys: usize,
     pub scans_started: u64,
     pub projected_rows: u64,
     pub projected_array_bytes: u64,
@@ -46,6 +46,13 @@ pub struct TurnLookup {
     keys: BTreeMap<String, bool>,
     observation: TurnLookupObservation,
     _workspace: MergeReservation,
+}
+
+/// A bounded input window, before capturing the base and doing any native I/O.
+pub(crate) struct PreparedTurnLookup {
+    pub(crate) keys: BTreeMap<String, bool>,
+    workspace: MergeReservation,
+    started: Instant,
 }
 
 impl TurnLookup {
@@ -97,13 +104,12 @@ impl TurnIngestionSpec {
     /// the number of requested keys. All hits end the scan early; misses require
     /// exhausting it. This existence query is not a historical uniqueness audit.
     ///
+    /// `None` means workspace was not admitted, not that keys are absent. It
+    /// never waits for admission while ordered apply holds other resources.
     /// Membership alone does not deduplicate concurrent writes. The caller must
     /// retain its protected read view and validate [`TurnLookup::matches`] before
     /// ordered application; this helper does not fence publication or file GC.
     /// Native scan errors propagate rather than becoming negative lookups.
-    ///
-    /// `None` means workspace was not admitted, not that keys are absent. It
-    /// never waits for admission while ordered apply holds other resources.
     /// Lance scan/decoder workspace requires separate caller admission.
     pub async fn lookup_existing(
         &self,
@@ -111,16 +117,21 @@ impl TurnIngestionSpec {
         keys: &[&str],
         workspace: &Arc<MergeMemoryBudget>,
     ) -> Result<Option<TurnLookup>> {
+        let Some(prepared) = self.prepare_lookup(keys, workspace)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.lookup_prepared(base, prepared).await?))
+    }
+
+    pub(crate) fn prepare_lookup(
+        &self,
+        keys: &[&str],
+        workspace: &Arc<MergeMemoryBudget>,
+    ) -> Result<Option<PreparedTurnLookup>> {
         if keys.is_empty() {
             return Ok(None);
         }
         let started = Instant::now();
-        let actual = arrow_schema::Schema::from(base.schema());
-        ensure!(
-            actual == *self.body_schema
-                || actual == *crate::annotations::single_body::storage_schema(self)?,
-            "body lookup schema differs from its ingestion specification"
-        );
         ensure!(
             keys.iter()
                 .all(|key| !key.is_empty() && key.len() <= MAX_KEY_BYTES),
@@ -133,12 +144,50 @@ impl TurnIngestionSpec {
         let Some(reservation) = workspace.try_reserve(bytes) else {
             return Ok(None);
         };
-        let mut requested = keys
-            .iter()
-            .map(|key| ((*key).to_owned(), false))
-            .collect::<BTreeMap<_, _>>();
+        Ok(Some(PreparedTurnLookup {
+            keys: keys.iter().map(|key| ((*key).to_owned(), false)).collect(),
+            workspace: reservation,
+            started,
+        }))
+    }
+
+    pub(crate) async fn lookup_prepared(
+        &self,
+        base: Arc<Dataset>,
+        prepared: PreparedTurnLookup,
+    ) -> Result<TurnLookup> {
+        ensure!(
+            arrow_schema::Schema::from(base.schema()) == *self.body_schema
+                || arrow_schema::Schema::from(base.schema())
+                    == *crate::annotations::single_body::storage_schema(self)?,
+            "body lookup schema differs from its ingestion specification"
+        );
+        let PreparedTurnLookup {
+            keys: mut requested,
+            workspace: reservation,
+            started,
+        } = prepared;
+        let staged_keys = requested.values().filter(|present| **present).count();
+        let mut remaining = requested.len() - staged_keys;
+        let mut observation = TurnLookupObservation {
+            requested_keys: requested.len(),
+            staged_keys,
+            ..Default::default()
+        };
+        if remaining == 0 {
+            observation.elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
+            return Ok(TurnLookup {
+                base,
+                keys: requested,
+                observation,
+                _workspace: reservation,
+            });
+        }
         let mut column_values = vec![BTreeSet::new(); self.primary_key.len()];
-        for key in requested.keys() {
+        for (key, present) in &requested {
+            if *present {
+                continue;
+            }
             for (values, value) in column_values.iter_mut().zip(self.key_values(key)?) {
                 values.insert(value.into_owned());
             }
@@ -169,12 +218,7 @@ impl TurnIngestionSpec {
         scan.batch_size(SCAN_BATCH_ROWS)
             .batch_readahead(1)
             .fragment_readahead(1);
-        let mut observation = TurnLookupObservation {
-            requested_keys: requested.len(),
-            scans_started: 1,
-            ..Default::default()
-        };
-        let mut remaining = requested.len();
+        observation.scans_started = 1;
         // Keep the scanner's plan so an all-hit early exit can report work
         // without polling to EOF just to trigger its completion callback.
         // Preserve Scanner::execution_options and the logical schema adapter.
@@ -238,11 +282,11 @@ impl TurnIngestionSpec {
         observation.rows_scanned = stats.all_counts.get("rows_scanned").copied();
         observation.task_wait_time_ns = stats.all_times.get("task_wait_time").copied();
         observation.elapsed_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
-        Ok(Some(TurnLookup {
+        Ok(TurnLookup {
             base,
             keys: requested,
             observation,
             _workspace: reservation,
-        }))
+        })
     }
 }

@@ -1,5 +1,6 @@
 //! Read a small admitted prefix without advancing any application position.
 use super::*;
+use lance_context_wal::replication::runtime::client::payload_memory;
 
 const MAX_REQUESTS: usize = 8;
 // Match one core cold-lookup window. Bodies stay in their original requests;
@@ -12,6 +13,7 @@ const MAX_PAYLOAD_BYTES: u64 = 32 << 20;
 pub(super) struct Lookup {
     pub(super) registrations: Option<RegistrationLookup>,
     pub(super) patches: Option<PatchLookup>,
+    pub(super) bodies: Option<single_body::Lookup>,
 }
 
 pub(super) async fn fetch(
@@ -52,14 +54,20 @@ pub(super) async fn fetch(
                         .client
                         .request_routed(Request::Fetch { group, index }),
                 )
-                .await?;
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error) if error.is::<payload_memory::Unavailable>() => return Ok(None),
+                Err(error) => return Err(error),
+            };
             ensure!(
                 matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
                 "committed annotation payload unavailable"
             );
-            // runtime::client::receive allocates vec![0; bytes] for each body;
-            // this is a complete allocation, unlike a caller's Bytes slice.
-            (response.body, Some(bytes))
+            // RPC reception owns this complete payload allocation, unlike a
+            // caller's Bytes slice. A configured pool follows its shared owner.
+            let capacity = response.body_capacity();
+            (response.body, Some(capacity))
         }
     };
     meta.check_body_length(body.len(), ingress.scope.contract.max_record_bytes as usize)?;
@@ -92,7 +100,9 @@ pub(super) async fn fetch(
             .phases
             .measure(Phase::AnnotationDecode, async {
                 tokio::task::spawn_blocking(move || -> Result<Pending> {
-                    let decoded = if mixed {
+                    let decoded = if single_body::is_schema(&schema) {
+                        single_body::decode(body, schema, max_rows, value_bytes)?
+                    } else if mixed {
                         mixed::wire::decode(body, schema, max_rows, value_bytes)?
                     } else {
                         mixed::Decoded::Patches(wire::decode(body, schema, max_rows, value_bytes)?)
@@ -118,6 +128,28 @@ pub(super) async fn prepare(
     page: &mut lance_context_wal::replication::Page,
     queued: &mut VecDeque<Pending>,
 ) -> Result<Lookup> {
+    if service.is_single_body() {
+        // Accumulate whole admitted records, rather than repeatedly scanning
+        // history for arbitrary 2048-key chunks. The apply budget bounds frames
+        // and the subsequent shared key-only query independently.
+        let mut bytes = head.meta.body_bytes;
+        while queued.len() + 1 < MAX_REQUESTS && bytes < MAX_PAYLOAD_BYTES {
+            let Some((index, meta)) = page.entries.first().cloned() else {
+                break;
+            };
+            if meta.body_bytes > MAX_PAYLOAD_BYTES - bytes {
+                break;
+            }
+            let Some(next) = fetch(service, index, meta).await? else {
+                break;
+            };
+            bytes += next.meta.body_bytes;
+            queued.push_back(next);
+            page.entries.remove(0);
+        }
+        // Driver refreshes this on stale-base detection as well as initially.
+        return Ok(Lookup::default());
+    }
     if head.meta.body_bytes > MAX_PAYLOAD_BYTES
         || head.decoded.rows() > MAX_ROWS
         || !service.shared.window.lock().unwrap().admits(&head.meta)
@@ -204,5 +236,6 @@ pub(super) async fn prepare(
     Ok(Lookup {
         registrations,
         patches,
+        bodies: None,
     })
 }
