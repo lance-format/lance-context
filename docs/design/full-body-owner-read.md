@@ -6,10 +6,19 @@ application's existing authentication boundary, as with annotation RPCs.
 Trusted deployment configuration supplies owner addresses.
 
 The JSON request is `{"turn":"<business key>"}`. Construct that key with the
-same `TurnIngestionSpec::business_key` or `row_key` used by ingestion. A
+public `TurnIngestionSpec::business_key` used by ingestion. A
 composite key includes every primary-key field; a physical Lance row ID is
 not a business key. Forwarders route using the spec's session field and the
 persisted shard layout.
+
+For a spec whose primary key is `(session_id, id)`, call
+`spec.business_key(&[session_id, id], limits.value_bytes)`. The public decoder
+`http::annotations::full_body::decode(bytes, &spec, &key)` verifies the exact
+original schema, one-batch/one-row shape, valid non-null required fields and the
+complete requested key. Bound the HTTP response and admit input/decode workspace
+before receiving it; retain that admission while using the decoded batch.
+Uncompressed binary values can share input buffers, while alignment repair may
+allocate. Decode only a successful Arrow response; 204 denotes absence.
 
 A successful response is an Arrow IPC file containing exactly one row with
 the original user schema, with `Content-Type: application/vnd.apache.arrow.file`
