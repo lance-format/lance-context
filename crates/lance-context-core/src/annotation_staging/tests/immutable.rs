@@ -149,6 +149,10 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
     assert_eq!(before_install.applied, 2);
     assert_eq!(before_install.active_entries, 1);
     assert_eq!(before_install.frozen_entries, 2);
+    assert_eq!(before_install.immutable_apply.batches, 2);
+    assert_eq!(before_install.immutable_apply.rows, 5);
+    assert_eq!(before_install.immutable_apply.inserted_rows, 3);
+    assert_eq!(before_install.immutable_apply.duplicate_rows, 2);
     staging
         .install_published(&prepared, selected.clone())
         .await?;
@@ -176,6 +180,10 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         None
     );
     assert_eq!(staging.observation().await.applied, 2);
+    assert_eq!(
+        staging.observation().await.immutable_apply,
+        before_install.immutable_apply
+    );
     // Covered staged results are exercised across publication below.
     let refreshed = staging
         .try_capture_immutable_base_with_staged(&mut known)
@@ -226,6 +234,7 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
     // replay still publishes request results, without another data fragment.
     let recovered =
         AnnotationStaging::new_immutable_body(selected.clone(), scope(), 2, Limits::default())?;
+    assert_eq!(recovered.observation().await.immutable_apply.batches, 0);
     let base = recovered.capture_immutable_base().await?;
     let mut duplicates = request(&["a", "b", "c"]);
     for row in &mut duplicates {
@@ -254,6 +263,9 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         selected.manifest().fragments
     );
     recovered.install_published(&prepared, published).await?;
+    let applied = recovered.observation().await.immutable_apply;
+    assert_eq!((applied.batches, applied.rows), (1, 3));
+    assert_eq!((applied.inserted_rows, applied.duplicate_rows), (0, 3));
     assert_eq!(recovered.observation().await.materialized, 3);
     assert!(recovered.capture("a").await.is_err());
     assert!(recovered
@@ -291,6 +303,7 @@ async fn frozen_body_handles_keep_admission_bounded() -> Result<()> {
         Some(ApplyOutcome::Applied)
     );
     let frozen = staging.freeze(uuid::Uuid::new_v4()).await?.unwrap();
+    let applied = staging.observation().await.immutable_apply;
     assert_eq!(
         staging
             .register_immutable_committed(1, 2, &request(&["c"]), &lookup)
@@ -298,6 +311,7 @@ async fn frozen_body_handles_keep_admission_bounded() -> Result<()> {
         Some(ApplyOutcome::Backpressure)
     );
     assert_eq!(staging.observation().await.applied, 1);
+    assert_eq!(staging.observation().await.immutable_apply, applied);
     assert!(staging.freeze(uuid::Uuid::new_v4()).await.is_err());
     let batch = Arc::new(bodies(&["a", "b"])?);
     let workspace = crate::MergeMemoryBudget::new(8 << 20);
@@ -315,11 +329,22 @@ async fn frozen_body_handles_keep_admission_bounded() -> Result<()> {
         Some(ApplyOutcome::Backpressure)
     );
     drop((frozen, prepared));
+    assert_eq!(staging.observation().await.immutable_apply, applied);
     assert_eq!(
         staging
             .register_immutable_committed(1, 2, &request(&["c"]), &lookup)
             .await?,
         Some(ApplyOutcome::Applied)
     );
+    let applied = staging.observation().await.immutable_apply;
+    assert_eq!((applied.batches, applied.rows), (2, 3));
+    assert_eq!((applied.inserted_rows, applied.duplicate_rows), (3, 0));
+    assert!(matches!(
+        staging
+            .register_immutable_committed(2, 3, &[], &lookup)
+            .await?,
+        Some(ApplyOutcome::Rejected(_))
+    ));
+    assert_eq!(staging.observation().await.immutable_apply, applied);
     Ok(())
 }

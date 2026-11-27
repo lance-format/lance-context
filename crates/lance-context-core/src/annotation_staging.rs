@@ -143,6 +143,7 @@ struct State {
     immutable_publications: Arc<()>,
     immutable_lookup_reused: u64,
     immutable_lookup_invalidated: u64,
+    immutable_apply: ImmutableApplyObservation,
     views: views::Registry,
     applied: u64,
     materialized: u64,
@@ -197,6 +198,7 @@ pub struct Observation {
     /// Includes plain captures, uncovered publications and foreign lineages.
     /// Process-local; a rejected attempt does not advance the applied cut.
     pub immutable_lookup_invalidated: u64,
+    pub immutable_apply: ImmutableApplyObservation,
     /// Locally installed base, captured with materialized under one state lock.
     /// May lag a committed/selected publication. Not a selection or GC proof.
     pub installed_base: InstalledBase,
@@ -209,6 +211,22 @@ pub struct Observation {
     /// Data admission cannot occupy this reserve and prevent its own flush.
     pub retained_metadata_bytes: usize,
     pub readers: usize,
+}
+
+/// Successful immutable-body registrations in this staging instance. Updated
+/// atomically with the applied cut, before publication or source retirement.
+/// Rejected, stale and backpressured attempts do not count. Request replays
+/// resolved before registration do not count. Reconstruction resets totals;
+/// applying a recovered WAL suffix counts its actual registrations again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ImmutableApplyObservation {
+    pub batches: u64,
+    /// Input rows, including repeated keys within a batch.
+    pub rows: u64,
+    pub inserted_rows: u64,
+    /// Rows skipped because their key already exists in the captured lookup,
+    /// active/frozen staging, or an earlier row of this same atomic batch.
+    pub duplicate_rows: u64,
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -306,6 +324,7 @@ impl AnnotationStaging {
                 immutable_publications: Arc::new(()),
                 immutable_lookup_reused: 0,
                 immutable_lookup_invalidated: 0,
+                immutable_apply: ImmutableApplyObservation::default(),
                 base,
                 views,
                 applied: materialized,
@@ -717,6 +736,7 @@ impl AnnotationStaging {
             materialized: state.materialized,
             immutable_lookup_reused: state.immutable_lookup_reused,
             immutable_lookup_invalidated: state.immutable_lookup_invalidated,
+            immutable_apply: state.immutable_apply.clone(),
             installed_base: InstalledBase {
                 source: self.scope.clone(),
                 version: state.base.version_id(),

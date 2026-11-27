@@ -121,7 +121,6 @@ impl Faults {
         (observed, resume)
     }
 
-    #[cfg(feature = "http")]
     pub fn pause_data_write(&self) -> (oneshot::Receiver<Path>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (resume, waiting) = oneshot::channel();
