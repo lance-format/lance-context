@@ -6827,6 +6827,7 @@ mod tests {
                 version: worker.manifest.version,
                 with_deletions: true,
                 e_tag: worker.manifest_location.e_tag.as_deref(),
+                identity: worker.manifest_location.identity.as_deref(),
             };
             assert!(
                 worker
