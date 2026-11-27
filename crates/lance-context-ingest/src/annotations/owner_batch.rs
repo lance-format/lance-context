@@ -98,7 +98,6 @@ struct Segment {
     ram: Vec<Survivors>,
     ram_bytes: usize,
     rows: u64,
-    records: u64,
     metas: BTreeMap<u64, BatchMeta>,
 }
 
@@ -155,7 +154,6 @@ impl WriteBatch {
     /// replays the WAL from the last publication and rebuilds the list.
     pub fn record(&mut self, survivors: Survivors) -> Result<()> {
         self.active.rows += survivors.rows.len() as u64;
-        self.active.records += 1;
         if !survivors.rows.is_empty() {
             self.active.metas.insert(survivors.index, survivors.meta.clone());
         }
