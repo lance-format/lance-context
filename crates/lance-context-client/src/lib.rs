@@ -34,7 +34,13 @@ impl RemoteContextStore {
         let client = ContextClient::new(base_url);
         let info = match client.get_context(&req.name).await {
             Ok(info) => info,
-            Err(ClientError::Api { status: 404, .. }) => client.create_context(req).await?,
+            Err(ClientError::Api { status: 404, .. }) => match client.create_context(req).await {
+                Ok(info) => info,
+                Err(ClientError::Api {
+                    status: 409, code, ..
+                }) if code == "ALREADY_EXISTS" => client.get_context(&req.name).await?,
+                Err(e) => return Err(e),
+            },
             Err(e) => return Err(e),
         };
         Ok(Self {
@@ -276,7 +282,15 @@ impl RemoteRolloutStore {
         let client = ContextClient::new(base_url);
         let info = match client.get_rollout_store(&req.name).await {
             Ok(info) => info,
-            Err(ClientError::Api { status: 404, .. }) => client.create_rollout_store(req).await?,
+            Err(ClientError::Api { status: 404, .. }) => {
+                match client.create_rollout_store(req).await {
+                    Ok(info) => info,
+                    Err(ClientError::Api {
+                        status: 409, code, ..
+                    }) if code == "ALREADY_EXISTS" => client.get_rollout_store(&req.name).await?,
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) => return Err(e),
         };
         Ok(Self {
@@ -398,7 +412,15 @@ impl RemoteGenericStore {
         let client = ContextClient::new(base_url);
         let info = match client.get_generic_store(&req.name).await {
             Ok(info) => info,
-            Err(ClientError::Api { status: 404, .. }) => client.create_generic_store(req).await?,
+            Err(ClientError::Api { status: 404, .. }) => {
+                match client.create_generic_store(req).await {
+                    Ok(info) => info,
+                    Err(ClientError::Api {
+                        status: 409, code, ..
+                    }) if code == "ALREADY_EXISTS" => client.get_generic_store(&req.name).await?,
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) => return Err(e),
         };
         Ok(Self {
@@ -514,7 +536,15 @@ impl RemoteDatagenStore {
         let client = ContextClient::new(base_url);
         let info = match client.get_datagen_store(&req.name).await {
             Ok(info) => info,
-            Err(ClientError::Api { status: 404, .. }) => client.create_datagen_store(req).await?,
+            Err(ClientError::Api { status: 404, .. }) => {
+                match client.create_datagen_store(req).await {
+                    Ok(info) => info,
+                    Err(ClientError::Api {
+                        status: 409, code, ..
+                    }) if code == "ALREADY_EXISTS" => client.get_datagen_store(&req.name).await?,
+                    Err(e) => return Err(e),
+                }
+            }
             Err(e) => return Err(e),
         };
         Ok(Self {
