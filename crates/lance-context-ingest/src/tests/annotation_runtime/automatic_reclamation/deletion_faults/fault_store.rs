@@ -47,6 +47,7 @@ pub(in crate::tests) struct Faults {
     remote: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     index_write: Mutex<Option<PausedIndexWrite>>,
     data_write: Mutex<Option<PausedIndexWrite>>,
+    data_read: Mutex<Option<PausedIndexWrite>>,
 }
 
 #[derive(Debug)]
@@ -71,6 +72,21 @@ struct FailedListing {
 }
 
 impl Faults {
+    #[cfg(all(feature = "service", feature = "http-client"))]
+    pub fn pause_data_read(&self) -> (oneshot::Receiver<Path>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (resume, waiting) = oneshot::channel();
+        assert!(self
+            .data_read
+            .lock()
+            .unwrap()
+            .replace(PausedIndexWrite {
+                entered,
+                resume: waiting
+            })
+            .is_none());
+        (observed, resume)
+    }
     pub(super) fn with_azure_delete(store: Arc<dyn ObjectStore>) -> Self {
         let mut faults = Self::default();
         faults.azure_delete = Some(store);
@@ -371,6 +387,13 @@ impl ObjectStore for FaultStore {
         }))
     }
     async fn get_opts(&self, path: &Path, opts: GetOptions) -> object_store::Result<GetResult> {
+        if path.as_ref().contains("/data/") {
+            let pause = self.faults.data_read.lock().unwrap().take();
+            if let Some(pause) = pause {
+                let _ = pause.entered.send(path.clone());
+                pause.resume.await.map_err(|_| failure())?;
+            }
+        }
         if !opts.head && path.as_ref().contains("/_versions/") {
             self.faults.manifest_reads.fetch_add(1, Ordering::Relaxed);
             self.faults.manifest_gets.lock().unwrap().push(path.clone());

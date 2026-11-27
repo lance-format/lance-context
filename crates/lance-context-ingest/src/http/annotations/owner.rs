@@ -36,6 +36,7 @@ impl Owner {
             .route("/api/v1/annotations/{table}/producer", post(open))
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
+            .route("/api/v1/annotations/{table}/read-body", post(read_body))
             .route(
                 "/api/v1/annotations/{table}/selected-body",
                 post(selected_body),
@@ -54,12 +55,36 @@ impl Owner {
         self.gate.shutdown().await;
     }
 
+    #[cfg(all(test, feature = "service", feature = "http-client"))]
+    pub(crate) async fn read_body_for_test(&self, request: Request) -> Response {
+        self.clone()
+            .dispatch(
+                self.service
+                    .ingress()
+                    .scope
+                    .contract
+                    .qualified_table
+                    .clone(),
+                request,
+                Operation::ReadBody,
+            )
+            .await
+    }
+
     async fn dispatch(self, table: String, request: Request, operation: Operation) -> Response {
         let version = request.version();
         let guard = match self.gate.enter(matches!(operation, Operation::Update)) {
             Ok(guard) => guard,
             Err(error) => return early(error, request.version()),
         };
+        // A cancelled body read may release its view immediately; writes keep
+        // their existing detached completion/reconciliation behavior below.
+        if matches!(operation, Operation::ReadBody) {
+            return match self.process(&table, request, operation).await {
+                Ok((response, reservation)) => hold_response(response, guard, reservation),
+                Err(error) => early(error, version),
+            };
+        }
         match tokio::spawn(async move {
             let (response, reservation) = self.process(&table, request, operation).await?;
             Ok::<_, Failure>(hold_response(response, guard, reservation))
@@ -221,13 +246,27 @@ impl Owner {
             )
                 .into_response()
         } else {
-            let maximum = if matches!(operation, Operation::Read | Operation::FilterStatus) {
+            let maximum = if matches!(
+                operation,
+                Operation::Read | Operation::ReadBody | Operation::FilterStatus
+            ) {
                 self.reply_limit
             } else {
                 32 << 10
             };
             let bytes = body::read(request, maximum, "application/json", options).await?;
             match operation {
+                Operation::ReadBody => {
+                    let query: PointRequest = serde_json::from_slice(&bytes)
+                        .map_err(|_| Failure::bad("invalid_body_read"))?;
+                    body_read::read(
+                        &self.service,
+                        query,
+                        self.recovery_cut,
+                        options.body_total_timeout,
+                    )
+                    .await?
+                }
                 Operation::Open => {
                     let open: ProducerOpen =
                         serde_json::from_slice(&bytes).map_err(|_| Failure::bad("invalid_open"))?;
@@ -374,6 +413,13 @@ async fn update(
 }
 async fn read(State(owner): State<Owner>, Path(table): Path<String>, request: Request) -> Response {
     owner.dispatch(table, request, Operation::Read).await
+}
+async fn read_body(
+    State(owner): State<Owner>,
+    Path(table): Path<String>,
+    request: Request,
+) -> Response {
+    owner.dispatch(table, request, Operation::ReadBody).await
 }
 async fn close(
     State(owner): State<Owner>,

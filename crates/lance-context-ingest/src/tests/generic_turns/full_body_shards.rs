@@ -1,5 +1,5 @@
 //! Two session shards of one logical full-body table. HTTP writes and selected
-//! manifests are real; unmaterialized body reads use the existing Service API.
+//! manifests and cross-ingress full-body reads use the real owner/forwarder RPC.
 //! Three local WAL nodes host two RF3 groups; this is not a scale benchmark.
 use super::http::{journal, keys, transport, Server};
 use super::*;
@@ -15,6 +15,8 @@ use crate::{
     materializer::{Acquisition, Options},
     tests::annotation_runtime::{automatic_reclamation::deletion_faults::fault_store, run_owner},
 };
+
+mod read_safety;
 
 struct Physical {
     binding: TableBinding,
@@ -154,7 +156,7 @@ fn body(session: &str, id: &str, value: u8) -> Result<RecordBatch> {
         ("id", Arc::new(StringArray::from(vec![id])) as ArrayRef),
         (
             "content",
-            Arc::new(LargeBinaryArray::from_iter_values([vec![value; 64 << 10]])) as ArrayRef,
+            Arc::new(LargeBinaryArray::from_iter_values([vec![value; 256 << 10]])) as ArrayRef,
         ),
     ])
     .map_err(Into::into)
@@ -167,6 +169,39 @@ async fn check(service: &Service, spec: &TurnIngestionSpec, expected: &RecordBat
         .await?
         .context("acknowledged body missing")?;
     assert_eq!(value.batch(), expected);
+    Ok(())
+}
+
+async fn http_check(
+    base: &reqwest::Url,
+    spec: &TurnIngestionSpec,
+    expected: &RecordBatch,
+) -> Result<()> {
+    let response = transport()?
+        .post(base.join(&format!(
+            "/api/v1/annotations/{}/read-body",
+            binding().qualified_table
+        ))?)
+        .json(&crate::http::annotations::PointRequest {
+            turn: spec.row_key(expected, 0, 4096)?,
+        })
+        .send()
+        .await?;
+    let status = response.status();
+    if status != reqwest::StatusCode::OK {
+        bail!("body read returned {status}: {}", response.text().await?);
+    }
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/vnd.apache.arrow.file"
+    );
+    let bytes = response.bytes().await?;
+    assert!(
+        bytes.len() > 128 << 10,
+        "exercise a body larger than narrow JSON replies"
+    );
+    let decoded = lance_context_wal::ipc::decode(bytes, spec.body_schema().clone())?;
+    assert_eq!(decoded, vec![expected.clone()]);
     Ok(())
 }
 
@@ -238,9 +273,11 @@ async fn exercise() -> Result<()> {
             storage,
         });
     }
-    let uploads = MergeMemoryBudget::new(8 << 20);
+    // Both HTTP layers share this test budget. Admit one owner's scan/output
+    // workspace plus the forwarding response for the 5 MiB record contract.
+    let uploads = MergeMemoryBudget::new(32 << 20);
     let (a, ra) = shards[0].owner(&c, &layout, &spec, uploads.clone()).await?;
-    let (b, rb) = shards[1].owner(&c, &layout, &spec, uploads).await?;
+    let (b, rb) = shards[1].owner(&c, &layout, &spec, uploads.clone()).await?;
     let oa = Owner::new(&ra, keys()?, Default::default())?;
     let ob = Owner::new(&rb, keys()?, Default::default())?;
     let server_a = Server::start(oa.router()).await?;
@@ -264,7 +301,21 @@ async fn exercise() -> Result<()> {
     let ingress_a = Server::start(first.router()).await?;
     let ingress_b = Server::start(second.router()).await?;
     let (entered, resume) = faults.pause_data_write();
-    let (_stop_a, task_a) = run_owner(ra);
+    let (pause_apply, pause_requested) = tokio::sync::oneshot::channel();
+    let (apply_paused, paused) = tokio::sync::oneshot::channel();
+    let task_a = tokio::spawn(async move {
+        let work = ra.run(std::future::pending());
+        tokio::pin!(work);
+        tokio::select! {
+            result = &mut work => result,
+            _ = pause_requested => {
+                let _ = apply_paused.send(());
+                // Retain the runtime without polling its applier/publisher.
+                // Aborting this task below still drops the real runtime.
+                std::future::pending::<Result<()>>().await
+            }
+        }
+    });
     let (stop_b, task_b) = run_owner(rb);
     let writer_a = shards[0]
         .client(
@@ -300,6 +351,47 @@ async fn exercise() -> Result<()> {
     tokio::time::timeout(DEADLINE, entered).await??;
     assert_eq!(other_a.selected_full_body().await?.rows, Some(0));
     check(&a, &spec, &input[0]).await?;
+    http_check(&ingress_b.base, &spec, &input[0]).await?;
+
+    // A confirmed miss and unavailable read admission are distinct HTTP results.
+    let missing = crate::http::annotations::PointRequest {
+        turn: spec.business_key(&[&sessions[0], "absent"], 4096)?,
+    };
+    let endpoint = ingress_b.base.join(&format!(
+        "/api/v1/annotations/{}/read-body",
+        binding().qualified_table
+    ))?;
+    assert_eq!(
+        transport()?
+            .post(endpoint.clone())
+            .json(&missing)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let held = read_safety::idle_budget(&uploads).await?;
+    assert_eq!(
+        transport()?
+            .post(endpoint.clone())
+            .json(&missing)
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(held);
+    http_check(&ingress_b.base, &spec, &input[0]).await?;
+    read_safety::admission_and_response_lifetime(
+        &oa,
+        &a,
+        &uploads,
+        &missing,
+        &crate::http::annotations::PointRequest {
+            turn: spec.row_key(&input[0], 0, 4096)?,
+        },
+    )
+    .await?;
 
     // Independent producer through the other ingress cannot replace a body
     // already visible in frozen staging, even with different payload bytes.
@@ -323,7 +415,27 @@ async fn exercise() -> Result<()> {
     assert_eq!(writer_b.selected_full_body().await?.rows, Some(1));
     assert_eq!(other_a.selected_full_body().await?.rows, Some(0));
     check(&b, &spec, &input[1]).await?;
+    http_check(&ingress_a.base, &spec, &input[1]).await?;
 
+    pause_apply.send(()).unwrap();
+    tokio::time::timeout(DEADLINE, paused).await??;
+    // Commit a later request without applying it. Reads of the acknowledged
+    // body wait only for this owner's acquisition cut, not the current WAL tail.
+    let pending = request(
+        &a,
+        &producer(&a, 4).await?,
+        1,
+        shards[0].wire(&spec, &input[0])?,
+    )
+    .await?;
+    let accepted = a.ingress().append(&pending).await?;
+    assert!(accepted.position.index > a.observation().await.0.applied);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        http_check(&ingress_b.base, &spec, &input[0]),
+    )
+    .await??;
+    drop(pending);
     // Kill A before its frozen upload completes. B must still accept and
     // materialize another body without A advancing its publication cut.
     task_a.abort();

@@ -4,7 +4,7 @@ use lance_context_core::annotation_staging::{ImmutableBodyRead, TurnBodySource};
 
 enum Hold {
     Staged { _row: mixed::frames::HeldRow },
-    Materialized { _reservation: MergeReservation },
+    Materialized,
 }
 
 /// Retain through response encoding. Staged data shares its original Arrow
@@ -13,6 +13,7 @@ pub struct Body {
     batch: RecordBatch,
     _hold: Hold,
     _view: ImmutableBodyRead,
+    _workspace: Option<MergeReservation>,
 }
 
 impl Body {
@@ -25,10 +26,38 @@ impl Service {
     /// Quorum barrier then local applied view. This read never scans WAL data
     /// and never consults an independently opened latest Lance snapshot.
     pub async fn get_full_body(&self, key: &str, deadline: Duration) -> Result<Option<Body>> {
+        self.read_full_body(key, None, deadline, None).await
+    }
+
+    /// The HTTP owner fences the result after encoding. Admit read and output
+    /// workspace together before entering, so response encoding never waits
+    /// for more credit while retaining a read from that same budget.
+    #[cfg(feature = "http")]
+    pub(crate) async fn get_full_body_owned(
+        &self,
+        key: &str,
+        recovery_cut: u64,
+        deadline: Duration,
+        workspace: MergeReservation,
+    ) -> Result<Option<Body>> {
+        self.read_full_body(key, Some(recovery_cut), deadline, Some(workspace))
+            .await
+    }
+
+    async fn read_full_body(
+        &self,
+        key: &str,
+        recovery_cut: Option<u64>,
+        deadline: Duration,
+        mut workspace: Option<MergeReservation>,
+    ) -> Result<Option<Body>> {
         ensure!(self.is_single_body(), "not a single body service");
         self.validate_turn(key)?;
         tokio::time::timeout(deadline, async {
-            let through = self.barrier().await?;
+            let through = match recovery_cut {
+                Some(cut) => cut,
+                None => self.barrier().await?,
+            };
             self.wait_through(through).await?;
             let (view, staged) = {
                 let _ordered = self.shared.ordered.lock().await;
@@ -47,10 +76,12 @@ impl Service {
                 let TurnBodySource::Materialized(base) = view.source() else {
                     bail!("body read lost its captured base")
                 };
-                let bytes = (self.ingress.scope.contract.max_record_bytes as usize)
-                    .checked_mul(3)
-                    .context("body read budget overflow")?;
-                let reservation = self.ingress.budget.reserve(bytes).await;
+                if workspace.is_none() {
+                    let bytes = (self.ingress.scope.contract.max_record_bytes as usize)
+                        .checked_mul(3)
+                        .context("body read budget overflow")?;
+                    workspace = Some(self.ingress.budget.reserve(bytes).await);
+                }
                 let spec = self.ingress.turn_spec.as_ref().unwrap();
                 let filter = spec
                     .primary_key()
@@ -84,12 +115,7 @@ impl Service {
                     found = Some(batch);
                 }
                 let Some(batch) = found else { return Ok(None) };
-                (
-                    batch,
-                    Hold::Materialized {
-                        _reservation: reservation,
-                    },
-                )
+                (batch, Hold::Materialized)
             };
             // Return the user's exact original schema, sharing all columns.
             let batch = RecordBatch::try_new(
@@ -105,6 +131,7 @@ impl Service {
                 batch,
                 _hold: hold,
                 _view: view,
+                _workspace: workspace,
             }))
         })
         .await
