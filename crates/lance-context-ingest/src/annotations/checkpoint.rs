@@ -12,26 +12,69 @@ use lance_context_wal::replication::publication as p;
 struct Encoded {
     version: u8,
     slots: u32,
-    // Sorted slot, accepted index, rejected row, rejection code. At most 37
-    // JSON bytes per entry even at the largest legal field values: all 16,384
-    // producers fit below 640 KiB, leaving room in the 1 MiB native descriptor cap.
+    // Version 1: sorted slot, latest rejected index, rejected row, rejection
+    // code. No producer identity and no earliest prefix rejection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rejected: Vec<(u32, u64, u32, u8)>,
+    // Version 2: base64 of a slot presence bitmap followed by one packed
+    // record per present slot (see `pack`). Carries both the latest exact
+    // rejection and the earliest unresolved rejection of the slot's producer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcomes: Option<String>,
+}
+
+/// Persisted outcome evidence for one producer slot.
+#[derive(Clone, Default)]
+pub(crate) struct SlotOutcome {
+    /// Producer generation that owns `sticky` (and produced `latest`).
+    generation: u64,
+    /// Latest exact rejection, as before version 2.
+    latest: Option<(u64, Rejection)>,
+    /// Earliest unresolved rejection of this producer generation. Never
+    /// overwritten by a later result; kept apart from `latest`.
+    sticky: Option<(u64, Rejection)>,
 }
 
 pub(crate) struct Snapshot {
     pub through: u64,
-    encoded: Encoded,
+    slots: u32,
+    /// Sorted by slot; only slots with some rejection evidence.
+    outcomes: Vec<(u32, SlotOutcome)>,
 }
+
+fn reason_code(reason: &RejectionReason) -> u8 {
+    match reason {
+        RejectionReason::InvalidPatch => 0,
+        RejectionReason::InvalidTurn => 1,
+        RejectionReason::MissingTurn => 2,
+        RejectionReason::ValueTooLarge => 3,
+        RejectionReason::BatchTooLarge => 4,
+    }
+}
+
+fn code_reason(code: u8) -> Result<RejectionReason> {
+    Ok(match code {
+        0 => RejectionReason::InvalidPatch,
+        1 => RejectionReason::InvalidTurn,
+        2 => RejectionReason::MissingTurn,
+        3 => RejectionReason::ValueTooLarge,
+        4 => RejectionReason::BatchTooLarge,
+        _ => bail!("invalid annotation rejection code"),
+    })
+}
+
+// Record layout: header u8 (bits 0-2 sticky code, 3-5 latest code, 6 has
+// latest, 7 has sticky), generation u64, then [index u64, row u16] for sticky
+// and for latest when present. At most 29 bytes; with the 2 KiB bitmap all
+// 16,384 slots encode to under 637 KB of base64, within MAX_RESULTS_BYTES.
+const RECORD_MAX: usize = 29;
 
 impl Snapshot {
     fn empty(slots: u32) -> Self {
         Self {
             through: 0,
-            encoded: Encoded {
-                version: 1,
-                slots,
-                rejected: Vec::new(),
-            },
+            slots,
+            outcomes: Vec::new(),
         }
     }
 
@@ -42,43 +85,169 @@ impl Snapshot {
         );
         let encoded: Encoded = serde_json::from_str(value)?;
         ensure!(
-            encoded.version == 1
-                && (1..=producer::MAX_SLOTS).contains(&encoded.slots)
-                && encoded.rejected.len() <= encoded.slots as usize
-                && encoded.rejected.windows(2).all(|w| w[0].0 < w[1].0)
-                && encoded.rejected.iter().all(|&(slot, index, row, reason)| {
-                    slot < encoded.slots
-                        && index > 0
-                        && index <= through
-                        && row < 65_536
-                        && reason < 5
-                }),
+            (1..=producer::MAX_SLOTS).contains(&encoded.slots),
             "invalid annotation result snapshot"
         );
-        Ok(Self { through, encoded })
+        let index_ok = |index: u64| index > 0 && index <= through;
+        let mut outcomes = Vec::new();
+        match encoded.version {
+            1 => {
+                ensure!(
+                    encoded.outcomes.is_none()
+                        && encoded.rejected.len() <= encoded.slots as usize
+                        && encoded.rejected.windows(2).all(|w| w[0].0 < w[1].0)
+                        && encoded.rejected.iter().all(|&(slot, index, row, _)| {
+                            slot < encoded.slots && index_ok(index) && row < 65_536
+                        }),
+                    "invalid annotation result snapshot"
+                );
+                for &(slot, index, row, code) in &encoded.rejected {
+                    outcomes.push((
+                        slot,
+                        SlotOutcome {
+                            generation: 0,
+                            latest: Some((
+                                index,
+                                Rejection {
+                                    row: row as usize,
+                                    reason: code_reason(code)?,
+                                },
+                            )),
+                            sticky: None,
+                        },
+                    ));
+                }
+            }
+            2 => {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                ensure!(encoded.rejected.is_empty(), "invalid annotation result snapshot");
+                let bytes = STANDARD.decode(
+                    encoded
+                        .outcomes
+                        .as_deref()
+                        .context("annotation result snapshot has no outcomes")?,
+                )?;
+                let bitmap = (encoded.slots as usize).div_ceil(8);
+                ensure!(bytes.len() >= bitmap, "truncated annotation result snapshot");
+                let (bits, mut rest) = bytes.split_at(bitmap);
+                fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+                    ensure!(rest.len() >= n, "truncated annotation result snapshot");
+                    let (head, tail) = rest.split_at(n);
+                    *rest = tail;
+                    Ok(head)
+                }
+                for slot in 0..encoded.slots {
+                    if bits[slot as usize / 8] & (1 << (slot % 8)) == 0 {
+                        continue;
+                    }
+                    let header = take(&mut rest, 1)?[0];
+                    let generation = u64::from_le_bytes(take(&mut rest, 8)?.try_into()?);
+                    let mut entry = |code: u8| -> Result<(u64, Rejection)> {
+                        let index = u64::from_le_bytes(take(&mut rest, 8)?.try_into()?);
+                        let row = u16::from_le_bytes(take(&mut rest, 2)?.try_into()?);
+                        ensure!(index_ok(index), "invalid annotation result index");
+                        Ok((
+                            index,
+                            Rejection {
+                                row: row as usize,
+                                reason: code_reason(code)?,
+                            },
+                        ))
+                    };
+                    let sticky = (header & 0x80 != 0)
+                        .then(|| entry(header & 7))
+                        .transpose()?;
+                    let latest = (header & 0x40 != 0)
+                        .then(|| entry((header >> 3) & 7))
+                        .transpose()?;
+                    ensure!(
+                        (sticky.is_some() || latest.is_some())
+                            && (sticky.is_none() || generation > 0),
+                        "invalid annotation slot outcome"
+                    );
+                    outcomes.push((
+                        slot,
+                        SlotOutcome {
+                            generation,
+                            latest,
+                            sticky,
+                        },
+                    ));
+                }
+                ensure!(
+                    rest.is_empty(),
+                    "trailing annotation result snapshot bytes"
+                );
+                // Bitmap padding bits beyond `slots` must be clear.
+                for slot in encoded.slots..(bitmap as u32 * 8) {
+                    ensure!(
+                        bits[slot as usize / 8] & (1 << (slot % 8)) == 0,
+                        "invalid annotation result bitmap"
+                    );
+                }
+            }
+            _ => bail!("unsupported annotation result snapshot version"),
+        }
+        Ok(Self {
+            through,
+            slots: encoded.slots,
+            outcomes,
+        })
+    }
+
+    pub(crate) fn encode(&self) -> Result<String> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let bitmap = (self.slots as usize).div_ceil(8);
+        let mut bytes = vec![0u8; bitmap];
+        bytes.reserve(self.outcomes.len() * RECORD_MAX);
+        for (slot, outcome) in &self.outcomes {
+            ensure!(*slot < self.slots, "result slot outside capacity");
+            bytes[*slot as usize / 8] |= 1 << (slot % 8);
+            let code = |e: &Option<(u64, Rejection)>| e.as_ref().map_or(0, |(_, r)| reason_code(&r.reason));
+            let header = code(&outcome.sticky)
+                | (code(&outcome.latest) << 3)
+                | ((outcome.latest.is_some() as u8) << 6)
+                | ((outcome.sticky.is_some() as u8) << 7);
+            bytes.push(header);
+            bytes.extend_from_slice(&outcome.generation.to_le_bytes());
+            for (index, rejection) in outcome.sticky.iter().chain(outcome.latest.iter()) {
+                bytes.extend_from_slice(&index.to_le_bytes());
+                bytes.extend_from_slice(&u16::try_from(rejection.row)?.to_le_bytes());
+            }
+        }
+        Ok(serde_json::to_string(&Encoded {
+            version: 2,
+            slots: self.slots,
+            rejected: Vec::new(),
+            outcomes: Some(STANDARD.encode(bytes)),
+        })?)
+    }
+
+    fn outcome(&self, slot: usize) -> Option<&SlotOutcome> {
+        let row = self
+            .outcomes
+            .binary_search_by_key(&(slot as u32), |e| e.0)
+            .ok()?;
+        Some(&self.outcomes[row].1)
     }
 
     fn rejected(&self, slot: usize) -> Option<(u64, Rejection)> {
-        let row = self
-            .encoded
-            .rejected
-            .binary_search_by_key(&(slot as u32), |e| e.0)
-            .ok()?;
-        let (_, index, row, reason) = self.encoded.rejected[row];
+        self.outcome(slot)?.latest.clone()
+    }
+
+    /// Earliest unresolved rejection persisted for `slot`, with its producer.
+    pub(crate) fn sticky(&self, slot: usize) -> Option<(Uuid, u64, Rejection)> {
+        let outcome = self.outcome(slot)?;
+        let (index, rejection) = outcome.sticky.clone()?;
         Some((
+            producer::producer_id(slot as u32, outcome.generation),
             index,
-            Rejection {
-                row: row as usize,
-                reason: match reason {
-                    0 => RejectionReason::InvalidPatch,
-                    1 => RejectionReason::InvalidTurn,
-                    2 => RejectionReason::MissingTurn,
-                    3 => RejectionReason::ValueTooLarge,
-                    4 => RejectionReason::BatchTooLarge,
-                    _ => unreachable!("validated result snapshot"),
-                },
-            },
+            rejection,
         ))
+    }
+
+    pub(crate) fn slots(&self) -> u32 {
+        self.slots
     }
 }
 
@@ -186,15 +355,29 @@ impl Results {
             accepted.position.index <= self.base.through,
             "annotation request outcome expired; request must not be re-executed"
         );
-        let result = match self.base.rejected(slot) {
-            Some((index, rejected)) if index == accepted.position.index => {
+        // The latest exact rejection and the earliest sticky rejection are
+        // separate persisted fields; either may be this exact request.
+        let exact = self
+            .base
+            .rejected(slot)
+            .filter(|(index, _)| *index == accepted.position.index)
+            .or_else(|| {
+                self.base
+                    .sticky(slot)
+                    .filter(|(producer, index, _)| {
+                        *producer == accepted.meta.producer && *index == accepted.position.index
+                    })
+                    .map(|(_, index, rejection)| (index, rejection))
+            });
+        let result = match exact {
+            Some((_, rejected)) => {
                 ensure!(
                     rejected.row < accepted.rows as usize,
                     "rejection row is outside the original request"
                 );
                 MutationResult::Rejected(rejected)
             }
-            _ => MutationResult::Applied,
+            None => MutationResult::Applied,
         };
         Ok(Completed {
             index: accepted.position.index,
@@ -205,46 +388,50 @@ impl Results {
 
     fn snapshot(&self, through: u64) -> Result<Snapshot> {
         ensure!(through >= self.base.through, "result cut regressed");
-        let mut rejected = Vec::new();
+        let mut outcomes = Vec::new();
         for (slot, latest) in self.latest.iter().enumerate() {
-            // Keep a same-producer earliest rejection over a later Applied so a
-            // streaming producer's unobserved rejection survives publication.
-            let sticky = self.sticky[slot].as_ref().filter(|(producer, index, _)| {
-                *index <= through
-                    && latest.as_ref().is_some_and(|r| r.meta.producer == *producer)
-            });
-            let rejection = if let Some((_, index, rejection)) = sticky {
-                Some((*index, rejection.clone()))
-            } else { match latest.as_ref().filter(|r| r.index > self.base.through) {
-                Some(result) => {
-                    ensure!(result.index <= through, "result cut precedes application");
-                    match &result.result {
-                        MutationResult::Applied => None,
-                        MutationResult::Rejected(rejected) => {
-                            Some((result.index, rejected.clone()))
-                        }
+            // Latest exact outcome: a live result past the base, else the base.
+            let (latest_rejection, latest_generation) =
+                match latest.as_ref().filter(|r| r.index > self.base.through) {
+                    Some(result) => {
+                        ensure!(result.index <= through, "result cut precedes application");
+                        let rejection = match &result.result {
+                            MutationResult::Applied => None,
+                            MutationResult::Rejected(r) => Some((result.index, r.clone())),
+                        };
+                        (rejection, Some(result.meta.producer.as_u128() as u64))
                     }
-                }
-                None => self.base.rejected(slot),
-            } };
-            if let Some((index, rejection)) = rejection {
-                let code = match rejection.reason {
-                    RejectionReason::InvalidPatch => 0,
-                    RejectionReason::InvalidTurn => 1,
-                    RejectionReason::MissingTurn => 2,
-                    RejectionReason::ValueTooLarge => 3,
-                    RejectionReason::BatchTooLarge => 4,
+                    None => (
+                        self.base.rejected(slot),
+                        self.base.outcome(slot).map(|o| o.generation),
+                    ),
                 };
-                rejected.push((slot as u32, index, u32::try_from(rejection.row)?, code));
+            // Earliest unresolved rejection, kept separately so it never
+            // replaces the latest exact outcome. `record_sticky` clears it when
+            // another producer generation takes the slot.
+            let sticky = self.sticky[slot]
+                .as_ref()
+                .filter(|(_, index, _)| *index <= through);
+            if latest_rejection.is_none() && sticky.is_none() {
+                continue;
             }
+            let generation = match sticky {
+                Some((producer, _, _)) => producer.as_u128() as u64,
+                None => latest_generation.unwrap_or(0),
+            };
+            outcomes.push((
+                slot as u32,
+                SlotOutcome {
+                    generation,
+                    latest: latest_rejection,
+                    sticky: sticky.map(|(_, index, r)| (*index, r.clone())),
+                },
+            ));
         }
         Ok(Snapshot {
             through,
-            encoded: Encoded {
-                version: 1,
-                slots: self.latest.len() as u32,
-                rejected,
-            },
+            slots: self.latest.len() as u32,
+            outcomes,
         })
     }
 }
@@ -393,7 +580,7 @@ impl Service {
             }
             results.snapshot(through)?
         };
-        let encoded = serde_json::to_string(&snapshot.encoded)?;
+        let encoded = snapshot.encode()?;
         Snapshot::decode(&encoded, through)?;
         // Old public handles may outlive installation. Bound their retained
         // source vectors too, independently of the value/result allocations.
@@ -561,7 +748,7 @@ pub(super) async fn open(
         .context("annotation publication has no request results")?;
     let snapshot = Snapshot::decode(results, through)?;
     ensure!(
-        snapshot.encoded.slots == ingress.client.producer_slots(),
+        snapshot.slots() == ingress.client.producer_slots(),
         "annotation producer capacity changed"
     );
     if let Some(pending) = view
@@ -690,23 +877,31 @@ pub(crate) async fn load_with_read_params(
 mod tests {
     use super::*;
     #[test]
-    fn maximum_producer_rejections_fit_without_repeating_receipt_metadata() -> Result<()> {
-        let snapshot = Encoded {
-            version: 1,
+    fn maximum_producer_outcomes_fit_result_metadata() -> Result<()> {
+        let rejection = Rejection {
+            row: 65_535,
+            reason: RejectionReason::BatchTooLarge,
+        };
+        let snapshot = Snapshot {
+            through: u64::MAX - 1,
             slots: producer::MAX_SLOTS,
-            rejected: (0..producer::MAX_SLOTS)
-                .map(|slot| (slot, u64::MAX - 1, 65_535, 4))
+            outcomes: (0..producer::MAX_SLOTS)
+                .map(|slot| {
+                    (
+                        slot,
+                        SlotOutcome {
+                            generation: u64::MAX,
+                            latest: Some((u64::MAX - 1, rejection.clone())),
+                            sticky: Some((u64::MAX - 2, rejection.clone())),
+                        },
+                    )
+                })
                 .collect(),
         };
-        let encoded = serde_json::to_string(&snapshot)?;
+        let encoded = snapshot.encode()?;
         assert!(encoded.len() <= MAX_RESULTS_BYTES);
-        assert_eq!(
-            Snapshot::decode(&encoded, u64::MAX - 1)?
-                .encoded
-                .rejected
-                .len(),
-            producer::MAX_SLOTS as usize
-        );
+        let decoded = Snapshot::decode(&encoded, u64::MAX - 1)?;
+        assert_eq!(decoded.outcomes.len(), producer::MAX_SLOTS as usize);
         Ok(())
     }
 }
