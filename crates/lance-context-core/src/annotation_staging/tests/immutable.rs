@@ -195,6 +195,7 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
     );
     assert_eq!(refreshed.cached_keys(), 2);
     assert_eq!(staging.observation().await.immutable_membership.hits, 2);
+    let before_misses = staging.observation().await.immutable_membership;
     let lineage = staging.state.read().await.immutable_publications.clone();
     // A warmed future cut cannot leak into an older captured base, and another
     // lineage cannot inherit the entry even with an identical business key.
@@ -210,6 +211,18 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
             .contains_immutable("a", &Arc::new(()), 1)
             .await
     );
+    let after_misses = staging.observation().await.immutable_membership;
+    assert_eq!(
+        after_misses.miss_future_cut,
+        before_misses.miss_future_cut + 1
+    );
+    assert_eq!(
+        after_misses.miss_wrong_lineage,
+        before_misses.miss_wrong_lineage + 1
+    );
+    assert_eq!(after_misses.misses, before_misses.misses + 2);
+    assert_eq!(after_misses.miss_absent, before_misses.miss_absent);
+    assert!(after_misses.session_cache_capacity_bytes.is_some());
     // Cache eviction loses only acceleration. Unknown remains a real lookup.
     selected.session().file_metadata_cache().clear().await;
     let evicted = staging
@@ -217,6 +230,10 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         .await?
         .unwrap();
     assert_eq!(evicted.cached_keys(), 0);
+    assert_eq!(
+        staging.observation().await.immutable_membership.miss_absent,
+        after_misses.miss_absent + 3
+    );
     assert_eq!(
         known.values().copied().collect::<Vec<_>>(),
         vec![false, false, true, false]
@@ -270,6 +287,14 @@ async fn first_create_freeze_publish_preserves_suffix_and_rejects_stale_lookup()
         .await?
         .unwrap();
     assert_eq!(cold.cached_keys(), 0);
+    assert_eq!(
+        recovered
+            .observation()
+            .await
+            .immutable_membership
+            .miss_absent,
+        1
+    );
     assert!(!keys["c"]); // A fresh instance cannot inherit another owner's truth.
     drop(cold);
     let base = recovered.capture_immutable_base().await?;

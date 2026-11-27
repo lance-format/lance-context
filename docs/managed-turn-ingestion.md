@@ -140,6 +140,26 @@ external reader retention is integrated. WAL source progress uses the existing
 managed publication protocol. Long-running storage reclamation and a real
 application's source checkpoint bridge require separate qualification.
 
+## Membership cache observations
+
+The existing annotation observation includes `immutable_membership` cache
+diagnostics. Its `misses` is the sum of `miss_disabled`, `miss_absent`,
+`miss_wrong_key`, `miss_wrong_lineage` and `miss_future_cut`. These describe
+resident probes, not completed ingestion, publication or source progress.
+`miss_absent` cannot distinguish a new key, eviction, unsupported resident
+lookup or a fresh owner namespace. Ordinary verified append publication preserves
+the namespace and lineage. `warms` counts submitted insertions, which may be
+immediately evicted; `refusals` counts backing admission or size failures, not
+evictions.
+
+`session_cache_capacity_bytes` and `session_cache_reported_entries` report the
+existing shared Session backend, including other entry types and namespaces.
+The latter is an approximate entry count whose zero value can also mean the
+backend does not support a cheap count. Neither field measures membership-only
+resident bytes. No eviction count is exposed by the current cache API. These
+observations perform no cache enumeration, maintenance flush, storage read or
+extra key lookup; each membership probe still updates one atomic counter.
+
 ## Executable integration checks
 
 The Rust `tests::generic_turns` tests use actual RF3 services, Lance files and
