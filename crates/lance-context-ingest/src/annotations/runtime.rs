@@ -110,6 +110,38 @@ impl Runtime {
         Ok(self)
     }
 
+    /// Opt in to the streaming owner batch pipeline for full-body ingestion.
+    /// Collect keeps keys only (bodies stay in the WAL); one historical
+    /// lookup covers each large buffered id batch while the next collects;
+    /// ordered apply records only surviving ordinals, spilled to
+    /// `options.spill_dir` (e.g. a PVC) when large; publication refetches
+    /// survivors from the WAL, clusters them by (session_id, id) and writes
+    /// ONE fragment. Configure before running this owner. A max wait for the
+    /// collect stage comes from `with_body_lookup_batch_wait`.
+    pub fn with_owner_batch(self, options: super::owner_batch::Options) -> Result<Self> {
+        let service = &self.driver.service;
+        ensure!(
+            service.is_single_body(),
+            "owner batch pipeline requires full-body ingestion"
+        );
+        ensure!(
+            service.shared.progress.borrow().through
+                == service.shared.results.lock().unwrap().base.through
+                && service.shared.frames.lock().unwrap().retained() == (0, 0),
+            "configure the owner batch pipeline before applying"
+        );
+        let owner = format!(
+            "{}-{}-{}",
+            service.ingress.scope.table,
+            service.ingress.scope.incarnation,
+            service.bucket()
+        );
+        let batch = super::owner_batch::WriteBatch::open(options, &owner)?;
+        *service.shared.write_batch.lock().unwrap() = Some(batch);
+        service.shared.batch_metrics.lock().unwrap().observed.enabled = true;
+        Ok(self)
+    }
+
     /// Cap the full-body key window below its half-lookup-budget default,
     /// so a fixture can force a real `KeyBound` window boundary.
     #[cfg(test)]
@@ -645,6 +677,7 @@ impl Publisher {
                 .get_or_insert_with(tokio::time::Instant::now);
             if source.bytes < self.options.min_source_bytes as u64
                 && source.records < self.options.max_records
+                && !self.service.write_batch_full()
                 && self.service.shared.progress.borrow().backpressure.is_none()
                 && started.elapsed() < self.options.max_batch_wait
             {

@@ -4,6 +4,8 @@ use lance_context_core::annotation_staging::{ImmutableBodyRead, TurnBodySource};
 
 enum Hold {
     Staged { _row: mixed::frames::HeldRow },
+    /// Owner batch: the staged body was refetched from its WAL record.
+    Refetched { _reservation: MergeReservation },
     Materialized,
 }
 
@@ -59,19 +61,60 @@ impl Service {
                 None => self.barrier().await?,
             };
             self.wait_through(through).await?;
-            let (view, staged) = {
+            let (view, staged, deferred) = {
                 let _ordered = self.shared.ordered.lock().await;
                 let view = self.shared.staging.capture_immutable_body(key).await?;
+                let mut deferred = None;
                 let staged = match view.source() {
                     TurnBodySource::Unmaterialized(source) => {
-                        Some(self.shared.frames.lock().unwrap().row(source, key)?)
+                        let meta = self
+                            .shared
+                            .write_batch
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .and_then(|batch| batch.deferred(source.record_index));
+                        match meta {
+                            Some(meta) => {
+                                deferred = Some((source, meta));
+                                None
+                            }
+                            None => Some(self.shared.frames.lock().unwrap().row(source, key)?),
+                        }
                     }
                     TurnBodySource::Materialized(_) => None,
                 };
-                (view, staged)
+                (view, staged, deferred)
             };
             let (batch, hold) = if let Some(row) = staged {
                 (row.batch.clone(), Hold::Staged { _row: row })
+            } else if let Some((source, meta)) = deferred {
+                // The captured view keeps this generation (and therefore its
+                // WAL record) from being retired while the body is refetched.
+                let (bodies, reservation) =
+                    self.refetch_bodies(source.record_index, meta).await?;
+                let spec = self.ingress.turn_spec.as_ref().unwrap();
+                let mut row = source.row as usize;
+                let mut found = None;
+                for batch in &bodies {
+                    if row < batch.num_rows() {
+                        let original =
+                            RecordBatch::try_new(spec.body_schema().clone(), batch.columns().to_vec())?;
+                        ensure!(
+                            spec.row_key(&original, row, key.len())? == key,
+                            "refetched body row differs from turn origin"
+                        );
+                        found = Some(batch.slice(row, 1));
+                        break;
+                    }
+                    row -= batch.num_rows();
+                }
+                (
+                    found.context("refetched body row is outside its source record")?,
+                    Hold::Refetched {
+                        _reservation: reservation,
+                    },
+                )
             } else {
                 let TurnBodySource::Materialized(base) = view.source() else {
                     bail!("body read lost its captured base")
