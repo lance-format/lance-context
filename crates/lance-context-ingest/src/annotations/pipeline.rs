@@ -141,7 +141,8 @@ impl Ahead {
                 // source gap. Current apply can release producer lanes while
                 // these admitted inputs wait; promotion can include their next
                 // committed requests in the same bounded historical scan.
-                let deferred = matches!(prepared.body_stop, Some(PrefetchStop::PageExhausted));
+                let deferred = matches!(prepared.body_stop, Some(PrefetchStop::PageExhausted))
+                    && cut.is_none_or(|cut| page.through < cut);
                 let query = if deferred {
                     None
                 } else {
