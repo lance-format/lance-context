@@ -87,3 +87,8 @@ required-features = ["service"]
 [[example]]
 name = "managed_turn_replay"
 required-features = ["service", "http-client"]
+
+[[example]]
+name = "body_lookup_probe"
+path = "examples/body_lookup_probe/main.rs"
+required-features = ["service"]

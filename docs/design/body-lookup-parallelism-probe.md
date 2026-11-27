@@ -77,3 +77,101 @@ deterministic cancellation during a gated read and an all-hit result before an
 irrelevant gated fragment finishes. This validates the comparison entry; it is
 not a production throughput experiment. Real captured-key results remain required
 before changing owner defaults.
+
+## Runnable fixed-input example
+
+Build the example in a separate experimental environment, outside the live
+ingestion build and target directory:
+
+```sh
+cargo build -p lance-context-ingest --features service --example body_lookup_probe
+```
+
+This command uses the dev profile. Record the actual build profile, CPU
+architecture, machine limits and storage/network location alongside results.
+A debug build or another machine is not a production-pod performance measurement.
+
+The first command saves the exact authenticated quorum-selected catalog record,
+before directory retention can retire the captured version:
+
+```sh
+body_lookup_probe record CONFIG.json CAPTURE.json NEW_RECORD.json
+```
+
+`CONFIG.json` is a private deployment-authorized JSON object with these fields:
+
+| Field | Existing type / meaning |
+| --- | --- |
+| `wal` | `application::config::WalConnection`: original layout, replication limits, endpoints, TLS file paths, RPC options |
+| `binding` | Original `TableBinding` for this full-body table |
+| `shard` | Original `{ "bucket": ... }` |
+| `staging` | Original annotation staging `Limits`, needed for the wire contract |
+| `spec` | Original serialized `TurnIngestionSpec` |
+| `uri` | Authorized storage URI for this binding |
+| `storage_options` | Existing storage options (optional, defaults empty) |
+
+Use the actual host values, including staging limits. The full-body wire hash
+differs from both the ordinary dataset schema and the mixed body/narrow-table
+wire hash. Do not guess it. `CAPTURE.json` is the complete existing serialized
+lookup capture, without an extra envelope. Inputs must be regular files, private
+on Unix (0600 or stricter); JSON sizes are capped at 2 MiB config, 32 MiB capture,
+64 KiB saved record. No keys or credential values appear in stdout/report.
+
+`record` validates the capture against the configured binding, key specification
+and shard, then checks the publisher binding through an authenticated quorum read
+and reads `Some(capture.base_version)` from the existing manifest catalog. It
+never selects latest, acquires an owner, starts an applier or changes retention.
+It fails if selection is unavailable, unknown or retired. The new private record
+file is flushed and synced; an existing output is never overwritten. An empty or
+partial file after failure is not a valid record. Preserve the authenticated
+provenance of this artifact: deserializing a supplied record is not authentication.
+
+The record can be used after catalog-directory retirement while the referenced
+manifest/data/index files still exist. `PinnedManifest` is not a file-retention
+lease. The default directory retention is 64 versions, not a time TTL; verify the
+actual host setting separately. Do not change compaction or retention for this
+experiment.
+
+Then run the comparison using the saved record, with explicit experimental
+native/key memory limits (MiB), rounds and per-query deadline (seconds):
+
+```sh
+body_lookup_probe run CONFIG.json CAPTURE.json RECORD.json NEW_REPORT.jsonl 256 64 3 120
+```
+
+These numeric limits are examples, not recommendations for production. The
+standalone CLI uses its own bounded pool and one session; it does not share the
+live host pool. It is not a production ACK or backlog-drain benchmark. Native
+allocation capacity, JSON/plan/cache overhead and RSS are different quantities.
+To embed the example, use `probe::open` with the original caller-owned `Storage`
+and `probe::compare` with the original key workspace and pool observation closure;
+these functions preserve the session, accessors and store wrappers.
+
+The standalone resolver supports the existing Lance storage options/environment;
+it does not recreate a host-specific renewable catalog credential accessor. If
+the deployed storage uses one, run the embedded functions with that original
+`Storage` or supply the equivalent existing authorized provider before opening.
+Do not replace renewal with copied short-lived secrets just to run the example.
+
+The probe checks table/incarnation/wire hash/key routing, the exact version and
+the complete ordered fragment inventory. It runs ordinary lookup as its result
+reference, followed by P/F `(8,8), (16,8), (32,8), (8,16), (8,32)` in rotated and
+reversed order over subsequent rounds. Every lookup must return the same complete
+membership vector. Results release key admission before the next query. A native
+or key-workspace refusal, timeout, read error or mismatch stops the comparison and
+is never reported as a successful miss. There is no added lookup retry.
+
+The private JSONL report includes first-result/completion time, actual partition
+count, scan rows/fragments/ranges, native logical reads, store read counter deltas
+and pool reserved/backed/demand/refusal counters. Native peaks are cumulative over
+this standalone session. Cache state persists, so these are not cold-cache runs.
+Outstanding I/O may finish after early exit: counters sampled at completion are
+not exclusive costs of one query. Range overlap is explicitly `not_instrumented`;
+store averages cannot establish duplicate cloud GETs. Physical network bytes and
+online ingestion throughput are not measured by this example.
+
+Example tests use a real four-fragment local Lance snapshot: all 16 lookups in
+three rounds agree with independently expected two hits and one miss. They also
+exercise wrong fragment order, foreign wire/binding/version, incomplete capture,
+native refusal, reservation release, private input limits and exclusive outputs.
+This verifies the runner, not performance on production data.
