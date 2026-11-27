@@ -1,5 +1,62 @@
 use super::*;
 use crate::tests::annotation_runtime::automatic_reclamation::deletion_faults::fault_store;
+use lance_context_wal::replication::runtime::client::payload_memory::{Pool, Reservation};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Mutex,
+};
+
+#[derive(Default)]
+struct CapturePool {
+    refuse: AtomicBool,
+    held: Arc<AtomicUsize>,
+    backed: Arc<AtomicUsize>,
+    cancel: Mutex<
+        Option<tokio::sync::oneshot::Receiver<Result<crate::annotations::lookup_capture::Capture>>>,
+    >,
+}
+
+struct CaptureCharge {
+    bytes: usize,
+    held: Arc<AtomicUsize>,
+    backed: Arc<AtomicUsize>,
+}
+
+impl Pool for CapturePool {
+    fn try_reserve(&self, bytes: usize) -> Result<Option<Box<dyn Reservation>>> {
+        // Deterministically cancel after State took the request and checked
+        // receiver liveness, but before allocating/copying the diagnostic keys.
+        drop(self.cancel.lock().unwrap().take());
+        if self.refuse.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        self.held.fetch_add(bytes, Ordering::SeqCst);
+        Ok(Some(Box::new(CaptureCharge {
+            bytes,
+            held: self.held.clone(),
+            backed: self.backed.clone(),
+        })))
+    }
+}
+
+impl Reservation for CaptureCharge {
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+    fn set_backed_bytes(&mut self, bytes: usize) {
+        assert!(bytes <= self.bytes);
+        assert!(self.held.load(Ordering::SeqCst) >= self.bytes);
+        if bytes != 0 {
+            self.backed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for CaptureCharge {
+    fn drop(&mut self) {
+        self.held.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn staged_duplicates_skip_history_and_publication_restores_base_lookup() -> Result<()> {
@@ -176,7 +233,8 @@ async fn exercise() -> Result<()> {
         annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
     assert_eq!(durable.count_rows(None).await?, 4);
     let before = service.body_lookup_observation();
-    let keys = capture.arm(diagnostic_budget.clone())?;
+    let pool = Arc::new(CapturePool::default());
+    let keys = capture.arm_with_pool(diagnostic_budget.clone(), pool.clone())?;
     let repeated = request(&service, &lane, 5, encode(1)?).await?;
     let result = service.submit(&repeated, DEADLINE).await?;
     let after = service.body_lookup_observation();
@@ -190,7 +248,9 @@ async fn exercise() -> Result<()> {
     );
     assert_eq!((data.requested_keys, data.staged_keys), (2, 0));
     assert_eq!(data.window.first_record, result.index);
+    assert!(pool.held.load(Ordering::SeqCst) > 0);
     drop(captured);
+    assert_eq!(pool.held.load(Ordering::SeqCst), 0);
     assert_eq!(diagnostic_budget.reserved(), 0);
     assert_eq!(after.scans_started, before.scans_started + 1);
     assert_eq!(after.native_summaries, before.native_summaries + 1);
@@ -231,6 +291,39 @@ async fn exercise() -> Result<()> {
     assert!(error.to_string().contains("budget unavailable"));
     drop(held);
     assert_eq!(diagnostic_budget.reserved(), 0);
+    drained(&c, &service, result.index).await?;
+    pool.refuse.store(true, Ordering::SeqCst);
+    let keys = capture.arm_with_pool(diagnostic_budget.clone(), pool.clone())?;
+    let repeated = request(&service, &lane, 7, encode(1)?).await?;
+    let result = service.submit(&repeated, DEADLINE).await?;
+    assert_eq!(result.result, MutationResult::Applied);
+    let error = tokio::time::timeout(DEADLINE, keys)
+        .await??
+        .err()
+        .context("capture bypassed host admission")?;
+    assert!(
+        error.is::<lance_context_wal::replication::runtime::client::payload_memory::Unavailable>()
+    );
+    assert_eq!(pool.held.load(Ordering::SeqCst), 0);
+    assert_eq!(diagnostic_budget.reserved(), 0);
+    drained(&c, &service, result.index).await?;
+
+    pool.refuse.store(false, Ordering::SeqCst);
+    let backed = pool.backed.load(Ordering::SeqCst);
+    *pool.cancel.lock().unwrap() =
+        Some(capture.arm_with_pool(diagnostic_budget.clone(), pool.clone())?);
+    let repeated = request(&service, &lane, 8, encode(1)?).await?;
+    let result = service.submit(&repeated, DEADLINE).await?;
+    assert_eq!(result.result, MutationResult::Applied);
+    assert!(pool.cancel.lock().unwrap().is_none());
+    assert_eq!(pool.backed.load(Ordering::SeqCst), backed + 1);
+    assert_eq!(
+        pool.held.load(Ordering::SeqCst),
+        0,
+        "failed send releases host charge after copying"
+    );
+    assert_eq!(diagnostic_budget.reserved(), 0);
+    drop(capture.arm_with_pool(diagnostic_budget.clone(), pool)?);
     drained(&c, &service, result.index).await?;
     stop.send(()).unwrap();
     task.await??;

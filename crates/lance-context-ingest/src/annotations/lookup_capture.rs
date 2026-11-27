@@ -4,6 +4,7 @@ use super::*;
 use crate::turn_ingestion::TurnIngestionSpec;
 use lance::Dataset;
 use lance_context_wal::replication::publication::Authority;
+use lance_context_wal::replication::runtime::client::payload_memory::{Pool, Reservation};
 use std::{collections::BTreeMap, mem::size_of};
 use tokio::sync::oneshot;
 
@@ -28,6 +29,8 @@ pub struct Capture {
     data: Data,
     #[serde(skip)]
     _reservation: MergeReservation,
+    #[serde(skip)]
+    _host_reservation: Option<Box<dyn Reservation>>,
 }
 
 impl Capture {
@@ -63,6 +66,7 @@ struct Request {
     id: Uuid,
     owner: Authority,
     budget: Arc<MergeMemoryBudget>,
+    pool: Option<Arc<dyn Pool>>,
     sender: oneshot::Sender<Result<Capture>>,
 }
 
@@ -93,6 +97,27 @@ impl Handle {
         &self,
         budget: Arc<MergeMemoryBudget>,
     ) -> Result<oneshot::Receiver<Result<Capture>>> {
+        self.arm_inner(budget, None)
+    }
+
+    /// Also charge the embedding host's shared pool before copying. The pool
+    /// must provide nonblocking admission. Its reservation belongs to the
+    /// capture itself through send/drop, including a receiver timeout racing
+    /// with record(). No caller-side guard or zero-budget observation can
+    /// substitute for this allocation lifetime. Refusal fails only the capture.
+    pub fn arm_with_pool(
+        &self,
+        budget: Arc<MergeMemoryBudget>,
+        pool: Arc<dyn Pool>,
+    ) -> Result<oneshot::Receiver<Result<Capture>>> {
+        self.arm_inner(budget, Some(pool))
+    }
+
+    fn arm_inner(
+        &self,
+        budget: Arc<MergeMemoryBudget>,
+        pool: Option<Arc<dyn Pool>>,
+    ) -> Result<oneshot::Receiver<Result<Capture>>> {
         let mut slot = self.state.0.lock().unwrap();
         ensure!(
             slot.as_ref()
@@ -104,6 +129,7 @@ impl Handle {
             id: Uuid::new_v4(),
             owner: self.owner.clone(),
             budget,
+            pool,
             sender,
         });
         Ok(receiver)
@@ -131,7 +157,7 @@ impl State {
             }
             slot.take().unwrap()
         };
-        // No await, external callback, log or disk I/O on the ingestion path.
+        // No await, log or disk I/O; any supplied pool admits synchronously.
         // A dropped receiver simply drops the charged diagnostic payload.
         let result = capture(&request, service, spec, base, keys, window);
         let _ = request.sender.send(result);
@@ -177,6 +203,9 @@ fn capture(
         .budget
         .try_reserve(bytes)
         .context("body lookup capture budget unavailable")?;
+    // The request owns its pool even after the caller times out. Once admitted,
+    // the charge moves with the result, never with the receiver's task lifetime.
+    let mut host_reservation = crate::payload_memory::reserve(request.pool.as_deref(), bytes)?;
     let mut copied = Vec::with_capacity(unresolved);
     for (key, present) in keys {
         if !*present {
@@ -202,8 +231,12 @@ fn capture(
             .collect(),
         keys: copied.into_boxed_slice(),
     };
+    if let Some(charge) = &mut host_reservation {
+        charge.set_backed_bytes(bytes);
+    }
     Ok(Capture {
         data,
         _reservation: reservation,
+        _host_reservation: host_reservation,
     })
 }

@@ -52,3 +52,15 @@ apply/publication budgets so diagnostics do not consume their capacity.
 RF3 tests exercise staged/frozen exclusion, publication into a new base, exact
 owner/version/fragment bindings, cross-page eight-request intervals, cancellation,
 single pending request, memory refusal without ingestion failure and release.
+
+For an embedding host with shared memory accounting, use
+`handle.arm_with_pool(diagnostic_budget, host_pool)` where `host_pool` implements
+`lance_context_wal::replication::runtime::client::payload_memory::Pool`.
+The existing nonblocking pool admits the estimated copied key/metadata buffers
+before allocation. Its reservation is owned by the capture and survives copying,
+sending, caller timeout and failed send, then drops after the captured data.
+A pool refusal fails only the diagnostic; ingestion continues. The separate
+`MergeMemoryBudget` remains a per-capture ceiling. A guard owned only by the caller
+or a check that this budget is currently zero cannot cover a callback that took
+an armed request before the receiver was cancelled. Serialization and output
+buffers still require the host's own accounting.
