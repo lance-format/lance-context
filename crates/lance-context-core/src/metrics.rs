@@ -209,7 +209,20 @@ pub(crate) struct MemtableFlushMetrics {
 #[cfg(feature = "metrics")]
 impl Default for MemtableFlushMetrics {
     fn default() -> Self {
-        use lance::dataset::mem_wal::observer::MemtableFlushPhase;
+        use lance::dataset::mem_wal::observer::{MemtableFlushPhase, WritePhase};
+        for phase in [
+            WritePhase::WriterOpen,
+            WritePhase::Admission,
+            WritePhase::StateLock,
+            WritePhase::Prepare,
+            WritePhase::Insert,
+            WritePhase::Visibility,
+        ] {
+            ::metrics::counter!("rollout_write_phase_errors_total", "phase" => phase.as_str())
+                .increment(0);
+            ::metrics::counter!("rollout_write_phase_abandoned_total", "phase" => phase.as_str())
+                .increment(0);
+        }
         // Register bounded outcome series before the first event, so a scrape
         // can establish a zero baseline. New writers must not reset totals.
         for phase in [
@@ -253,6 +266,42 @@ impl MemtableFlushMetrics {
 
 #[cfg(feature = "metrics")]
 impl lance::dataset::mem_wal::observer::WalObserver for MemtableFlushMetrics {
+    fn on_write_phase_start(&self, phase: lance::dataset::mem_wal::observer::WritePhase) -> u64 {
+        self.health.write_started(phase)
+    }
+
+    fn on_write_visibility_progress(
+        &self,
+        token: u64,
+        progress: lance::dataset::mem_wal::observer::WriteVisibilityProgress,
+    ) {
+        self.health.write_progress(token, progress);
+    }
+
+    fn on_write_phase_finish(
+        &self,
+        token: u64,
+        phase: lance::dataset::mem_wal::observer::WritePhase,
+        duration: std::time::Duration,
+        outcome: lance::dataset::mem_wal::observer::FlushPhaseOutcome,
+    ) {
+        use lance::dataset::mem_wal::observer::FlushPhaseOutcome;
+        self.health.write_finished(token, outcome);
+        match outcome {
+            FlushPhaseOutcome::Ok => {
+                ::metrics::histogram!("rollout_write_phase_duration_seconds", "phase" => phase.as_str())
+                    .record(duration.as_secs_f64());
+            }
+            FlushPhaseOutcome::Error => {
+                ::metrics::counter!("rollout_write_phase_errors_total", "phase" => phase.as_str())
+                    .increment(1);
+            }
+            FlushPhaseOutcome::Abandoned => {
+                ::metrics::counter!("rollout_write_phase_abandoned_total", "phase" => phase.as_str()).increment(1);
+            }
+        }
+    }
+
     fn on_wal_flush(&self, duration: std::time::Duration, bytes: usize) {
         ::metrics::histogram!("rollout_wal_flush_duration_seconds").record(duration.as_secs_f64());
         ::metrics::counter!("rollout_wal_flushes_total").increment(1);

@@ -113,6 +113,7 @@ pub fn install_recorder() -> MetricsHandle {
         "rollout_wal_flush_duration_seconds",
         "rollout_memtable_flush_duration_seconds",
         "rollout_memtable_flush_phase_duration_seconds",
+        "rollout_write_phase_duration_seconds",
     ] {
         builder = builder
             .set_buckets_for_metric(Matcher::Full(name.to_string()), FLUSH_LATENCY_BUCKETS)
@@ -252,6 +253,16 @@ fn describe_metrics() {
         "Failed memtable flush phases. Label: phase."
     );
     describe_counter!("rollout_memtable_flush_phase_abandoned_total", "Locally abandoned memtable flush phase futures; remote outcome may be unknown. Label: phase.");
+    describe_histogram!("rollout_write_phase_duration_seconds", Unit::Seconds,
+        "Successful MemTable put phases: writer_open, admission, state_lock, prepare, insert, visibility. Background IO has separate metrics; visibility waits on WAL and/or in-memory indexes.");
+    describe_counter!(
+        "rollout_write_phase_errors_total",
+        "Failed MemTable put phases. Label: phase."
+    );
+    describe_counter!(
+        "rollout_write_phase_abandoned_total",
+        "Locally abandoned put phases; remote write outcome may be unknown. Label: phase."
+    );
 
     // Master task lifecycle.
     describe_histogram!(
@@ -462,8 +473,13 @@ mod tests {
             "rollout_wal_flush_duration_seconds",
             "rollout_memtable_flush_duration_seconds",
             "rollout_memtable_flush_phase_duration_seconds",
+            "rollout_write_phase_duration_seconds",
         ] {
-            let histogram = if name == "rollout_memtable_flush_phase_duration_seconds" {
+            let histogram = if matches!(
+                name,
+                "rollout_memtable_flush_phase_duration_seconds"
+                    | "rollout_write_phase_duration_seconds"
+            ) {
                 metrics::histogram!(name, "phase" => "prepare")
             } else {
                 metrics::histogram!(name)
@@ -595,6 +611,7 @@ mod tests {
             "rollout_wal_flush_duration_seconds",
             "rollout_memtable_flush_duration_seconds",
             "rollout_memtable_flush_phase_duration_seconds",
+            "rollout_write_phase_duration_seconds",
         ] {
             for (bound, count) in [("0.1", 1), ("300", 2)] {
                 assert!(
@@ -644,14 +661,16 @@ mod tests {
         // added tail buckets cost 24 series across two flushes and four phases.
         // adding one two-valued label to a job-scale histogram costs ~9 series
         // and trips this, forcing the tradeoff to be made explicitly rather than
-        // discovered on an invoice.
+        // discovered on an invoice. One observed write phase adds 16 series to
+        // this fixture. Production has six fixed phase values (96 histogram
+        // series); tokens, table names and cursor positions are never labels.
         let series = text
             .lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())
             .count();
         assert!(
-            series <= 173,
-            "metric cardinality regressed to {series} series (budget 173). Every series is a \
+            series <= 189,
+            "metric cardinality regressed to {series} series (budget 189). Every series is a \
              billed custom metric in Datadog — prefer a counter label over a histogram label."
         );
     }

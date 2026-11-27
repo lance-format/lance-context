@@ -953,10 +953,14 @@ impl StorageBase {
             ))),
             ..Default::default()
         };
+        let observer = config.observer.clone();
         let writer = Arc::new(
-            self.dataset
-                .mem_wal_writer(self.write_shard, config)
-                .await?,
+            lance::dataset::mem_wal::observer::observe_write_phase(
+                observer.as_deref(),
+                lance::dataset::mem_wal::observer::WritePhase::WriterOpen,
+                self.dataset.mem_wal_writer(self.write_shard, config),
+            )
+            .await?,
         );
         *guard = Some(writer.clone());
         Ok(writer)

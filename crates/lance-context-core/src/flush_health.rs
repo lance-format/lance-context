@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use lance::dataset::mem_wal::observer::{FlushPhaseOutcome, WritePhase, WriteVisibilityProgress};
 use serde::Serialize;
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -32,6 +33,14 @@ struct Health {
     active: Option<Active>,
     generations: usize,
     bytes: usize,
+    writes: BTreeMap<u64, ActiveWrite>,
+}
+
+#[derive(Debug)]
+struct ActiveWrite {
+    phase: WritePhase,
+    started: Instant,
+    progress: Option<WriteVisibilityProgress>,
 }
 
 #[derive(Debug)]
@@ -49,6 +58,7 @@ impl WriterHealth {
             active: None,
             generations: 0,
             bytes: 0,
+            writes: BTreeMap::new(),
         }));
         registry()
             .lock()
@@ -110,6 +120,37 @@ impl WriterHealth {
     pub(crate) fn completed(&self) {
         self.state.lock().unwrap().active = None;
     }
+
+    pub(crate) fn write_started(&self, phase: WritePhase) -> u64 {
+        let token = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.state.lock().unwrap().writes.insert(
+            token,
+            ActiveWrite {
+                phase,
+                started: Instant::now(),
+                progress: None,
+            },
+        );
+        token
+    }
+
+    pub(crate) fn write_progress(&self, token: u64, progress: WriteVisibilityProgress) {
+        if let Some(write) = self.state.lock().unwrap().writes.get_mut(&token) {
+            write.progress = Some(progress);
+        }
+    }
+
+    pub(crate) fn write_finished(&self, token: u64, outcome: FlushPhaseOutcome) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(write) = state.writes.remove(&token) {
+            let elapsed = write.started.elapsed();
+            if elapsed.as_secs() >= 10 {
+                tracing::warn!(writer_id = self.id, uri = %state.uri, shard = %state.shard,
+                    phase = write.phase.as_str(), outcome = ?outcome, elapsed_seconds = elapsed.as_secs_f64(),
+                    cursors = ?write.progress, "slow MemWAL write phase finished");
+            }
+        }
+    }
 }
 
 impl Drop for WriterHealth {
@@ -134,6 +175,40 @@ pub struct FlushHealth {
     pub writers_observed: usize,
     pub writers_unknown: usize,
     pub active: Vec<FlushStatus>,
+    pub writes: Vec<WriteStatus>,
+}
+
+#[derive(Serialize)]
+pub struct WriteStatus {
+    pub writer_id: u64,
+    pub uri: String,
+    pub shard: String,
+    pub phase: &'static str,
+    pub elapsed_seconds: f64,
+    pub progress: Option<WriteCursorStatus>,
+}
+
+#[derive(Serialize)]
+pub struct WriteCursorStatus {
+    pub durable: usize,
+    pub target_durable: usize,
+    pub indexed: usize,
+    pub target_indexed: usize,
+    pub requires_durable: bool,
+}
+
+impl WriteCursorStatus {
+    fn waiting_for(&self) -> &'static str {
+        match (
+            self.requires_durable && self.durable < self.target_durable,
+            self.indexed < self.target_indexed,
+        ) {
+            (true, true) => "wal_and_index",
+            (true, false) => "wal",
+            (false, true) => "index",
+            (false, false) => "ready",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -164,6 +239,7 @@ pub fn snapshot() -> FlushHealth {
         writers_observed: 0,
         writers_unknown: 0,
         active: Vec::new(),
+        writes: Vec::new(),
     };
     let writers: Vec<_> = match registry().try_lock() {
         Ok(registry) => registry
@@ -186,6 +262,22 @@ pub fn snapshot() -> FlushHealth {
             continue;
         };
         result.writers_observed += 1;
+        result
+            .writes
+            .extend(state.writes.values().map(|write| WriteStatus {
+                writer_id: id,
+                uri: state.uri.clone(),
+                shard: state.shard.clone(),
+                phase: write.phase.as_str(),
+                elapsed_seconds: now.saturating_duration_since(write.started).as_secs_f64(),
+                progress: write.progress.map(|progress| WriteCursorStatus {
+                    durable: progress.durable,
+                    target_durable: progress.target_durable,
+                    indexed: progress.indexed,
+                    target_indexed: progress.target_indexed,
+                    requires_durable: progress.requires_durable,
+                }),
+            }));
         let Some(active) = &state.active else {
             continue;
         };
@@ -260,6 +352,51 @@ fn render_snapshot(snapshot: &FlushHealth) -> String {
                 .fold(0.0, f64::max),
         );
         gauge("rollout_memtable_flush_checkpoint_idle_max_seconds", "Longest interval without a new durable checkpoint; coarse evidence, not proof of a stalled I/O operation.", snapshot.active.iter().map(|s| s.checkpoint_idle_seconds).fold(0.0, f64::max));
+        use std::fmt::Write;
+        out.push_str("# HELP rollout_write_phase_in_flight Unfinished MemTable put phases, excluding caller queues.\n# TYPE rollout_write_phase_in_flight gauge\n");
+        out.push_str("# HELP rollout_write_phase_oldest_seconds Oldest unfinished put phase, sampled without waiting on the writer.\n# TYPE rollout_write_phase_oldest_seconds gauge\n");
+        for phase in [
+            WritePhase::WriterOpen,
+            WritePhase::Admission,
+            WritePhase::StateLock,
+            WritePhase::Prepare,
+            WritePhase::Insert,
+            WritePhase::Visibility,
+        ] {
+            let phase = phase.as_str();
+            let writes = || snapshot.writes.iter().filter(|write| write.phase == phase);
+            let _ = writeln!(
+                out,
+                "rollout_write_phase_in_flight{{phase=\"{phase}\"}} {}",
+                writes().count()
+            );
+            let _ = writeln!(
+                out,
+                "rollout_write_phase_oldest_seconds{{phase=\"{phase}\"}} {}",
+                writes()
+                    .map(|write| write.elapsed_seconds)
+                    .fold(0.0, f64::max)
+            );
+        }
+        out.push_str("# HELP rollout_write_visibility_waiters Last observed blocking cursor for unfinished visibility waits; cursors can advance concurrently.\n# TYPE rollout_write_visibility_waiters gauge\n");
+        for waiting_for in ["wal", "index", "wal_and_index", "ready", "unknown"] {
+            let count = snapshot
+                .writes
+                .iter()
+                .filter(|write| {
+                    write.phase == "visibility"
+                        && write
+                            .progress
+                            .as_ref()
+                            .map_or("unknown", WriteCursorStatus::waiting_for)
+                            == waiting_for
+                })
+                .count();
+            let _ = writeln!(
+                out,
+                "rollout_write_visibility_waiters{{waiting_for=\"{waiting_for}\"}} {count}"
+            );
+        }
     }
     out
 }
@@ -268,6 +405,59 @@ fn render_snapshot(snapshot: &FlushHealth) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn write_progress_does_not_clear_a_concurrent_wait_or_reset_its_age() {
+        let writer = WriterHealth::new("test".into(), "s1".into());
+        let waiting = writer.write_started(WritePhase::Visibility);
+        let other = writer.write_started(WritePhase::Visibility);
+        let started = Instant::now() - Duration::from_secs(60);
+        writer
+            .state
+            .lock()
+            .unwrap()
+            .writes
+            .get_mut(&waiting)
+            .unwrap()
+            .started = started;
+        writer.write_progress(
+            waiting,
+            WriteVisibilityProgress {
+                durable: 10,
+                target_durable: 12,
+                indexed: 2,
+                target_indexed: 2,
+                requires_durable: true,
+            },
+        );
+        writer.write_finished(other, FlushPhaseOutcome::Ok);
+        let state = writer.state.lock().unwrap();
+        assert_eq!(state.writes.len(), 1);
+        let write = state.writes.get(&waiting).unwrap();
+        assert_eq!(write.started, started);
+        assert_eq!(write.progress.unwrap().durable, 10);
+        drop(state);
+        writer.write_finished(waiting, FlushPhaseOutcome::Ok);
+        assert!(writer.state.lock().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn visibility_diagnostics_compare_each_cursor_with_its_own_target() {
+        let mut progress = WriteCursorStatus {
+            durable: 100,
+            target_durable: 101,
+            indexed: 1,
+            target_indexed: 2,
+            requires_durable: true,
+        };
+        assert_eq!(progress.waiting_for(), "wal_and_index");
+        progress.indexed = 2;
+        assert_eq!(progress.waiting_for(), "wal");
+        progress.requires_durable = false;
+        assert_eq!(progress.waiting_for(), "ready");
+        progress.indexed = 1;
+        assert_eq!(progress.waiting_for(), "index");
+    }
 
     #[test]
     fn retry_and_unrelated_success_do_not_reset_failed_generation_progress() {

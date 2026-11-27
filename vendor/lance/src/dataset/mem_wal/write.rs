@@ -48,7 +48,9 @@ pub use super::wal::{WalEntry, WalEntryData, WalFlushFailure, WalFlushResult, Wa
 
 use super::index::{MemIndexPlugin, MemIndexRegistry};
 use super::memtable::flush::{PreparedMemTableFlush, TriggerMemTableFlush};
-use super::observer::{MemtableFlushPhase, WalObserver, observe_flush_phase};
+use super::observer::{
+    MemtableFlushPhase, WalObserver, WritePhase, observe_flush_phase, observe_write_phase,
+};
 use super::scanner::InMemoryMemTableRef;
 use super::scanner::SsTableWarmer;
 use super::wal::{
@@ -3552,7 +3554,12 @@ impl ShardWriter {
         if ShardMemory::memtables(writer_state.memory.clone()).unflushed_bytes()
             >= self.config.max_unflushed_memtable_bytes
         {
-            let mut state = state_lock.write().await;
+            let mut state = observe_write_phase(
+                self.config.observer.as_deref(),
+                WritePhase::StateLock,
+                async { Ok::<_, Error>(state_lock.write().await) },
+            )
+            .await?;
             if writer_state.maybe_trigger_memtable_flush(&mut state, 1, 1)?
                 == FreezeOutcome::Blocked
             {
@@ -3563,19 +3570,27 @@ impl ShardWriter {
         // Apply backpressure if needed (before acquiring main lock). The reading
         // carries whether this put needs a freeze, so a controller bounding the
         // tier below can refuse only the puts that would grow it.
-        backpressure
-            .maybe_apply_backpressure(
+        observe_write_phase(
+            self.config.observer.as_deref(),
+            WritePhase::Admission,
+            backpressure.maybe_apply_backpressure(
                 ShardMemory::memtables(writer_state.memory.clone()).with_freeze_required(
                     writer_state.freeze_required(incoming_batches, incoming_rows),
                 ),
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
         let start = std::time::Instant::now();
 
         // Acquire write lock for entire operation (atomic approach)
         let (batch_positions, durable_watcher, batch_store, indexes) = {
-            let mut state = state_lock.write().await;
+            let mut state = observe_write_phase(
+                self.config.observer.as_deref(),
+                WritePhase::StateLock,
+                async { Ok::<_, Error>(state_lock.write().await) },
+            )
+            .await?;
 
             // 0. Freeze first if this put would not fit: the row cap is a hard
             //    index capacity, so an overshoot cannot be undone afterwards.
@@ -3593,14 +3608,27 @@ impl ShardWriter {
             // 1. Shape the batches to the memtable's schema, spill Blob v2
             //    payloads into the active target, then keep only prepared
             //    descriptors in the memtable and WAL.
-            let batches = incoming.shape(&state.schema)?;
             let batch_store = state.memtable.batch_store();
-            let (batches, mut blob_preprocessor, shared_blob_preprocessor) = writer_state
-                .prepare_batches(&state.memtable, &state.schema, batches)
-                .await?;
+            let (batches, mut blob_preprocessor, shared_blob_preprocessor) = observe_write_phase(
+                self.config.observer.as_deref(),
+                WritePhase::Prepare,
+                async {
+                    let batches = incoming.shape(&state.schema)?;
+                    writer_state
+                        .prepare_batches(&state.memtable, &state.schema, batches)
+                        .await
+                },
+            )
+            .await?;
 
             // 2. Insert all batches into memtable atomically
-            let results = match state.memtable.insert_batches_only(batches).await {
+            let results = match observe_write_phase(
+                self.config.observer.as_deref(),
+                WritePhase::Insert,
+                state.memtable.insert_batches_only(batches),
+            )
+            .await
+            {
                 Ok(results) => results,
                 Err(error) => {
                     if let Some(preprocessor) = blob_preprocessor.as_mut() {
@@ -3638,11 +3666,13 @@ impl ShardWriter {
             //    satisfied by a *previous* memtable's appends, so the first N
             //    puts into every post-rotation memtable would ack as durable with
             //    no WAL append ever happening.
-            let durable_watcher = writer_state.track_batch_for_wal(
-                indexes.clone(),
-                end_pos,
-                batch_store.global_offset() + end_pos,
-            );
+            let durable_watcher = writer_state
+                .track_batch_for_wal(
+                    indexes.clone(),
+                    end_pos,
+                    batch_store.global_offset() + end_pos,
+                )
+                .with_observer(self.config.observer.clone());
 
             // 5. Check if WAL flush should be triggered
             writer_state.maybe_trigger_wal_flush(&mut state);
