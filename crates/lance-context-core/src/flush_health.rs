@@ -312,8 +312,14 @@ pub fn render() -> String {
     render_snapshot(&snapshot)
 }
 
+/// Write-wait gauges and observation completeness for services that already
+/// export their own flush-progress metrics. Full details remain in `snapshot`.
+pub fn render_write_health() -> String {
+    render_write_snapshot(&snapshot())
+}
+
 fn render_snapshot(snapshot: &FlushHealth) -> String {
-    let mut out = String::new();
+    let mut out = render_write_snapshot(snapshot);
     let mut gauge = |name: &str, help: &str, value: f64| {
         use std::fmt::Write;
         let _ = writeln!(
@@ -321,11 +327,6 @@ fn render_snapshot(snapshot: &FlushHealth) -> String {
             "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
         );
     };
-    gauge(
-        "rollout_memtable_flush_health_complete",
-        "All resident writer observations were readable.",
-        u8::from(snapshot.complete) as f64,
-    );
     gauge(
         "rollout_memtable_flush_health_sample_timestamp_seconds",
         "Time this process generated the health snapshot.",
@@ -352,28 +353,50 @@ fn render_snapshot(snapshot: &FlushHealth) -> String {
                 .fold(0.0, f64::max),
         );
         gauge("rollout_memtable_flush_checkpoint_idle_max_seconds", "Longest interval without a new durable checkpoint; coarse evidence, not proof of a stalled I/O operation.", snapshot.active.iter().map(|s| s.checkpoint_idle_seconds).fold(0.0, f64::max));
+    }
+    out
+}
+
+fn render_write_snapshot(snapshot: &FlushHealth) -> String {
+    let mut out = format!(
+        "# HELP rollout_memtable_flush_health_complete All resident writer observations were readable.\n\
+         # TYPE rollout_memtable_flush_health_complete gauge\n\
+         rollout_memtable_flush_health_complete {}\n",
+        u8::from(snapshot.complete)
+    );
+    if snapshot.complete {
         use std::fmt::Write;
         out.push_str("# HELP rollout_write_phase_in_flight Unfinished MemTable put phases, excluding caller queues.\n# TYPE rollout_write_phase_in_flight gauge\n");
-        out.push_str("# HELP rollout_write_phase_oldest_seconds Oldest unfinished put phase, sampled without waiting on the writer.\n# TYPE rollout_write_phase_oldest_seconds gauge\n");
-        for phase in [
+        let phases = [
             WritePhase::WriterOpen,
             WritePhase::Admission,
             WritePhase::StateLock,
             WritePhase::Prepare,
             WritePhase::Insert,
             WritePhase::Visibility,
-        ] {
+        ];
+        for phase in phases {
             let phase = phase.as_str();
-            let writes = || snapshot.writes.iter().filter(|write| write.phase == phase);
             let _ = writeln!(
                 out,
                 "rollout_write_phase_in_flight{{phase=\"{phase}\"}} {}",
-                writes().count()
+                snapshot
+                    .writes
+                    .iter()
+                    .filter(|write| write.phase == phase)
+                    .count()
             );
+        }
+        out.push_str("# HELP rollout_write_phase_oldest_seconds Oldest unfinished put phase, sampled without waiting on the writer.\n# TYPE rollout_write_phase_oldest_seconds gauge\n");
+        for phase in phases {
+            let phase = phase.as_str();
             let _ = writeln!(
                 out,
                 "rollout_write_phase_oldest_seconds{{phase=\"{phase}\"}} {}",
-                writes()
+                snapshot
+                    .writes
+                    .iter()
+                    .filter(|write| write.phase == phase)
                     .map(|write| write.elapsed_seconds)
                     .fold(0.0, f64::max)
             );
@@ -405,6 +428,35 @@ fn render_snapshot(snapshot: &FlushHealth) -> String {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn gauge_families_are_contiguous_and_typed() {
+        let sample = FlushHealth {
+            sampled_at_ms: 0,
+            complete: true,
+            writers_observed: 0,
+            writers_unknown: 0,
+            active: Vec::new(),
+            writes: Vec::new(),
+        };
+        for text in [render_snapshot(&sample), render_write_snapshot(&sample)] {
+            let mut current_family = "";
+            let mut declared = std::collections::BTreeSet::new();
+            for line in text.lines() {
+                if let Some(declaration) = line.strip_prefix("# TYPE ") {
+                    let (name, kind) = declaration.split_once(' ').unwrap();
+                    assert_eq!(kind, "gauge");
+                    assert!(declared.insert(name), "repeated TYPE for {name}");
+                    current_family = name;
+                } else if !line.starts_with('#') && !line.is_empty() {
+                    let name = line.split(['{', ' ']).next().unwrap();
+                    assert_eq!(name, current_family, "sample outside its typed family");
+                }
+            }
+            assert!(declared.contains("rollout_write_phase_in_flight"));
+            assert!(declared.contains("rollout_write_phase_oldest_seconds"));
+        }
+    }
 
     #[test]
     fn write_progress_does_not_clear_a_concurrent_wait_or_reset_its_age() {
@@ -505,6 +557,9 @@ mod tests {
         let text = render_snapshot(&sample);
         assert!(text.contains("rollout_memtable_flush_health_complete 0"));
         assert!(!text.contains("rollout_memtable_flush_terminal_writers"));
+        let writes = render_write_snapshot(&sample);
+        assert!(writes.contains("rollout_memtable_flush_health_complete 0"));
+        assert!(!writes.contains("rollout_write_phase_in_flight"));
         drop(guard);
     }
 }
