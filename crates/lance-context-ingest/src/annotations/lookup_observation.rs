@@ -11,8 +11,9 @@ pub enum PrefetchStop {
 }
 
 /// Completed prefetch decisions, before lookup admission. These are selected
-/// inputs, not applied requests or completed native scans. This never waits for
-/// new arrivals beyond the captured source page.
+/// inputs, not applied requests or completed native scans. A full-body window
+/// can span committed source pages; an empty response ends it without polling
+/// for future writes.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BodyPrefetchObservation {
     pub preparations: u64,
