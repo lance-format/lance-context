@@ -4,6 +4,8 @@ use futures::future::BoxFuture;
 use lance_core::memory::{NativeMemoryKind, NativeMemoryPool, NativeMemoryReservation};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+mod coalescing;
+
 #[derive(Debug, Default)]
 struct Admission {
     refuse: AtomicBool,
@@ -395,10 +397,20 @@ async fn partial_ahead_refill_queries_the_published_prefix() -> Result<()> {
     .await?
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_promotion_coalesces_records_committed_after_prefix_apply() -> Result<()> {
+    tokio::time::timeout(
+        DEADLINE,
+        two_windows_with_late_tail(false, false, WindowInput::AfterPromotion),
+    )
+    .await?
+}
+
 enum WindowInput {
     Full,
     Late,
     CancelRefill,
+    AfterPromotion,
 }
 
 async fn two_windows_with_late_tail(
@@ -487,6 +499,9 @@ async fn two_windows_with_late_tail(
         &spec,
     )
     .await?;
+    if matches!(schedule, WindowInput::AfterPromotion) {
+        runtime = runtime.with_body_lookup_batch_wait(Duration::from_secs(1))?;
+    }
     let initial = service.observation().await.0.applied;
     let mut backlog = Vec::new();
     let mut lanes = Vec::new();
@@ -549,7 +564,7 @@ async fn two_windows_with_late_tail(
             service.body_lookup_observation().prefetch.requests,
             if late_tail { 9 } else { 16 }
         );
-        if late_tail {
+        if late_tail && !matches!(schedule, WindowInput::AfterPromotion) {
             // These requests become durable after the short ahead page was
             // captured, while the foreground query still owns its read gate.
             // Promotion should include them in the same bounded lookup.
@@ -574,7 +589,7 @@ async fn two_windows_with_late_tail(
                 };
                 backlog.push((prepared, index));
             }
-        } else {
+        } else if !late_tail {
             assert_eq!(
                 service.body_lookup_observation().prefetched_lookups_started,
                 1
@@ -630,7 +645,55 @@ async fn two_windows_with_late_tail(
             }
             assert_eq!(service.observation().await.0.applied, backlog[7].1);
         }
-        runtime.apply_once_for_test().await?;
+        if matches!(schedule, WindowInput::AfterPromotion) {
+            let before = service
+                .body_lookup_observation()
+                .prefetch
+                .source_empty_at_local_end;
+            let step = runtime.apply_once_for_test();
+            tokio::pin!(step);
+            loop {
+                tokio::select! {
+                    result = &mut step => panic!("partial promotion sealed before refill: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+                }
+                if service
+                    .body_lookup_observation()
+                    .prefetch
+                    .source_empty_at_local_end
+                    > before
+                {
+                    break;
+                }
+            }
+            // Model the return/journal/next-commit gap after the current prefix
+            // released its lanes. These were not durable at promotion's first read.
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            for i in 9..16 {
+                let prepared = request(
+                    &service,
+                    &lanes[i % lanes.len()],
+                    (i / lanes.len() + 1) as u64,
+                    encode(if i == 15 { 3 } else { 2 })?,
+                )
+                .await?;
+                let response = c
+                    .client
+                    .request_routed(Request::Append {
+                        group: 10,
+                        batch: prepared.batch.clone(),
+                    })
+                    .await?;
+                let Reply::Commit(Outcome::Committed(Applied::Accepted { index })) = response.reply
+                else {
+                    bail!("post-promotion test record was not quorum durable")
+                };
+                backlog.push((prepared, index));
+            }
+            step.await?;
+        } else {
+            runtime.apply_once_for_test().await?;
+        }
         assert_eq!(service.observation().await.0.applied, backlog[8].1);
         if !publish && !late_tail {
             assert_eq!(

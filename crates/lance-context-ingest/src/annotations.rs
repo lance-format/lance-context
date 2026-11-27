@@ -135,6 +135,8 @@ pub struct Driver {
     ahead: Option<pipeline::Ahead>,
     prefetched_lookup: bool,
     prefetched_reused: bool,
+    body_batch_wait: Duration,
+    body_batch_deadline: Option<tokio::time::Instant>,
 }
 
 /// Connect an authorized ingress without opening Lance or creating an applier.
@@ -517,6 +519,8 @@ impl Service {
             ahead: None,
             prefetched_lookup: false,
             prefetched_reused: false,
+            body_batch_wait: Duration::ZERO,
+            body_batch_deadline: None,
         };
         Ok((service, driver))
     }
@@ -997,7 +1001,7 @@ impl Driver {
                         ahead.after == after,
                         "speculative window lost its ordered prefix"
                     );
-                    if let Some(window) = ahead.ready(service).await? {
+                    if let Some(window) = ahead.ready(service, self.body_batch_wait).await? {
                         self.pending = Some(window.head);
                         self.lookahead = window.tail;
                         self.source_page = Some(window.page);
@@ -1046,14 +1050,19 @@ impl Driver {
                 // Keep the entry until fetch/decode succeeds. Cancellation or
                 // admission pressure must not skip the next committed record.
                 self.source_page.as_mut().unwrap().entries.remove(0);
-                self.lookup = prefetch::prepare(
-                    service,
-                    self.pending.as_ref().unwrap(),
-                    self.source_page.as_mut().unwrap(),
-                    &mut self.lookahead,
-                    replay_cut,
-                )
-                .await?;
+                if service.is_single_body() {
+                    self.body_batch_deadline =
+                        Some(tokio::time::Instant::now() + self.body_batch_wait);
+                } else {
+                    self.lookup = prefetch::prepare(
+                        service,
+                        self.pending.as_ref().unwrap(),
+                        self.source_page.as_mut().unwrap(),
+                        &mut self.lookahead,
+                        replay_cut,
+                    )
+                    .await?;
+                }
             } else {
                 if page.through > after {
                     // Control progress participates in the same freeze gate;
@@ -1074,6 +1083,18 @@ impl Driver {
             }
         }
         let pending = self.pending.as_ref().unwrap();
+        if let Some(deadline) = self.body_batch_deadline {
+            self.lookup = prefetch::coalesce(
+                service,
+                pending,
+                self.source_page.as_mut().unwrap(),
+                &mut self.lookahead,
+                replay_cut,
+                deadline,
+            )
+            .await?;
+            self.body_batch_deadline = None;
+        }
         let missing_body_lookup = service.is_single_body()
             && match &pending.decoded {
                 mixed::Decoded::Creates { rows, .. } => {

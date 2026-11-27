@@ -77,6 +77,21 @@ struct Publisher {
 }
 
 impl Runtime {
+    /// Opt in to bounded coalescing of underfilled full-body lookup windows.
+    /// This gives producer lanes released by Applied time to submit their next
+    /// record. It can add up to `wait` of intentional delay per short window;
+    /// request processing and network timeouts retain their existing bounds.
+    /// The default is zero. Configure before running this owner and measure
+    /// source ACK latency/backlog as well as keys per scan before enabling.
+    pub fn with_body_lookup_batch_wait(mut self, wait: Duration) -> Result<Self> {
+        ensure!(
+            self.driver.service.is_single_body() && wait <= Duration::from_secs(1),
+            "body lookup batch wait requires full-body ingestion and at most one second"
+        );
+        self.driver.body_batch_wait = wait;
+        Ok(self)
+    }
+
     #[cfg(test)]
     pub(crate) async fn apply_once_for_test(&mut self) -> Result<()> {
         self.driver.step_for_test().await

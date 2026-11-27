@@ -187,7 +187,11 @@ impl Ahead {
         }
     }
 
-    pub(super) async fn ready(&mut self, service: &Service) -> Result<Option<Window>> {
+    pub(super) async fn ready(
+        &mut self,
+        service: &Service,
+        batch_wait: Duration,
+    ) -> Result<Option<Window>> {
         // Promote the decoded window without waiting for its query. It becomes
         // foreground and may overlap the following window's query in turn.
         futures::future::poll_fn(|cx| loop {
@@ -198,16 +202,18 @@ impl Ahead {
             match result {
                 Ok(Some(mut window)) if window.query.is_none() => {
                     let service = service.clone();
+                    let deadline = tokio::time::Instant::now() + batch_wait;
                     // Retain the refill future in Ahead, not in this call's
                     // stack. Cancellation of step must preserve both admitted
                     // records and the next source cursor for the same driver.
                     self.loading = Some(Box::pin(async move {
-                        prefetch::prepare(
+                        prefetch::coalesce(
                             &service,
                             &window.head,
                             &mut window.page,
                             &mut window.tail,
                             window.cut,
+                            deadline,
                         )
                         .await?;
                         let Some(query) = Query::new(&service, &window.head, &window.tail, false)?
