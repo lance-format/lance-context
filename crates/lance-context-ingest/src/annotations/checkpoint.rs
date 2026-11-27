@@ -85,8 +85,95 @@ impl Snapshot {
 pub(super) struct Results {
     pub base: Arc<Snapshot>,
     pub latest: Vec<Option<Completed>>,
+    /// Earliest rejection per slot for the slot's current producer identity.
+    /// One entry per bounded producer slot. A commit-ack producer can stream
+    /// later requests before learning an outcome, so a later Applied must not
+    /// overwrite (in memory or in the published result snapshot) the
+    /// rejection that the producer has not yet observed.
+    pub sticky: Vec<Option<(Uuid, u64, Rejection)>>,
 }
+
+/// An earlier request from the same producer was rejected. The caller must
+/// treat its source prefix as rejected; the exact earlier outcome is returned
+/// by waiting on that earlier receipt.
+#[derive(Debug)]
+pub struct PriorRejected {
+    pub index: u64,
+    pub rejection: Rejection,
+}
+impl std::fmt::Display for PriorRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "earlier request at WAL index {} from this producer was rejected: {:?}",
+            self.index, self.rejection
+        )
+    }
+}
+impl std::error::Error for PriorRejected {}
+
 impl Results {
+    pub fn record_sticky(
+        &mut self,
+        slot: usize,
+        index: u64,
+        meta: &BatchMeta,
+        result: &MutationResult,
+    ) {
+        let entry = &mut self.sticky[slot];
+        if entry.as_ref().is_some_and(|(producer, _, _)| *producer != meta.producer) {
+            *entry = None;
+        }
+        if let MutationResult::Rejected(rejection) = result {
+            if entry.is_none() {
+                *entry = Some((meta.producer, index, rejection.clone()));
+            }
+        }
+    }
+
+    /// Commit-ack resolution after `wait_through(index)`. The exact latest
+    /// outcome and the same-producer earliest rejection are checked before
+    /// falling back to the published snapshot, as `resolve` does.
+    pub fn resolve_streamed(&self, accepted: &AcceptedAppend, slot: usize) -> Result<Completed> {
+        if let Some((producer, index, rejection)) = &self.sticky[slot] {
+            if *producer == accepted.meta.producer {
+                if *index == accepted.position.index {
+                    ensure!(
+                        rejection.row < accepted.rows as usize,
+                        "rejection row is outside the original request"
+                    );
+                    return Ok(Completed {
+                        index: *index,
+                        meta: accepted.meta.clone(),
+                        result: MutationResult::Rejected(rejection.clone()),
+                    });
+                }
+                if *index < accepted.position.index {
+                    return Err(anyhow::Error::new(PriorRejected {
+                        index: *index,
+                        rejection: rejection.clone(),
+                    }));
+                }
+            }
+        }
+        if let Some(result) = &self.latest[slot] {
+            if result.meta.producer == accepted.meta.producer
+                && result.index > accepted.position.index
+                && result.index > self.base.through
+            {
+                // Applied in order after this producer's request with no
+                // sticky rejection at or before it: this request applied.
+                return Ok(Completed {
+                    index: accepted.position.index,
+                    meta: accepted.meta.clone(),
+                    result: MutationResult::Applied,
+                });
+            }
+        }
+        self.resolve(accepted, slot)
+    }
+
+
     pub fn resolve(&self, accepted: &AcceptedAppend, slot: usize) -> Result<Completed> {
         if let Some(result) = &self.latest[slot] {
             if result.index == accepted.position.index && result.meta == accepted.meta {
@@ -120,7 +207,15 @@ impl Results {
         ensure!(through >= self.base.through, "result cut regressed");
         let mut rejected = Vec::new();
         for (slot, latest) in self.latest.iter().enumerate() {
-            let rejection = match latest.as_ref().filter(|r| r.index > self.base.through) {
+            // Keep a same-producer earliest rejection over a later Applied so a
+            // streaming producer's unobserved rejection survives publication.
+            let sticky = self.sticky[slot].as_ref().filter(|(producer, index, _)| {
+                *index <= through
+                    && latest.as_ref().is_some_and(|r| r.meta.producer == *producer)
+            });
+            let rejection = if let Some((_, index, rejection)) = sticky {
+                Some((*index, rejection.clone()))
+            } else { match latest.as_ref().filter(|r| r.index > self.base.through) {
                 Some(result) => {
                     ensure!(result.index <= through, "result cut precedes application");
                     match &result.result {
@@ -131,7 +226,7 @@ impl Results {
                     }
                 }
                 None => self.base.rejected(slot),
-            };
+            } };
             if let Some((index, rejection)) = rejection {
                 let code = match rejection.reason {
                     RejectionReason::InvalidPatch => 0,

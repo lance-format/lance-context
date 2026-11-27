@@ -176,6 +176,11 @@ impl Routes {
                         .map_err(|_| Failure::bad("invalid_status_filter"))?
                         .bucket
                 }
+                Operation::Applied => {
+                    serde_json::from_slice::<AppliedRequest>(&bytes)
+                        .map_err(|_| Failure::bad("invalid_applied_request"))?
+                        .bucket
+                }
                 Operation::SelectedBody => {
                     serde_json::from_slice::<SelectedBodyRequest>(&bytes)
                         .map_err(|_| Failure::bad("invalid_selected_body_request"))?
