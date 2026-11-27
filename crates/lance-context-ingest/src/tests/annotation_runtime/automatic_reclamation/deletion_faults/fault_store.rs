@@ -72,7 +72,7 @@ struct FailedListing {
 }
 
 impl Faults {
-    #[cfg(feature = "http")]
+    #[cfg(all(feature = "service", feature = "http-client"))]
     pub fn pause_data_read(&self) -> (oneshot::Receiver<Path>, oneshot::Sender<()>) {
         let (entered, observed) = oneshot::channel();
         let (resume, waiting) = oneshot::channel();

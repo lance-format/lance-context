@@ -55,7 +55,7 @@ impl Owner {
         self.gate.shutdown().await;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "service", feature = "http-client"))]
     pub(crate) async fn read_body_for_test(&self, request: Request) -> Response {
         self.clone()
             .dispatch(
