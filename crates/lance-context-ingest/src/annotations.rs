@@ -909,6 +909,15 @@ impl Service {
         (state, self.apply_backpressure().is_some())
     }
 
+    /// Opt-in diagnostics of the installed base's loaded fragment metadata.
+    /// Does not list objects, read bodies or load native index coverage.
+    pub async fn observation_with_manifest(
+        &self,
+    ) -> (lance_context_core::annotation_staging::Observation, bool) {
+        let state = self.shared.staging.observation_with_manifest().await;
+        (state, self.apply_backpressure().is_some())
+    }
+
     /// Returns the last gate that blocked apply, cleared by successful progress.
     /// Capacity release alone does not clear it until the applier runs again.
     pub fn apply_backpressure(&self) -> Option<ApplyBackpressure> {

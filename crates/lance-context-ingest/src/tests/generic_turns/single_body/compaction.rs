@@ -133,6 +133,18 @@ async fn full_body_compaction_preserves_bodies_row_ids_and_request_results() -> 
     assert_eq!(selected.rows, Some(6));
     let old = annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
     assert_eq!(old.manifest().fragments.len(), 3);
+    let before = service.observation_with_manifest().await.0.installed_base;
+    assert_eq!(before.version, old.version_id());
+    let fragments = before.fragment_summary.unwrap();
+    assert_eq!(fragments.fragments, 3);
+    assert_eq!(fragments.known_size_fragments, 3);
+    assert_eq!(fragments.known_physical_rows_fragments, 3);
+    assert_eq!(fragments.known_physical_rows, Some(6));
+    assert_eq!(fragments.small_fragments[0].fragments, 3);
+    assert_eq!(
+        fragments.small_fragments[0].bytes,
+        fragments.known_size_bytes
+    );
     let ids = row_ids(&old).await?;
     assert_eq!(ids.len(), 6);
     stop.send(()).unwrap();
@@ -174,8 +186,19 @@ async fn full_body_compaction_preserves_bodies_row_ids_and_request_results() -> 
     drained(&c, &service, completed.index).await?;
     stop.send(()).unwrap();
     task.await??;
-    let installed = service.observation().await.0.installed_base;
+    assert!(service
+        .observation()
+        .await
+        .0
+        .installed_base
+        .fragment_summary
+        .is_none());
+    let installed = service.observation_with_manifest().await.0.installed_base;
     assert_eq!(installed.rows, Some(6));
     assert_eq!(installed.version, rewritten.version_id());
+    let fragments = installed.fragment_summary.unwrap();
+    assert_eq!(fragments.fragments, 1);
+    assert_eq!(fragments.known_size_fragments, 1);
+    assert_eq!(fragments.known_physical_rows, Some(6));
     c.shutdown().await
 }
