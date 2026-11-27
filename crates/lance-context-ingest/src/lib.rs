@@ -37,6 +37,8 @@ pub mod annotations;
 pub mod application;
 #[cfg(feature = "materializer")]
 pub mod bootstrap;
+#[cfg(feature = "materializer")]
+pub mod credentials;
 #[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "materializer")]
