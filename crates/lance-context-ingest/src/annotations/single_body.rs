@@ -204,6 +204,7 @@ impl Service {
     pub(super) async fn lookup_prepared_bodies(
         &self,
         mut prepared: crate::turn_ingestion::PreparedTurnLookup,
+        window: lookup_capture::Window,
     ) -> Result<Option<Lookup>> {
         self.shared
             .phases
@@ -221,6 +222,13 @@ impl Service {
                 else {
                     return Ok(None);
                 };
+                self.shared.lookup_capture.record(
+                    self,
+                    spec,
+                    base.dataset(),
+                    &prepared.keys,
+                    window,
+                );
                 let keys = match spec.lookup_prepared(base.dataset().clone(), prepared).await {
                     Ok(keys) => keys,
                     Err(error)

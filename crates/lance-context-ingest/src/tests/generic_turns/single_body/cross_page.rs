@@ -107,6 +107,10 @@ async fn exercise(cancel: bool) -> Result<()> {
             gate.allow.store(true, Ordering::SeqCst);
         }
     }
+    let diagnostic_budget = MergeMemoryBudget::new(1 << 20);
+    let captured = runtime
+        .body_lookup_capture()?
+        .arm(diagnostic_budget.clone())?;
     runtime.apply_once_for_test().await?;
     let observed = service.body_lookup_observation();
     assert_eq!(observed.completed_lookups, 1);
@@ -121,6 +125,16 @@ async fn exercise(cancel: bool) -> Result<()> {
     );
     assert_eq!(service.observation().await.0.applied, backlog[0].1);
     assert_eq!(service.source_observation().records, 1);
+    let captured = tokio::time::timeout(DEADLINE, captured).await???;
+    let window = &captured.data().window;
+    assert_eq!(window.first_record, backlog[0].1);
+    assert_eq!(window.last_record, backlog[7].1);
+    assert_eq!(window.requests, 8);
+    assert_eq!(window.payload_bytes, observed.last_lookup_payload_bytes);
+    assert_eq!(captured.data().staged_keys, 0);
+    assert_eq!(captured.data().keys.len(), 6);
+    drop(captured);
+    assert_eq!(diagnostic_budget.reserved(), 0);
 
     if cancel {
         // Seven admitted requests span two pages, but only the first applied.

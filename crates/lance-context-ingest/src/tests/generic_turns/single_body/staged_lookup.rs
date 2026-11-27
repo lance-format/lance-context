@@ -41,6 +41,8 @@ async fn exercise() -> Result<()> {
         )?)
     };
     let (service, mut runtime) = owner(&c, &storage, &spec).await?;
+    let capture = runtime.body_lookup_capture()?;
+    let diagnostic_budget = MergeMemoryBudget::new(1 << 20);
     let initial = service.observation().await.0.installed_base;
     assert_eq!(initial.rows, Some(0));
     assert!(initial.immutable_body);
@@ -75,11 +77,21 @@ async fn exercise() -> Result<()> {
     let (entered, resume) = faults.pause_data_write();
     let (stop, task) = run_owner(runtime);
     entered.await?;
+    let cancelled = capture.arm(diagnostic_budget.clone())?;
+    assert!(capture.arm(diagnostic_budget.clone()).is_err());
+    drop(cancelled);
+    let mut keys = capture.arm(diagnostic_budget.clone())?;
     let duplicate = request(&service, &lane, 3, encode(1)?).await?;
     let result = service.submit(&duplicate, DEADLINE).await?;
     assert_eq!(result.result, MutationResult::Applied);
     assert_eq!(service.body_lookup_observation().scans_started, 1);
     assert_eq!(service.body_lookup_observation().staged_keys, 4);
+    // All-staged windows do not consume the one-shot historical capture.
+    assert!(matches!(
+        keys.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(diagnostic_budget.reserved(), 0);
     let mixed = request(&service, &lane, 4, encode(2)?).await?;
     let result = service.submit(&mixed, DEADLINE).await?;
     assert_eq!(result.result, MutationResult::Applied);
@@ -87,6 +99,48 @@ async fn exercise() -> Result<()> {
     assert_eq!(service.body_lookup_observation().staged_keys, 6);
     assert_eq!(service.body_lookup_observation().history_hits, 0);
     assert_eq!(service.body_lookup_observation().history_misses, 4);
+    let captured = tokio::time::timeout(DEADLINE, keys).await???;
+    assert!(diagnostic_budget.reserved() > 0);
+    let data = captured.data();
+    assert_eq!(
+        data.owner,
+        annotation_publication::state(&c).await?.authority
+    );
+    assert_eq!(data.incarnation, binding().incarnation);
+    assert_eq!((data.source_group, data.bucket), (10, 0));
+    assert_eq!(data.base_version, initial.version);
+    assert!(data.base_fragment_ids.is_empty());
+    assert_eq!(
+        (data.window.first_record, data.window.last_record),
+        (result.index, result.index)
+    );
+    assert_eq!(data.window.requests, 1);
+    assert_eq!(data.window.payload_bytes, mixed.body().len() as u64);
+    assert!(!data.window.speculative);
+    assert_eq!((data.requested_keys, data.staged_keys), (4, 2));
+    assert_eq!(
+        data.primary_key_columns
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>(),
+        ["session_id", "id"]
+    );
+    let mut expected = (2..4)
+        .map(|row| spec.row_key(&input[2], row, 4096))
+        .collect::<Result<Vec<_>>>()?;
+    expected.sort();
+    assert_eq!(
+        data.keys.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+        expected
+    );
+    // Output contains only identities, not the table URI or any body schema.
+    let json = serde_json::to_value(&captured)?;
+    assert!(json.get("uri").is_none());
+    assert!(json.get("content").is_none());
+    assert!(json.get("_reservation").is_none());
+    let capture_id = data.capture_id;
+    drop(captured);
+    assert_eq!(diagnostic_budget.reserved(), 0);
     let applied = service.observation().await.0.immutable_apply;
     assert_eq!((applied.batches, applied.rows), (4, 10));
     assert_eq!((applied.inserted_rows, applied.duplicate_rows), (4, 6));
@@ -122,9 +176,22 @@ async fn exercise() -> Result<()> {
         annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
     assert_eq!(durable.count_rows(None).await?, 4);
     let before = service.body_lookup_observation();
+    let keys = capture.arm(diagnostic_budget.clone())?;
     let repeated = request(&service, &lane, 5, encode(1)?).await?;
     let result = service.submit(&repeated, DEADLINE).await?;
     let after = service.body_lookup_observation();
+    let captured = tokio::time::timeout(DEADLINE, keys).await???;
+    let data = captured.data();
+    assert_ne!(data.capture_id, capture_id);
+    assert_eq!(data.base_version, selected.manifest.version);
+    assert_eq!(
+        data.base_fragment_ids.as_ref(),
+        durable.iter_fragments().map(|f| f.id).collect::<Vec<_>>()
+    );
+    assert_eq!((data.requested_keys, data.staged_keys), (2, 0));
+    assert_eq!(data.window.first_record, result.index);
+    drop(captured);
+    assert_eq!(diagnostic_budget.reserved(), 0);
     assert_eq!(after.scans_started, before.scans_started + 1);
     assert_eq!(after.native_summaries, before.native_summaries + 1);
     assert_eq!(after.staged_keys, before.staged_keys);
@@ -147,6 +214,23 @@ async fn exercise() -> Result<()> {
             .batch(),
         &input[0].slice(0, 1)
     );
+    drained(&c, &service, result.index).await?;
+    // Diagnostic refusal cannot fail or delay durable apply. The snapshot is
+    // one-shot even on failure, and releases every partial allocation.
+    let held = diagnostic_budget
+        .try_reserve(diagnostic_budget.limit())
+        .unwrap();
+    let keys = capture.arm(diagnostic_budget.clone())?;
+    let repeated = request(&service, &lane, 6, encode(1)?).await?;
+    let result = service.submit(&repeated, DEADLINE).await?;
+    assert_eq!(result.result, MutationResult::Applied);
+    let error = tokio::time::timeout(DEADLINE, keys)
+        .await??
+        .err()
+        .context("capture unexpectedly bypassed admission")?;
+    assert!(error.to_string().contains("budget unavailable"));
+    drop(held);
+    assert_eq!(diagnostic_budget.reserved(), 0);
     drained(&c, &service, result.index).await?;
     stop.send(()).unwrap();
     task.await??;

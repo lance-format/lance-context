@@ -40,10 +40,17 @@ impl Query {
         let native_running = Arc::new(AtomicBool::new(false));
         prepared.native_running = Some(native_running.clone());
         let owner = service.clone();
+        let window = lookup_capture::Window {
+            first_record: head.index,
+            last_record: tail.back().unwrap_or(head).index,
+            requests: tail.len() + 1,
+            payload_bytes: bytes,
+            speculative,
+        };
         Ok(Some(Self {
             service: service.clone(),
             future: Some(Box::pin(async move {
-                owner.lookup_prepared_bodies(prepared).await
+                owner.lookup_prepared_bodies(prepared, window).await
             })),
             result: None,
             native_running,

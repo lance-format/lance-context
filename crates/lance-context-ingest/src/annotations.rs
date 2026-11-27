@@ -22,6 +22,7 @@ use tokio::sync::watch;
 mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
+pub mod lookup_capture;
 mod lookup_observation;
 #[cfg(feature = "service")]
 pub mod metadata_upload;
@@ -99,6 +100,7 @@ struct Shared {
     progress: watch::Sender<Progress>,
     reclamation: Mutex<runtime::reclamation::Observation>,
     body_lookups: Mutex<BodyLookupObservation>,
+    lookup_capture: Arc<lookup_capture::State>,
     phases: Arc<crate::materializer::observation::Counters>,
 }
 
@@ -504,6 +506,7 @@ impl Service {
                 progress,
                 reclamation: Mutex::new(Default::default()),
                 body_lookups: Mutex::new(Default::default()),
+                lookup_capture: Arc::default(),
                 phases: Arc::default(),
             }),
         };

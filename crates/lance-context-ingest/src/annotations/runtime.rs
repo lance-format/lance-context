@@ -92,6 +92,19 @@ impl Runtime {
         Ok(self)
     }
 
+    /// Obtain a process-local, opt-in diagnostic handle bound to this owner.
+    /// Arming it captures one future historical lookup's keys, never bodies.
+    pub fn body_lookup_capture(&self) -> Result<super::lookup_capture::Handle> {
+        ensure!(
+            self.publisher.service.is_single_body(),
+            "not a single body runtime"
+        );
+        Ok(super::lookup_capture::Handle::new(
+            self.publisher.service.shared.lookup_capture.clone(),
+            self.publisher.catalog.authority().clone(),
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) async fn apply_once_for_test(&mut self) -> Result<()> {
         self.driver.step_for_test().await
