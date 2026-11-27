@@ -453,12 +453,10 @@ impl StorageOptionsAccessor {
             provider.provider_id()
         );
 
-        let storage_options_map = provider.force_fetch_storage_options().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to fetch storage options: {}",
-                e
-            ))))
-        })?;
+        let storage_options_map = provider
+            .force_fetch_storage_options()
+            .await
+            .map_err(|error| Error::io_source(Box::new(Error::external(Box::new(error)))))?;
 
         let Some(options) = storage_options_map else {
             if let Some(initial) = &self.initial_options {
@@ -520,12 +518,12 @@ impl StorageOptionsAccessor {
             provider.provider_id()
         );
 
-        let storage_options_map = provider.fetch_storage_options().await.map_err(|e| {
-            Error::io_source(Box::new(std::io::Error::other(format!(
-                "Failed to fetch storage options: {}",
-                e
-            ))))
-        })?;
+        // Preserve the provider's typed error for diagnostics. Keep its meaning
+        // external: a missing credential is not a missing data object.
+        let storage_options_map = provider
+            .fetch_storage_options()
+            .await
+            .map_err(|error| Error::io_source(Box::new(Error::external(Box::new(error)))))?;
 
         let Some(options) = storage_options_map else {
             // Provider returned None, fall back to initial options or use defaults
@@ -688,6 +686,85 @@ impl StorageOptionsAccessor {
 mod tests {
     use super::*;
     use mock_instant::thread_local::MockClock;
+
+    #[derive(Debug)]
+    struct FailsOnceProvider {
+        kind: Option<std::io::ErrorKind>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl StorageOptionsProvider for FailsOnceProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Err(match self.kind {
+                    Some(kind) => std::io::Error::new(kind, "injected provider failure").into(),
+                    None => Error::not_found("injected credential lookup"),
+                });
+            }
+            Ok(Some(HashMap::new()))
+        }
+
+        fn provider_id(&self) -> String {
+            "fails-once-provider".into()
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_failure_keeps_typed_source_without_retrying() {
+        use std::{error::Error as _, io::ErrorKind, sync::atomic::Ordering};
+
+        for force in [false, true] {
+            for kind in [
+                Some(ErrorKind::TimedOut),
+                Some(ErrorKind::PermissionDenied),
+                Some(ErrorKind::Interrupted),
+                None,
+            ] {
+                let provider = Arc::new(FailsOnceProvider {
+                    kind,
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                });
+                let accessor = StorageOptionsAccessor::with_provider(provider.clone());
+                let error = if force {
+                    accessor.refresh_storage_options().await
+                } else {
+                    accessor.get_storage_options().await
+                }
+                .unwrap_err();
+                assert!(matches!(error, Error::IO { .. }));
+                assert!(
+                    !error.is_not_found(),
+                    "provider failure is not a missing data object"
+                );
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                let external = error.source().unwrap().downcast_ref::<Error>().unwrap();
+                let original = external
+                    .external_source()
+                    .unwrap()
+                    .downcast_ref::<Error>()
+                    .unwrap();
+                assert_eq!(original.is_not_found(), kind.is_none());
+                let mut source = error.source();
+                let mut observed = None;
+                while let Some(cause) = source {
+                    if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+                        observed = Some(io.kind());
+                        break;
+                    }
+                    source = cause.source();
+                }
+                assert_eq!(observed, kind, "forced refresh: {force}");
+
+                // A failed refresh must release its cache lock and must not
+                // cache success or retry the provider on the caller's behalf.
+                assert!(accessor.get_storage_options().await.unwrap().0.is_empty());
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                assert!(accessor.get_storage_options().await.unwrap().0.is_empty());
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct MockStorageOptionsProvider {
