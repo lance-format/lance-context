@@ -115,6 +115,7 @@ pub struct Service {
     shared: Arc<Shared>,
     apply_budget: Arc<MergeMemoryBudget>,
     lookup_budget: Option<Arc<MergeMemoryBudget>>,
+    body_lookup_parallelism: Option<crate::turn_ingestion::TurnLookupParallelism>,
 }
 
 struct Pending {
@@ -487,6 +488,7 @@ impl Service {
             limits,
             apply_budget,
             lookup_budget,
+            body_lookup_parallelism: None,
             shared: Arc::new(Shared {
                 narrow: storage.clone(),
                 body,

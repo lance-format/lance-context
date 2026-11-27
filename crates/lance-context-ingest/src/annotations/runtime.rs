@@ -77,6 +77,24 @@ struct Publisher {
 }
 
 impl Runtime {
+    /// Override parallelism within each immutable-body historical query,
+    /// including speculative windows. Configure before running the owner.
+    /// The original shared Session/native pool still admits actual allocations;
+    /// this adds no separate scheduler or budget. Defaults remain unchanged.
+    /// Measure fixed-snapshot query cost and live backlog before choosing values.
+    pub fn with_body_lookup_parallelism(
+        mut self,
+        parallelism: crate::turn_ingestion::TurnLookupParallelism,
+    ) -> Result<Self> {
+        ensure!(
+            self.driver.service.is_single_body(),
+            "body lookup parallelism requires full-body ingestion"
+        );
+        parallelism.validate(&self.publisher.storage.session)?;
+        self.driver.service.body_lookup_parallelism = Some(parallelism);
+        Ok(self)
+    }
+
     /// Opt in to bounded coalescing of underfilled full-body lookup windows.
     /// This gives producer lanes released by Applied time to submit their next
     /// record. It can add up to `wait` of intentional delay per short window;

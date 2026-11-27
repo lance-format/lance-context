@@ -226,7 +226,14 @@ impl Service {
                 self.shared
                     .lookup_capture
                     .record(self, spec, &base, &prepared.keys, window);
-                let keys = match spec.lookup_prepared(base.dataset().clone(), prepared).await {
+                let keys = match spec
+                    .lookup_prepared_with_parallelism(
+                        base.dataset().clone(),
+                        prepared,
+                        self.body_lookup_parallelism,
+                    )
+                    .await
+                {
                     Ok(keys) => keys,
                     Err(error)
                         if error.chain().any(|cause| {

@@ -22,8 +22,8 @@ const MAX_KEY_BYTES: usize = 64 << 10;
 const SCAN_BATCH_ROWS: usize = 2048;
 const ADMITTED_SCAN_READAHEAD: usize = 8;
 
-/// Independent controls for an admitted, unordered membership scan. These
-/// affect one read-only lookup; they do not configure an ingestion owner.
+/// Independent controls within an admitted, unordered membership scan, used
+/// by a standalone lookup or an explicit ingestion Runtime builder override.
 /// More task partitions also increase concurrent decode demand. Both controls
 /// still use the captured Dataset's existing shared native memory pool.
 #[derive(Clone, Copy, Debug)]
@@ -33,13 +33,13 @@ pub struct TurnLookupParallelism {
 }
 
 impl TurnLookupParallelism {
-    fn validate(self, base: &Dataset) -> Result<()> {
+    pub(crate) fn validate(self, session: &lance::session::Session) -> Result<()> {
         ensure!(
             self.task_partitions > 0 && self.fragment_readahead > 0,
             "body lookup parallelism must be nonzero"
         );
         ensure!(
-            base.session().native_memory().is_some(),
+            session.native_memory().is_some(),
             "explicit body lookup parallelism requires a shared native memory pool"
         );
         Ok(())
@@ -186,7 +186,7 @@ impl TurnIngestionSpec {
         workspace: &Arc<MergeMemoryBudget>,
         parallelism: TurnLookupParallelism,
     ) -> Result<Option<TurnLookup>> {
-        parallelism.validate(&base)?;
+        parallelism.validate(&base.session())?;
         let Some(prepared) = self.prepare_lookup(keys, workspace)? else {
             return Ok(None);
         };
@@ -235,12 +235,15 @@ impl TurnIngestionSpec {
             .await
     }
 
-    async fn lookup_prepared_with_parallelism(
+    pub(crate) async fn lookup_prepared_with_parallelism(
         &self,
         base: Arc<Dataset>,
         prepared: PreparedTurnLookup,
         parallelism: Option<TurnLookupParallelism>,
     ) -> Result<TurnLookup> {
+        if let Some(parallelism) = parallelism {
+            parallelism.validate(&base.session())?;
+        }
         ensure!(
             arrow_schema::Schema::from(base.schema()) == *self.body_schema
                 || arrow_schema::Schema::from(base.schema())

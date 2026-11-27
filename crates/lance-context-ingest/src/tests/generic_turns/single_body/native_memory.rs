@@ -514,6 +514,14 @@ async fn two_windows_with_late_tail(
         &spec,
     )
     .await?;
+    let explicit_parallelism = !publish && !cancel && !late_tail;
+    if explicit_parallelism {
+        runtime =
+            runtime.with_body_lookup_parallelism(crate::turn_ingestion::TurnLookupParallelism {
+                task_partitions: 16,
+                fragment_readahead: 16,
+            })?;
+    }
     if matches!(schedule, WindowInput::AfterPromotion) {
         runtime = runtime.with_body_lookup_batch_wait(Duration::from_secs(1))?;
     }
@@ -711,6 +719,7 @@ async fn two_windows_with_late_tail(
         }
         assert_eq!(service.observation().await.0.applied, backlog[8].1);
         if !publish && !late_tail {
+            assert_eq!(service.body_lookup_observation().last_scan_partitions, 16);
             assert_eq!(
                 service.body_lookup_observation().prefetched_lookups_reused,
                 1

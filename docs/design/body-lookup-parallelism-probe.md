@@ -7,6 +7,13 @@ it never substitutes a private pool. The ordinary lookup and ingestion runtime
 retain their existing defaults. This method neither opens tables nor creates an
 owner, reader service, worker, scheduler or persistent configuration.
 
+For live ingestion, `Runtime::with_body_lookup_parallelism(parallelism)` is an
+optional builder override for both foreground and speculative historical queries.
+It uses this same query path and the original shared Session/native pool, rejects
+zero values and a missing native pool, and leaves defaults unchanged when omitted.
+Choose a setting from a fixed-snapshot comparison, then measure publication and
+backlog under actual traffic; the builder itself establishes no speedup.
+
 Use the existing authorized managed-manifest reader to open the capture's exact
 version. Bind the capture's table incarnation, source group/bucket and wire
 contract against the existing host binding, and verify its complete ordered
