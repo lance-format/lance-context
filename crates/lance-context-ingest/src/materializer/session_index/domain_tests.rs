@@ -225,6 +225,7 @@ async fn exercise(existing_address_index: bool) -> Result<()> {
                     query(snapshot, "status IS NULL", &["B", "D"]).await?;
                     query(snapshot, "status = 'ready'", &["A", "E"]).await?;
                 }
+                Key::Routing => unreachable!("routing keys are ZoneMap-only"),
             }
         }
     }

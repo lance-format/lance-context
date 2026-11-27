@@ -78,6 +78,7 @@ fn maintenance_options() -> Options {
         compaction: Some(materializer::SmallFileCompaction {
             target_file_bytes: 8 << 20,
             min_fragments: 2,
+            ..Default::default()
         }),
         ..options()
     }

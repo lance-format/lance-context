@@ -57,6 +57,7 @@ async fn compact_owner_budget(
                 compaction: Some(crate::materializer::SmallFileCompaction {
                     target_file_bytes: 64 << 10,
                     min_fragments: 2,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
