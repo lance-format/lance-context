@@ -394,7 +394,13 @@ impl StreamingProducer {
     /// decides. Pending state is cleared only for lanes that resolved.
     pub async fn fence(&self) -> Result<Fence> {
         let _order = self.sender.lock().await;
+        // Fails if any lane failed a commit (the failure is sticky), so an
+        // empty fence never hides failed or uncommitted records.
         self.shared.buffer.drained().await?;
+        anyhow::ensure!(
+            self.tasks.iter().all(|task| !task.is_finished()),
+            "streaming fence: a lane stopped with records possibly uncommitted"
+        );
         let touched: Vec<_> = self
             .lanes
             .iter()
@@ -433,8 +439,31 @@ impl StreamingProducer {
             .collect()
             .await;
         let mut fence = Fence::default();
+        let mut resolved = Vec::new();
+        let mut first_error = None;
         for result in results {
-            let (slot, applied) = result?;
+            match result {
+                Ok(ok) => resolved.push(ok),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            // A 409 prior_request_rejected or any wait failure: no key from
+            // this fence's lanes may become a skip. Drop every pending key
+            // (keys are never inserted at commit) but keep the receipts, and
+            // poison the producer so no later fence, empty or not, reports
+            // success over the unresolved prefix.
+            for slot in &self.lanes {
+                if let Some(pending) = slot.pending.lock().unwrap().as_mut() {
+                    pending.keys.clear();
+                }
+            }
+            self.shared.buffer.fail(&error);
+            return Err(error.context("streaming fence: applied wait failed"));
+        }
+        for (slot, applied) in resolved {
             // Nothing committed after the snapshot: sender lock held.
             let keys = slot.pending.lock().unwrap().take().map(|p| p.keys).unwrap_or_default();
             if let Some(cache) = self.shared.key_cache.clone() {
