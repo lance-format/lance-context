@@ -2,8 +2,8 @@ use super::*;
 use lance_context_wal::replication::runtime::client::payload_memory::{Pool, Reservation};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-struct Counts {
-    allow: AtomicBool,
+pub(super) struct Counts {
+    pub(super) allow: AtomicBool,
     attempts: AtomicUsize,
     held: AtomicUsize,
     limit: AtomicUsize,
@@ -20,7 +20,7 @@ impl Default for Counts {
         }
     }
 }
-struct Admission(Arc<Counts>);
+pub(super) struct Admission(pub(super) Arc<Counts>);
 struct Charge(Arc<Counts>, usize);
 impl Pool for Admission {
     fn try_reserve(&self, bytes: usize) -> Result<Option<Box<dyn Reservation>>> {

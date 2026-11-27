@@ -8,6 +8,7 @@ use crate::tests::annotation_runtime::{drained, run_owner};
 
 mod compaction;
 mod credentials;
+mod cross_page;
 mod lookahead_pressure;
 mod native_memory;
 mod payload_memory;
