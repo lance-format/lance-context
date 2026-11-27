@@ -22,6 +22,30 @@ const MAX_KEY_BYTES: usize = 64 << 10;
 const SCAN_BATCH_ROWS: usize = 2048;
 const ADMITTED_SCAN_READAHEAD: usize = 8;
 
+/// Independent controls for an admitted, unordered membership scan. These
+/// affect one read-only lookup; they do not configure an ingestion owner.
+/// More task partitions also increase concurrent decode demand. Both controls
+/// still use the captured Dataset's existing shared native memory pool.
+#[derive(Clone, Copy, Debug)]
+pub struct TurnLookupParallelism {
+    pub task_partitions: usize,
+    pub fragment_readahead: usize,
+}
+
+impl TurnLookupParallelism {
+    fn validate(self, base: &Dataset) -> Result<()> {
+        ensure!(
+            (1..=32).contains(&self.task_partitions) && (1..=32).contains(&self.fragment_readahead),
+            "body lookup parallelism must be within 1..=32"
+        );
+        ensure!(
+            base.session().native_memory().is_some(),
+            "explicit body lookup parallelism requires a shared native memory pool"
+        );
+        Ok(())
+    }
+}
+
 /// One admitted lookup window. Projection counters describe returned key
 /// batches; they are not physical object-store or HTTP bytes. Native counters
 /// snapshot successful scans at lookup completion, including early exits.
@@ -142,6 +166,32 @@ impl TurnIngestionSpec {
         Ok(Some(self.lookup_prepared(base, prepared).await?))
     }
 
+    /// Compare parallelism on an already authorized, fixed snapshot using the
+    /// same key admission, predicates, exact membership and early exit as normal
+    /// ingestion. Only eligible unordered native reads change; indexed inputs,
+    /// row streams and ranged reads retain their existing plans.
+    ///
+    /// This does not open a table, retain a GC lease, change owner defaults or
+    /// create a separate memory pool. The caller must bind a captured key set to
+    /// this exact base and retain its original host pool. Native refusal remains
+    /// an error, never a successful miss. Values must be within 1..=32.
+    pub async fn lookup_existing_with_parallelism(
+        &self,
+        base: Arc<Dataset>,
+        keys: &[&str],
+        workspace: &Arc<MergeMemoryBudget>,
+        parallelism: TurnLookupParallelism,
+    ) -> Result<Option<TurnLookup>> {
+        parallelism.validate(&base)?;
+        let Some(prepared) = self.prepare_lookup(keys, workspace)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.lookup_prepared_with_parallelism(base, prepared, Some(parallelism))
+                .await?,
+        ))
+    }
+
     pub(crate) fn prepare_lookup(
         &self,
         keys: &[&str],
@@ -175,6 +225,16 @@ impl TurnIngestionSpec {
         &self,
         base: Arc<Dataset>,
         prepared: PreparedTurnLookup,
+    ) -> Result<TurnLookup> {
+        self.lookup_prepared_with_parallelism(base, prepared, None)
+            .await
+    }
+
+    async fn lookup_prepared_with_parallelism(
+        &self,
+        base: Arc<Dataset>,
+        prepared: PreparedTurnLookup,
+        parallelism: Option<TurnLookupParallelism>,
     ) -> Result<TurnLookup> {
         ensure!(
             arrow_schema::Schema::from(base.schema()) == *self.body_schema
@@ -259,7 +319,11 @@ impl TurnIngestionSpec {
         // Preserve Scanner::execution_options and the logical schema adapter.
         let plan = scan.create_plan().await?;
         let plan = if readahead > 1 {
-            parallel_membership_scan(plan, readahead)?
+            parallel_membership_scan(
+                plan,
+                parallelism.map_or(readahead, |p| p.task_partitions),
+                parallelism.map(|p| p.fragment_readahead),
+            )?
         } else {
             plan
         };
@@ -349,6 +413,7 @@ impl TurnIngestionSpec {
 fn parallel_membership_scan(
     plan: Arc<dyn ExecutionPlan>,
     partitions: usize,
+    fragment_readahead: Option<usize>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
         if read.index_input().is_some()
@@ -358,18 +423,23 @@ fn parallel_membership_scan(
         {
             return Ok(plan);
         }
+        let mut options = read
+            .options()
+            .clone()
+            .with_threading_mode(FilteredReadThreadingMode::MultiplePartitions(partitions));
+        if let Some(fragments) = fragment_readahead {
+            options = options.with_fragment_readahead(fragments);
+        }
         return Ok(Arc::new(FilteredReadExec::try_new(
             read.dataset().clone(),
-            read.options()
-                .clone()
-                .with_threading_mode(FilteredReadThreadingMode::MultiplePartitions(partitions)),
+            options,
             None,
         )?));
     }
     let children = plan
         .children()
         .iter()
-        .map(|child| parallel_membership_scan((*child).clone(), partitions))
+        .map(|child| parallel_membership_scan((*child).clone(), partitions, fragment_readahead))
         .collect::<Result<Vec<_>>>()?;
     if children.is_empty() {
         Ok(plan)

@@ -19,7 +19,7 @@ mod lookup;
 #[cfg(feature = "materializer")]
 pub(crate) use lookup::PreparedTurnLookup;
 #[cfg(feature = "materializer")]
-pub use lookup::{TurnLookup, TurnLookupObservation};
+pub use lookup::{TurnLookup, TurnLookupObservation, TurnLookupParallelism};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

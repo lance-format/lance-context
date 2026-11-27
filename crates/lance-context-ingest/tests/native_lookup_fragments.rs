@@ -9,7 +9,7 @@ use lance::{
     Dataset,
 };
 use lance_context_core::MergeMemoryBudget;
-use lance_context_ingest::turn_ingestion::TurnIngestionSpec;
+use lance_context_ingest::turn_ingestion::{TurnIngestionSpec, TurnLookupParallelism};
 use lance_core::memory::{NativeMemoryKind, NativeMemoryPool, NativeMemoryReservation};
 use std::{
     sync::{
@@ -23,6 +23,7 @@ use std::{
 struct Accounting {
     total: Arc<AtomicUsize>,
     total_peak: AtomicUsize,
+    refuse: AtomicBool,
 }
 #[derive(Debug)]
 struct Charge {
@@ -55,6 +56,9 @@ impl NativeMemoryPool for Accounting {
         _: NativeMemoryKind,
         bytes: usize,
     ) -> lance_core::Result<Box<dyn NativeMemoryReservation>> {
+        if self.refuse.load(Ordering::SeqCst) {
+            return Err(lance_core::Error::backpressure("test native refusal"));
+        }
         let mut current = self.total.load(Ordering::SeqCst);
         loop {
             let next = current
@@ -265,6 +269,203 @@ fn partitions(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
     } else {
         Ok(plan.with_new_children(children)?)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_lookup_parallelism_preserves_membership_and_admission() -> Result<()> {
+    const ROWS: u64 = 65_536;
+    const FILE_ROWS: u64 = 2048;
+    let root = tempfile::tempdir()?;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("id", DataType::Utf8, false),
+    ]));
+    let spec = TurnIngestionSpec::new(
+        schema.clone(),
+        vec!["session_id".into(), "id".into()],
+        "session_id",
+    )?;
+    let input = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from_iter_values((0..ROWS).map(session))),
+            Arc::new(StringArray::from_iter_values((0..ROWS).map(hash))),
+        ],
+    )?;
+    let uri = format!(
+        "file-object-store://{}",
+        root.path().join("probe.lance").display()
+    );
+    let dataset = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(input)], schema),
+        &uri,
+        Some(WriteParams {
+            max_rows_per_file: FILE_ROWS as usize,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let first_file = dataset.manifest().fragments[0].files[0].path.clone();
+    assert_eq!(dataset.fragments().len(), 32);
+    let keys = [0, FILE_ROWS + 1, ROWS - 1, ROWS + 7]
+        .into_iter()
+        .map(|n| spec.business_key(&[&session(n), &hash(n)], 4096))
+        .collect::<Result<Vec<_>>>()?;
+    let refs = keys.iter().map(String::as_str).collect::<Vec<_>>();
+    let workspace = MergeMemoryBudget::new(1 << 20);
+    let memory = Arc::new(Accounting::default());
+    let base = Arc::new(
+        DatasetBuilder::from_uri(&uri)
+            .with_session(Arc::new(
+                lance::session::Session::default().with_native_memory(memory.clone()),
+            ))
+            .load()
+            .await?,
+    );
+    let ordinary = spec
+        .lookup_existing(base.clone(), &refs, &workspace)
+        .await?
+        .unwrap();
+    assert_eq!(ordinary.observation().scan_partitions, 8);
+    let expected = keys.iter().map(|key| ordinary.get(key)).collect::<Vec<_>>();
+    assert_eq!(expected, [Some(true), Some(true), Some(true), Some(false)]);
+    drop(ordinary);
+    for (task_partitions, fragment_readahead) in
+        [(1, 1), (8, 8), (16, 8), (32, 8), (8, 16), (8, 32)]
+    {
+        let found = spec
+            .lookup_existing_with_parallelism(
+                base.clone(),
+                &refs,
+                &workspace,
+                TurnLookupParallelism {
+                    task_partitions,
+                    fragment_readahead,
+                },
+            )
+            .await?
+            .unwrap();
+        assert!(found.matches(&base));
+        for (key, expected) in keys.iter().zip(&expected) {
+            assert_eq!(found.get(key), *expected);
+        }
+        assert_eq!(found.get(&keys[3]), Some(false));
+        assert_eq!(found.observation().scan_partitions, task_partitions);
+        assert_eq!(found.observation().rows_scanned, Some(ROWS as usize));
+        assert_eq!(found.observation().fragments_scanned, Some(32));
+        if task_partitions > 1 {
+            assert!(found
+                .observation()
+                .fragment_streams_peak
+                .is_some_and(|n| n <= fragment_readahead));
+        }
+    }
+    let settings = TurnLookupParallelism {
+        task_partitions: 32,
+        fragment_readahead: 8,
+    };
+    for (task_partitions, fragment_readahead) in [(0, 8), (33, 8), (8, 0), (8, 33)] {
+        assert!(spec
+            .lookup_existing_with_parallelism(
+                base.clone(),
+                &refs,
+                &workspace,
+                TurnLookupParallelism {
+                    task_partitions,
+                    fragment_readahead
+                }
+            )
+            .await
+            .is_err());
+    }
+    // Explicit parallelism cannot bypass a missing native pool or key admission.
+    assert!(spec
+        .lookup_existing_with_parallelism(Arc::new(dataset), &refs, &workspace, settings)
+        .await
+        .is_err());
+    let held = workspace.reserve(workspace.limit()).await;
+    assert!(spec
+        .lookup_existing_with_parallelism(base.clone(), &refs, &workspace, settings)
+        .await?
+        .is_none());
+    drop(held);
+    memory.refuse.store(true, Ordering::SeqCst);
+    assert!(spec
+        .lookup_existing_with_parallelism(base.clone(), &refs, &workspace, settings)
+        .await
+        .is_err());
+    drop(base);
+    assert_eq!(workspace.reserved(), 0);
+    wait_released(&memory, None).await?;
+
+    for all_hits in [false, true] {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reads = Arc::new(Reads {
+            slow_path: first_file.clone(),
+            delay: Duration::from_secs(60),
+            release: Some(release.clone()),
+            ..Default::default()
+        });
+        let memory = Arc::new(Accounting::default());
+        let base = Arc::new(
+            DatasetBuilder::from_uri(&uri)
+                .with_store_params(ObjectStoreParams {
+                    object_store_wrapper: Some(Arc::new(Wrapper(reads.clone()))),
+                    ..Default::default()
+                })
+                .with_session(Arc::new(
+                    lance::session::Session::default().with_native_memory(memory.clone()),
+                ))
+                .load()
+                .await?,
+        );
+        if all_hits {
+            // A hit in another fragment returns while the first fragment is gated.
+            let found = tokio::time::timeout(
+                Duration::from_secs(5),
+                spec.lookup_existing_with_parallelism(
+                    base.clone(),
+                    &refs[1..2],
+                    &workspace,
+                    settings,
+                ),
+            )
+            .await
+            .context("explicit lookup lost all-hit early exit")??
+            .unwrap();
+            assert_eq!(found.get(refs[1]), Some(true));
+            assert!(reads.slowed.load(Ordering::SeqCst));
+        } else {
+            // The missing key requires EOF. Cancel after the gate was entered,
+            // before releasing it, so cancellation is deterministic.
+            let lookup =
+                spec.lookup_existing_with_parallelism(base.clone(), &refs, &workspace, settings);
+            tokio::pin!(lookup);
+            tokio::select! {
+                result = &mut lookup => anyhow::bail!("lookup ended before cancellation: {:?}", result.err()),
+                result = tokio::time::timeout(Duration::from_secs(5), async {
+                    while !reads.slowed.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
+                }) => result?,
+            }
+        }
+        drop(base);
+        release.notify_one();
+        wait_released(&memory, Some(&reads)).await?;
+        assert_eq!(workspace.reserved(), 0);
+    }
+    Ok(())
+}
+
+async fn wait_released(memory: &Accounting, reads: Option<&Reads>) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while memory.total.load(Ordering::SeqCst) != 0
+            || reads.is_some_and(|r| r.active.load(Ordering::SeqCst) != 0)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("native lookup resources did not release")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
