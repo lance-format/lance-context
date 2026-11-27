@@ -370,7 +370,10 @@ pub(super) async fn prepare(
                 // Keep the metadata entry; this record starts a later window.
                 break PrefetchStop::KeyBound;
             }
-            let retain = resident.0 < MAX_REQUESTS
+            // Owner batch mode keeps no bodies at all: survivors are
+            // refetched from the WAL when the write batch is published.
+            let retain = !service.owner_batch()
+                && resident.0 < MAX_REQUESTS
                 && next.meta.body_bytes <= MAX_PAYLOAD_BYTES.saturating_sub(resident.1);
             if retain {
                 resident = (resident.0 + 1, resident.1 + next.meta.body_bytes);
