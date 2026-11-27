@@ -77,6 +77,52 @@ struct Publisher {
 }
 
 impl Runtime {
+    /// Override parallelism within each immutable-body historical query,
+    /// including speculative windows. Configure before running the owner.
+    /// The original shared Session/native pool still admits actual allocations;
+    /// this adds no separate scheduler or budget. Defaults remain unchanged.
+    /// Measure fixed-snapshot query cost and live backlog before choosing values.
+    pub fn with_body_lookup_parallelism(
+        mut self,
+        parallelism: crate::turn_ingestion::TurnLookupParallelism,
+    ) -> Result<Self> {
+        ensure!(
+            self.driver.service.is_single_body(),
+            "body lookup parallelism requires full-body ingestion"
+        );
+        parallelism.validate(&self.publisher.storage.session)?;
+        self.driver.service.body_lookup_parallelism = Some(parallelism);
+        Ok(self)
+    }
+
+    /// Opt in to bounded coalescing of underfilled full-body lookup windows.
+    /// This gives producer lanes released by Applied time to submit their next
+    /// record. It can add up to `wait` of intentional delay per short window;
+    /// request processing and network timeouts retain their existing bounds.
+    /// The default is zero. Configure before running this owner and measure
+    /// source ACK latency/backlog as well as keys per scan before enabling.
+    pub fn with_body_lookup_batch_wait(mut self, wait: Duration) -> Result<Self> {
+        ensure!(
+            self.driver.service.is_single_body() && wait <= Duration::from_secs(1),
+            "body lookup batch wait requires full-body ingestion and at most one second"
+        );
+        self.driver.body_batch_wait = wait;
+        Ok(self)
+    }
+
+    /// Obtain a process-local, opt-in diagnostic handle bound to this owner.
+    /// Arming it captures one future historical lookup's keys, never bodies.
+    pub fn body_lookup_capture(&self) -> Result<super::lookup_capture::Handle> {
+        ensure!(
+            self.publisher.service.is_single_body(),
+            "not a single body runtime"
+        );
+        Ok(super::lookup_capture::Handle::new(
+            self.publisher.service.shared.lookup_capture.clone(),
+            self.publisher.catalog.authority().clone(),
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) async fn apply_once_for_test(&mut self) -> Result<()> {
         self.driver.step_for_test().await

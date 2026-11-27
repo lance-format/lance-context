@@ -1,0 +1,658 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+//! Vector Transforms
+//!
+
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use arrow::datatypes::UInt64Type;
+use arrow_array::UInt64Array;
+use arrow_array::types::{Float16Type, Float32Type, Float64Type};
+use arrow_array::{Array, ArrowPrimitiveType, RecordBatch, UInt32Array, cast::AsArray};
+use arrow_schema::{DataType, Field, Schema};
+use lance_arrow::RecordBatchExt;
+use num_traits::Float;
+
+use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
+use lance_linalg::kernels::normalize_fsl;
+use tracing::instrument;
+
+use super::pca::{PcaModel, non_finite_output};
+
+/// Transform of a Vector Matrix.
+///
+///
+pub trait Transformer: Debug + Send + Sync {
+    /// Transform a [`RecordBatch`] of vectors
+    ///
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch>;
+}
+
+/// Normalize Transformer
+///
+/// L2 Normalize each vector.
+#[derive(Debug)]
+pub struct NormalizeTransformer {
+    input_column: String,
+    output_column: Option<String>,
+}
+
+impl NormalizeTransformer {
+    pub fn new(column: impl AsRef<str>) -> Self {
+        Self {
+            input_column: column.as_ref().to_owned(),
+            output_column: None,
+        }
+    }
+
+    /// Create Normalize output transform that will be stored in a different column.
+    ///
+    pub fn new_with_output(input_column: impl AsRef<str>, output_column: impl AsRef<str>) -> Self {
+        Self {
+            input_column: input_column.as_ref().to_owned(),
+            output_column: Some(output_column.as_ref().to_owned()),
+        }
+    }
+}
+
+impl Transformer for NormalizeTransformer {
+    #[instrument(name = "NormalizeTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let arr = batch.column_by_name(&self.input_column).ok_or_else(|| {
+            Error::index(format!(
+                "Normalize Transform: column {} not found in RecordBatch {}",
+                self.input_column,
+                batch.schema(),
+            ))
+        })?;
+
+        let data = arr.as_fixed_size_list();
+        let norm = normalize_fsl(data)?;
+        let transformed = Arc::new(norm);
+
+        if let Some(output_column) = &self.output_column {
+            let field = Field::new(output_column, transformed.data_type().clone(), true);
+            Ok(batch.try_with_column(field, transformed)?)
+        } else {
+            Ok(batch.replace_column_by_name(&self.input_column, transformed)?)
+        }
+    }
+}
+
+/// Only keep the vectors that is finite number, filter out NaN and Inf.
+#[derive(Debug)]
+pub(crate) struct KeepFiniteVectors {
+    column: String,
+}
+
+impl KeepFiniteVectors {
+    pub fn new(column: impl AsRef<str>) -> Self {
+        Self {
+            column: column.as_ref().to_owned(),
+        }
+    }
+}
+
+fn is_all_finite<T: ArrowPrimitiveType>(arr: &dyn Array) -> bool
+where
+    T::Native: Float,
+{
+    arr.null_count() == 0
+        && !arr
+            .as_primitive::<T>()
+            .values()
+            .iter()
+            .any(|&v| !v.is_finite())
+}
+
+impl Transformer for KeepFiniteVectors {
+    #[instrument(name = "KeepFiniteVectors::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let Some(arr) = batch.column_by_name(&self.column) else {
+            return Ok(batch.clone());
+        };
+
+        let data = match arr.data_type() {
+            DataType::FixedSizeList(_, _) => arr.as_fixed_size_list(),
+            DataType::List(_) => arr.as_list::<i32>().values().as_fixed_size_list(),
+            _ => {
+                return Err(Error::index(format!(
+                    "KeepFiniteVectors: column {} is not a fixed size list: {}",
+                    self.column,
+                    arr.data_type()
+                )));
+            }
+        };
+
+        let mut valid = Vec::with_capacity(batch.num_rows());
+        data.iter().enumerate().for_each(|(idx, arr)| {
+            if let Some(data) = arr {
+                let is_valid = match data.data_type() {
+                    // f16 vectors are computed in f32 space, so they will not overflow.
+                    DataType::Float16 => is_all_finite::<Float16Type>(&data),
+                    // f32 vectors must be bounded to avoid overflow in distance computation.
+                    DataType::Float32 => is_all_finite::<Float32Type>(&data),
+                    // f32 vectors are computed in f32 space, so they have the same limit as f64.
+                    DataType::Float64 => is_all_finite::<Float64Type>(&data),
+                    DataType::UInt8 => data.null_count() == 0,
+                    DataType::Int8 => data.null_count() == 0,
+                    _ => false,
+                };
+                if is_valid {
+                    valid.push(idx as u32);
+                }
+            };
+        });
+        if valid.len() < batch.num_rows() {
+            let indices = UInt32Array::from(valid);
+            Ok(batch.take(&indices)?)
+        } else {
+            Ok(batch.clone())
+        }
+    }
+}
+
+/// Replaces a fixed-size-list vector column with its PCA projection.
+///
+/// The input child values may be Float16, Float32, or Float64. The projected
+/// column always contains Float32 values, while all other columns are preserved.
+#[derive(Debug)]
+pub struct PcaTransformer {
+    model: Arc<PcaModel>,
+    input_column: String,
+}
+
+impl PcaTransformer {
+    /// Creates a transformer backed by one shared trained model.
+    pub fn new(model: Arc<PcaModel>, input_column: impl AsRef<str>) -> Self {
+        Self {
+            model,
+            input_column: input_column.as_ref().to_owned(),
+        }
+    }
+}
+
+impl Transformer for PcaTransformer {
+    #[instrument(name = "PcaTransformer::transform", level = "debug", skip_all)]
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let vectors = batch.column_by_name(&self.input_column).ok_or_else(|| {
+            Error::index(format!(
+                "PCA Transform: column {} not found in RecordBatch {}",
+                self.input_column,
+                batch.schema()
+            ))
+        })?;
+        let vectors = vectors.as_fixed_size_list_opt().ok_or_else(|| {
+            Error::index(format!(
+                "PCA Transform: column {} is not a FixedSizeListArray: {}",
+                self.input_column,
+                vectors.data_type()
+            ))
+        })?;
+        let transformed = self.model.transform(vectors).map_err(|error| {
+            let message = error.to_string();
+            let row_id = non_finite_output(&error).and_then(|failure| {
+                let row = failure.row;
+                batch
+                    .column_by_name(ROW_ID)
+                    .and_then(|row_ids| row_ids.as_primitive_opt::<UInt64Type>())
+                    .filter(|row_ids| row < row_ids.len() && row_ids.is_valid(row))
+                    .map(|row_ids| row_ids.value(row))
+            });
+            match row_id {
+                Some(row_id) => Error::invalid_input(format!(
+                    "PCA Transform: column {}, row_id={row_id}: {message}",
+                    self.input_column
+                )),
+                None => Error::invalid_input(format!(
+                    "PCA Transform: column {}: {message}",
+                    self.input_column
+                )),
+            }
+        })?;
+        let transformed = Arc::new(transformed);
+        Ok(batch.replace_column_schema_by_name(
+            &self.input_column,
+            transformed.data_type().clone(),
+            transformed,
+        )?)
+    }
+}
+
+#[derive(Debug)]
+pub struct DropColumn {
+    column: String,
+}
+
+impl DropColumn {
+    pub fn new(column: &str) -> Self {
+        Self {
+            column: column.to_owned(),
+        }
+    }
+}
+
+impl Transformer for DropColumn {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        Ok(batch.drop_column(&self.column)?)
+    }
+}
+
+#[derive(Debug)]
+pub struct Flatten {
+    column: String,
+}
+
+impl Flatten {
+    pub fn new(column: &str) -> Self {
+        Self {
+            column: column.to_owned(),
+        }
+    }
+}
+
+impl Transformer for Flatten {
+    fn transform(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let Some(arr) = batch.column_by_name(&self.column) else {
+            // this case is that we have precomputed buffers,
+            // so we don't need to flatten the original vectors.
+            return Ok(batch.clone());
+        };
+        match arr.data_type() {
+            DataType::FixedSizeList(_, _) => Ok(batch.clone()),
+            DataType::List(_) => {
+                let row_ids = batch[ROW_ID].as_primitive::<UInt64Type>();
+                let vectors = arr.as_list::<i32>();
+
+                let row_ids = row_ids.values().iter().zip(vectors.iter()).flat_map(
+                    |(row_id, multivector)| {
+                        std::iter::repeat_n(
+                            *row_id,
+                            multivector.map(|multivec| multivec.len()).unwrap_or(0),
+                        )
+                    },
+                );
+                let row_ids = UInt64Array::from_iter_values(row_ids);
+                let vectors = vectors.values().as_fixed_size_list().clone();
+                let schema = Arc::new(Schema::new(vec![
+                    ROW_ID_FIELD.clone(),
+                    Field::new(self.column.as_str(), vectors.data_type().clone(), true),
+                ]));
+                let batch =
+                    RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(vectors)])?;
+                Ok(batch)
+            }
+            _ => Err(Error::index(format!(
+                "Flatten: column {} is not a vector: {}",
+                self.column,
+                arr.data_type()
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use approx::assert_relative_eq;
+    use arrow::buffer::NullBuffer;
+    use arrow_array::{
+        FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int32Array, UInt64Array,
+    };
+    use arrow_schema::Schema;
+    use half::f16;
+    use lance_arrow::*;
+    use lance_linalg::distance::L2;
+
+    fn train_test_pca() -> Arc<PcaModel> {
+        let values = Float32Array::from(vec![1.0, 0.0, 0.0, 2.0, -1.0, 0.0, 0.0, -2.0]);
+        let vectors = FixedSizeListArray::try_new_from_values(values, 2).unwrap();
+        Arc::new(
+            PcaModel::train(&vectors, &super::super::pca::PcaParams::new(1))
+                .expect("PCA training should succeed"),
+        )
+    }
+
+    #[test]
+    fn test_pca_transformer_replaces_vector_and_preserves_columns() {
+        let input_values = [1.0_f32, 0.5, -1.0, -0.5];
+        let vectors = vec![
+            FixedSizeListArray::try_new_from_values(
+                Float16Array::from_iter_values(input_values.map(f16::from_f32)),
+                2,
+            )
+            .unwrap(),
+            FixedSizeListArray::try_new_from_values(Float32Array::from(input_values.to_vec()), 2)
+                .unwrap(),
+            FixedSizeListArray::try_new_from_values(
+                Float64Array::from(input_values.map(f64::from).to_vec()),
+                2,
+            )
+            .unwrap(),
+        ];
+        let row_ids = UInt64Array::from(vec![11, 12]);
+        let payload = Int32Array::from(vec![7, 8]);
+        let transformer = PcaTransformer::new(train_test_pca(), "vector");
+
+        for vectors in vectors {
+            let schema = Schema::new(vec![
+                ROW_ID_FIELD.clone(),
+                Field::new("payload", DataType::Int32, false),
+                Field::new("vector", vectors.data_type().clone(), true),
+            ]);
+            let batch = RecordBatch::try_new(
+                Arc::new(schema),
+                vec![
+                    Arc::new(row_ids.clone()),
+                    Arc::new(payload.clone()),
+                    Arc::new(vectors),
+                ],
+            )
+            .unwrap();
+
+            let output = transformer.transform(&batch).unwrap();
+            let transformed = output["vector"].as_fixed_size_list();
+            assert_eq!(transformed.value_type(), DataType::Float32);
+            assert_eq!(transformed.value_length(), 1);
+            assert_eq!(output[ROW_ID].as_ref(), &row_ids);
+            assert_eq!(output["payload"].as_ref(), &payload);
+        }
+    }
+
+    #[test]
+    fn test_pca_transformer_reports_non_finite_input() {
+        let vectors =
+            FixedSizeListArray::try_new_from_values(Float32Array::from(vec![f32::NAN, 0.0]), 2)
+                .unwrap();
+        let schema = Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("vector", vectors.data_type().clone(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(UInt64Array::from(vec![42])), Arc::new(vectors)],
+        )
+        .unwrap();
+
+        let error = PcaTransformer::new(train_test_pca(), "vector")
+            .transform(&batch)
+            .expect_err("non-finite input should fail");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("non-finite"));
+    }
+
+    #[test]
+    fn test_pca_transformer_reports_non_finite_output_with_row_id() {
+        let training = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 1.0, -1.0, -1.0, 2.0, 2.0, -2.0, -2.0]),
+            2,
+        )
+        .unwrap();
+        let model = Arc::new(
+            PcaModel::train(&training, &super::super::pca::PcaParams::new(1))
+                .expect("PCA training should succeed"),
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![f32::MAX, f32::MAX]),
+            2,
+        )
+        .unwrap();
+        let schema = Schema::new(vec![
+            ROW_ID_FIELD.clone(),
+            Field::new("vector", vectors.data_type().clone(), true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
+            vec![Arc::new(UInt64Array::from(vec![1234])), Arc::new(vectors)],
+        )
+        .unwrap();
+
+        let error = PcaTransformer::new(model, "vector")
+            .transform(&batch)
+            .expect_err("non-finite output should fail");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let message = error.to_string();
+        assert!(message.contains("row_id=1234"), "{message}");
+        assert!(message.contains("value="), "{message}");
+        assert!(message.contains("output_dimension=0"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn test_normalize_transformer_f32() {
+        let data = Float32Array::from_iter_values([1.0, 1.0, 2.0, 2.0].into_iter());
+        let fsl = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
+        let transformer = NormalizeTransformer::new("v");
+        let output = transformer.transform(&batch).unwrap();
+        let actual = output.column_by_name("v").unwrap();
+        let act_fsl = actual.as_fixed_size_list();
+        assert_eq!(act_fsl.len(), 2);
+        assert_relative_eq!(
+            act_fsl.value(0).as_primitive::<Float32Type>().values()[..],
+            [1.0 / 2.0_f32.sqrt(); 2]
+        );
+        assert_relative_eq!(
+            act_fsl.value(1).as_primitive::<Float32Type>().values()[..],
+            [2.0 / 8.0_f32.sqrt(); 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normalize_transformer_16() {
+        let data =
+            Float16Array::from_iter_values([1.0_f32, 1.0, 2.0, 2.0].into_iter().map(f16::from_f32));
+        let fsl = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float16, true)), 2),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap();
+        let transformer = NormalizeTransformer::new("v");
+        let output = transformer.transform(&batch).unwrap();
+        let actual = output.column_by_name("v").unwrap();
+        let act_fsl = actual.as_fixed_size_list();
+        assert_eq!(act_fsl.len(), 2);
+        let expect_1 = [f16::from_f32_const(1.0) / f16::from_f32_const(2.0).sqrt(); 2];
+        act_fsl
+            .value(0)
+            .as_primitive::<Float16Type>()
+            .values()
+            .iter()
+            .zip(expect_1.iter())
+            .for_each(|(a, b)| assert!(a - b <= f16::epsilon()));
+
+        let expect_2 = [f16::from_f32_const(2.0) / f16::from_f32_const(8.0).sqrt(); 2];
+        act_fsl
+            .value(1)
+            .as_primitive::<Float16Type>()
+            .values()
+            .iter()
+            .zip(expect_2.iter())
+            .for_each(|(a, b)| assert!(a - b <= f16::epsilon()));
+    }
+
+    #[tokio::test]
+    async fn test_normalize_transformer_with_output_column() {
+        let data = Float32Array::from_iter_values([1.0, 1.0, 2.0, 2.0].into_iter());
+        let fsl = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            true,
+        )]);
+        let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(fsl.clone())]).unwrap();
+        let transformer = NormalizeTransformer::new_with_output("v", "o");
+        let output = transformer.transform(&batch).unwrap();
+        let input = output.column_by_name("v").unwrap();
+        assert_eq!(input.as_ref(), &fsl);
+        let actual = output.column_by_name("o").unwrap();
+        let act_fsl = actual.as_fixed_size_list();
+        assert_eq!(act_fsl.len(), 2);
+        assert_relative_eq!(
+            act_fsl.value(0).as_primitive::<Float32Type>().values()[..],
+            [1.0 / 2.0_f32.sqrt(); 2]
+        );
+        assert_relative_eq!(
+            act_fsl.value(1).as_primitive::<Float32Type>().values()[..],
+            [2.0 / 8.0_f32.sqrt(); 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_column() {
+        let i32_array = Int32Array::from_iter_values([1, 2].into_iter());
+        let data = Float32Array::from_iter_values([1.0, 1.0, 2.0, 2.0].into_iter());
+        let fsl = FixedSizeListArray::try_new_from_values(data, 2).unwrap();
+        let schema = Schema::new(vec![
+            Field::new("i32", DataType::Int32, false),
+            Field::new(
+                "v",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            ),
+        ]);
+        let batch =
+            RecordBatch::try_new(schema.into(), vec![Arc::new(i32_array), Arc::new(fsl)]).unwrap();
+        let transformer = DropColumn::new("v");
+        let output = transformer.transform(&batch).unwrap();
+        assert!(output.column_by_name("v").is_none());
+
+        let dup_drop_result = transformer.transform(&output);
+        assert!(dup_drop_result.is_ok());
+    }
+
+    /// Builds a 2-dim FSL column with one row per `rows` entry. `None` means a
+    /// null vector; otherwise the two f32 values are used as-is.
+    fn fsl_batch(rows: &[Option<[f32; 2]>]) -> RecordBatch {
+        let values = Float32Array::from(
+            rows.iter()
+                .flat_map(|row| row.unwrap_or([0.0, 0.0]))
+                .collect::<Vec<f32>>(),
+        );
+        let nulls = NullBuffer::from(rows.iter().map(Option::is_some).collect::<Vec<bool>>());
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let fsl =
+            FixedSizeListArray::try_new(item.clone(), 2, Arc::new(values), Some(nulls)).unwrap();
+        let schema = Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeList(item, 2),
+            true,
+        )]);
+        RecordBatch::try_new(schema.into(), vec![Arc::new(fsl)]).unwrap()
+    }
+
+    #[test]
+    fn test_keep_finite_vectors_drops_null_and_non_finite_rows() {
+        let batch = fsl_batch(&[
+            Some([1.0, 2.0]),
+            None,
+            Some([f32::NAN, 1.0]),
+            Some([f32::INFINITY, 1.0]),
+            Some([f32::NEG_INFINITY, 1.0]),
+            Some([1e20, -1e20]),
+            Some([3.0, 4.0]),
+        ]);
+        let output = KeepFiniteVectors::new("v").transform(&batch).unwrap();
+
+        let kept = output.column_by_name("v").unwrap().as_fixed_size_list();
+        assert_eq!(kept.len(), 3, "only finite rows survive");
+        assert_eq!(kept.null_count(), 0);
+        assert_eq!(
+            kept.values().as_primitive::<Float32Type>().values(),
+            &[1.0, 2.0, 1e20, -1e20, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn test_keep_finite_vectors_on_all_null_and_empty_batches() {
+        let all_null = fsl_batch(&[None, None]);
+        assert_eq!(
+            KeepFiniteVectors::new("v")
+                .transform(&all_null)
+                .unwrap()
+                .num_rows(),
+            0
+        );
+
+        let empty = fsl_batch(&[]);
+        assert_eq!(
+            KeepFiniteVectors::new("v")
+                .transform(&empty)
+                .unwrap()
+                .num_rows(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_keep_finite_vectors_passes_through_missing_column() {
+        // A batch without the configured column is returned untouched rather
+        // than erroring, so the transform is a no-op on unrelated batches.
+        let batch = fsl_batch(&[Some([1.0, 2.0])]);
+        let output = KeepFiniteVectors::new("other").transform(&batch).unwrap();
+        assert_eq!(output.num_rows(), 1);
+    }
+
+    #[test]
+    fn test_keep_finite_vectors_rejects_non_list_column() {
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new("v", DataType::Int32, false)]).into(),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let error = KeepFiniteVectors::new("v").transform(&batch).unwrap_err();
+        assert!(matches!(error, Error::Index { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("column v"), "{message}");
+        assert!(message.contains("Int32"), "{message}");
+    }
+
+    #[test]
+    fn test_is_all_finite() {
+        let array = Float32Array::from(vec![1.0, 2.0]);
+        assert!(is_all_finite::<Float32Type>(&array));
+
+        let failure_values = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        for &v in &failure_values {
+            let array = Float32Array::from(vec![1.0, v]);
+            assert!(
+                !is_all_finite::<Float32Type>(&array),
+                "value {} should fail is_all_finite",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_finite_f16() {
+        let v1 = vec![f16::MAX; 10_000];
+        let v2 = vec![f16::MAX - f16::from_f32_const(1.0); 10_000];
+        let distance = f16::l2(&v1, &v2);
+        assert!(distance.is_finite());
+    }
+
+    #[test]
+    fn test_finite_f32() {
+        let v1 = vec![f32::MAX; 10_000];
+        let v2 = vec![f32::MAX - 1.0; 10_000];
+        let distance = f32::l2(&v1, &v2);
+        assert!(distance.is_finite());
+    }
+
+    #[test]
+    fn test_finite_f64() {
+        let v1 = vec![f64::MAX; 10_000];
+        let v2 = vec![f64::MAX - 1.0; 10_000];
+        let distance = f64::l2(&v1, &v2);
+        assert!(distance.is_finite());
+    }
+}

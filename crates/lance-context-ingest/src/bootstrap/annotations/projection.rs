@@ -98,7 +98,7 @@ pub async fn provision(
             scope.incarnation,
         )?;
         let selected = DatasetBuilder::from_uri(&storage.uri)
-            .with_storage_options(storage.options.clone())
+            .with_read_params(storage.read_params(Default::default()))
             .with_session(storage.session.clone())
             .with_commit_handler(Arc::new(reader))
             .load()
@@ -119,13 +119,13 @@ pub async fn provision(
     let (source_store, source_path) = ObjectStore::from_uri_and_params(
         origin.session.store_registry(),
         &origin.uri,
-        &parameters(&origin.options),
+        &origin.params,
     )
     .await?;
     let (target_store, target_path) = ObjectStore::from_uri_and_params(
         storage.session.store_registry(),
         &storage.uri,
-        &parameters(&storage.options),
+        &storage.params,
     )
     .await?;
     ensure!(
@@ -285,7 +285,7 @@ pub(crate) async fn project(
         mode: WriteMode::Create,
         enable_stable_row_ids: true,
         max_bytes_per_file: workspace_bytes,
-        store_params: Some(parameters(&storage.options)),
+        store_params: Some(storage.params.clone()),
         session: Some(storage.session.clone()),
         commit_handler: Some(Arc::new(ExactVersion(1))),
         skip_auto_cleanup: true,
@@ -329,7 +329,7 @@ pub(crate) async fn index(storage: &Storage, initial: &Dataset, marker: &str) ->
     let indexed = if current.version_id() == 1 {
         let mut target = DatasetBuilder::from_uri(&storage.uri)
             .with_version(1)
-            .with_storage_options(storage.options.clone())
+            .with_read_params(storage.read_params(Default::default()))
             .with_session(storage.session.clone())
             .with_commit_handler(Arc::new(ExactVersion(2)))
             .load()

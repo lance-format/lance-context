@@ -1,0 +1,926 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+use std::hash::{BuildHasher, RandomState};
+
+use bytes::Bytes;
+
+use hashbrown::{HashTable, hash_table::Entry};
+
+use super::super::token_lookup;
+use super::*;
+use token_lookup::{FIRST_TOKEN_COL, LOOKUP_FST_COL, LOOKUP_VERSION_KEY};
+
+// Bytes keeps the Arrow allocation (and any native-memory reservation) alive.
+// Arrow implements AsRef<[u8]> for &Buffer, but not for an owned Buffer.
+struct FstBuffer(arrow::buffer::Buffer);
+
+impl AsRef<[u8]> for FstBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+struct TokenBytesWriter {
+    values: Vec<u8>,
+    reservation: lance_core::memory::NativeReservation,
+    memory: lance_core::memory::NativeMemory,
+}
+
+impl TokenBytesWriter {
+    fn new(memory: lance_core::memory::NativeMemory) -> Self {
+        Self {
+            values: Vec::new(),
+            reservation: None,
+            memory,
+        }
+    }
+
+    fn into_bytes(self) -> Bytes {
+        lance_core::memory::retain_bytes(Bytes::from(self.values), self.reservation)
+    }
+}
+
+impl std::io::Write for TokenBytesWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        lance_core::memory::reserve_vec(
+            &mut self.values,
+            &mut self.reservation,
+            &self.memory,
+            lance_core::memory::NativeMemoryKind::Index,
+            bytes.len(),
+        )
+        .map_err(std::io::Error::other)?;
+        self.values.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// at indexing, we use HashMap because we need it to be mutable,
+// at searching, we use fst::Map because it's more efficient
+#[derive(Debug, Clone)]
+pub enum TokenMap {
+    HashMap(HashMap<String, u32>),
+    Fst(fst::Map<Bytes>),
+}
+
+impl Default for TokenMap {
+    fn default() -> Self {
+        Self::HashMap(HashMap::new())
+    }
+}
+
+impl DeepSizeOf for TokenMap {
+    fn deep_size_of_children(&self, ctx: &mut lance_core::deepsize::Context) -> usize {
+        match self {
+            Self::HashMap(map) => map.deep_size_of_children(ctx),
+            Self::Fst(map) => map.as_fst().size(),
+        }
+    }
+}
+
+impl TokenMap {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::HashMap(map) => map.len(),
+            Self::Fst(map) => map.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn for_each_token(&self, mut visit: impl FnMut(&[u8], u32) -> Result<()>) -> Result<()> {
+        match self {
+            Self::HashMap(map) => {
+                for (token, &token_id) in map {
+                    visit(token.as_bytes(), token_id)?;
+                }
+            }
+            Self::Fst(map) => {
+                let mut stream = map.stream();
+                while let Some((token, token_id)) = stream.next() {
+                    visit(token, token_id as u32)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct CompleteTokenSetKey;
+impl CacheKey for CompleteTokenSetKey {
+    type ValueType = TokenSet;
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "complete-tokens".into()
+    }
+    fn type_name() -> &'static str {
+        "FTS/CompleteTokenSet"
+    }
+}
+
+struct TokenLookupScalarsKey;
+impl CacheKey for TokenLookupScalarsKey {
+    type ValueType = (u32, usize);
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        "token-lookup-scalars".into()
+    }
+    fn type_name() -> &'static str {
+        "FTS/TokenLookupScalars"
+    }
+}
+
+// TokenSet is a mapping from tokens to token ids
+#[derive(Debug, Clone, Default, DeepSizeOf)]
+pub struct TokenSet {
+    // token -> token_id
+    pub(crate) tokens: TokenMap,
+    pub(crate) next_id: u32,
+    total_length: usize,
+}
+
+impl TokenSet {
+    pub fn into_mut(self) -> Self {
+        let tokens = match self.tokens {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+
+                new_map
+            }
+        };
+
+        Self {
+            tokens: TokenMap::HashMap(tokens),
+            next_id: self.next_id,
+            total_length: self.total_length,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn to_batch(self, format: TokenSetFormat) -> Result<RecordBatch> {
+        match format {
+            TokenSetFormat::Arrow => self.into_arrow_batch(),
+            TokenSetFormat::Fst => self.into_fst_batch(),
+        }
+    }
+
+    fn into_arrow_batch(self) -> Result<RecordBatch> {
+        let mut token_builder = StringBuilder::with_capacity(self.tokens.len(), self.total_length);
+        let mut token_id_builder = UInt32Builder::with_capacity(self.tokens.len());
+
+        match self.tokens {
+            TokenMap::Fst(map) => {
+                let mut stream = map.stream();
+                while let Some((token, token_id)) = stream.next() {
+                    token_builder.append_value(String::from_utf8_lossy(token));
+                    token_id_builder.append_value(token_id as u32);
+                }
+            }
+            TokenMap::HashMap(map) => {
+                for (token, token_id) in map.into_iter().sorted_unstable() {
+                    token_builder.append_value(token);
+                    token_id_builder.append_value(token_id);
+                }
+            }
+        }
+
+        arrow_token_batch(token_builder, token_id_builder)
+    }
+
+    fn into_fst_batch(mut self) -> Result<RecordBatch> {
+        let fst_map = match std::mem::take(&mut self.tokens) {
+            TokenMap::Fst(map) => map,
+            TokenMap::HashMap(map) => Self::build_fst_from_map(map)?,
+        };
+        fst_token_batch(fst_map, self.next_id, self.total_length)
+    }
+
+    fn build_fst_from_map(map: HashMap<String, u32>) -> Result<fst::Map<Bytes>> {
+        Self::build_fst_with_memory(map, None)
+    }
+
+    fn build_fst_with_memory(
+        map: HashMap<String, u32>,
+        memory: lance_core::memory::NativeMemory,
+    ) -> Result<fst::Map<Bytes>> {
+        let mut entries: Vec<_> = map.into_iter().collect();
+        entries.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+        let mut builder = fst::MapBuilder::new(TokenBytesWriter::new(memory))
+            .map_err(|error| Error::index(error.to_string()))?;
+        for (token, token_id) in entries {
+            builder
+                .insert(&token, token_id as u64)
+                .map_err(|e| Error::index(format!("failed to insert token {}: {}", token, e)))?;
+        }
+        let bytes = builder
+            .into_inner()
+            .map_err(|error| Error::index(error.to_string()))?
+            .into_bytes();
+        fst::Map::new(bytes).map_err(|error| Error::index(error.to_string()))
+    }
+
+    pub async fn load(reader: Arc<dyn IndexReader>, format: TokenSetFormat) -> Result<Self> {
+        match format {
+            TokenSetFormat::Arrow => Self::load_arrow(reader).await,
+            TokenSetFormat::Fst => Self::load_fst(reader).await,
+        }
+    }
+
+    async fn load_cached(
+        reader: Arc<dyn IndexReader>,
+        format: TokenSetFormat,
+        cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        cache
+            .get_or_insert_with_key(CompleteTokenSetKey, || Self::load(reader, format))
+            .await
+    }
+
+    pub(crate) async fn load_for_terms(
+        reader: Arc<dyn IndexReader>,
+        format: TokenSetFormat,
+        terms: &[String],
+        cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        let memory = reader.native_memory();
+        if let Some(tokens) = cache.get_with_key(&CompleteTokenSetKey).await {
+            return tokens.for_terms(terms, memory);
+        }
+        if format != TokenSetFormat::Fst {
+            return Self::load_cached(reader, format, cache)
+                .await?
+                .for_terms(terms, memory);
+        }
+        let Some(tokens) = token_lookup::lookup(&reader, terms, cache).await? else {
+            return Self::load_cached(reader, format, cache)
+                .await?
+                .for_terms(terms, memory);
+        };
+        let scalars = cache
+            .get_or_insert_with_key(TokenLookupScalarsKey, || async {
+                let batch = reader
+                    .read_range(0..1, Some(&[TOKEN_NEXT_ID_COL, TOKEN_TOTAL_LENGTH_COL]))
+                    .await?;
+                if batch.num_rows() != 1 {
+                    return Err(Error::index("token lookup scalar row is missing"));
+                }
+                let next_id = batch
+                    .column_by_name(TOKEN_NEXT_ID_COL)
+                    .and_then(|array| array.as_primitive_opt::<datatypes::UInt32Type>())
+                    .filter(|array| array.null_count() == 0)
+                    .ok_or_else(|| Error::index("token lookup next ID is invalid"))?
+                    .value(0);
+                let total_length = batch
+                    .column_by_name(TOKEN_TOTAL_LENGTH_COL)
+                    .and_then(|array| array.as_primitive_opt::<datatypes::UInt64Type>())
+                    .filter(|array| array.null_count() == 0)
+                    .ok_or_else(|| Error::index("token lookup total length is invalid"))?
+                    .value(0);
+                if reader.num_rows()
+                    != (next_id as usize)
+                        .div_ceil(token_lookup::BLOCK_TERMS)
+                        .max(1)
+                {
+                    return Err(Error::index(
+                        "token lookup block count disagrees with token count",
+                    ));
+                }
+                let total_length = usize::try_from(total_length).map_err(|error| {
+                    Error::index(format!("token total length exceeds usize: {error}"))
+                })?;
+                Ok((next_id, total_length))
+            })
+            .await?;
+        let (next_id, total_length) = *scalars;
+        if tokens.values().any(|id| *id >= next_id) {
+            return Err(Error::index("token lookup ID exceeds the dictionary size"));
+        }
+        Ok(Arc::new(Self {
+            tokens: TokenMap::Fst(Self::build_fst_with_memory(tokens, memory)?),
+            next_id,
+            total_length,
+        }))
+    }
+
+    // Preserve original posting IDs and corpus metadata, without retaining the
+    // full cached dictionary in every active exact-query partition handle.
+    fn for_terms(
+        &self,
+        terms: &[String],
+        memory: lance_core::memory::NativeMemory,
+    ) -> Result<Arc<Self>> {
+        let selected = terms
+            .iter()
+            .filter_map(|term| self.get(term).map(|id| (term.clone(), id)))
+            .collect();
+        Ok(Arc::new(Self {
+            tokens: TokenMap::Fst(Self::build_fst_with_memory(selected, memory)?),
+            next_id: self.next_id,
+            total_length: self.total_length,
+        }))
+    }
+
+    async fn load_arrow(reader: Arc<dyn IndexReader>) -> Result<Self> {
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+
+        let memory = reader.native_memory();
+        let (tokens, next_id, total_length) = spawn_blocking(move || {
+            let mut next_id = 0;
+            let mut total_length = 0;
+            let mut tokens = fst::MapBuilder::new(TokenBytesWriter::new(memory))
+                .map_err(|error| Error::index(error.to_string()))?;
+
+            let token_col = batch[TOKEN_COL].as_string::<i32>();
+            let token_id_col = batch[TOKEN_ID_COL].as_primitive::<datatypes::UInt32Type>();
+
+            for (token, &token_id) in token_col.iter().zip(token_id_col.values().iter()) {
+                let token =
+                    token.ok_or(Error::index("found null token in token set".to_owned()))?;
+                next_id = next_id.max(token_id + 1);
+                total_length += token.len();
+                tokens.insert(token, token_id as u64).map_err(|e| {
+                    Error::index(format!("failed to insert token {}: {}", token, e))
+                })?;
+            }
+
+            let bytes = tokens
+                .into_inner()
+                .map_err(|error| Error::index(error.to_string()))?
+                .into_bytes();
+            let tokens = fst::Map::new(bytes).map_err(|error| Error::index(error.to_string()))?;
+            Ok::<_, Error>((tokens, next_id, total_length))
+        })
+        .await
+        .map_err(|err| Error::execution(format!("failed to spawn blocking task: {}", err)))??;
+
+        Ok(Self {
+            tokens: TokenMap::Fst(tokens),
+            next_id,
+            total_length,
+        })
+    }
+
+    async fn load_fst(reader: Arc<dyn IndexReader>) -> Result<Self> {
+        let batch = reader.read_range(0..reader.num_rows(), None).await?;
+        if batch.num_rows() == 0 {
+            return Err(Error::index("token set batch is empty".to_owned()));
+        }
+
+        let fst_col = batch[TOKEN_FST_BYTES_COL].as_binary::<i64>();
+        let start = fst_col.value_offsets()[0] as usize;
+        let end = fst_col.value_offsets()[1] as usize;
+        let bytes = Bytes::from_owner(FstBuffer(
+            fst_col.values().slice_with_length(start, end - start),
+        ));
+        let map = fst::Map::new(bytes)
+            .map_err(|e| Error::index(format!("failed to load fst tokens: {}", e)))?;
+
+        let total_length_col =
+            batch[TOKEN_TOTAL_LENGTH_COL].as_primitive::<datatypes::UInt64Type>();
+
+        // Token ids are dense `[0, len)`, so `next_id` must equal the token count. Recompute
+        // it instead of trusting the persisted value, which writers before #7115 could leave
+        // stale. Mirrors `load_arrow`.
+        let next_id = map.len() as u32;
+
+        let total_length = total_length_col
+            .values()
+            .first()
+            .copied()
+            .ok_or(Error::index(
+                "token total length column is empty".to_owned(),
+            ))?;
+
+        Ok(Self {
+            tokens: TokenMap::Fst(map),
+            next_id,
+            total_length: usize::try_from(total_length).map_err(|_| {
+                Error::index(format!(
+                    "token total length {} overflows usize",
+                    total_length
+                ))
+            })?,
+        })
+    }
+
+    pub fn add(&mut self, token: String) -> u32 {
+        let next_id = self.next_id();
+        let len = token.len();
+        let token_id = match self.tokens {
+            TokenMap::HashMap(ref mut map) => *map.entry(token).or_insert(next_id),
+            _ => unreachable!("tokens must be HashMap while indexing"),
+        };
+
+        // add token if it doesn't exist
+        if token_id == next_id {
+            self.next_id += 1;
+            self.total_length += len;
+        }
+
+        token_id
+    }
+
+    pub fn get(&self, token: &str) -> Option<u32> {
+        match self.tokens {
+            TokenMap::HashMap(ref map) => map.get(token).copied(),
+            TokenMap::Fst(ref map) => map.get(token).map(|id| id as u32),
+        }
+    }
+
+    /// [`Self::get`] for many `(dictionary, token)` pairs, returning results
+    /// in input order.
+    ///
+    /// An FST walk is a chain of dependent reads, and the dictionaries of a
+    /// many-partition index far exceed the CPU caches, so resolving one pair
+    /// at a time waits on one cache miss at a time. Advancing several
+    /// independent walks in rotation, and prefetching each walk's next node,
+    /// overlaps those misses.
+    pub(super) fn get_many(lookups: &[(&Self, &str)]) -> Vec<Option<u32>> {
+        const MAX_WALKS: usize = 16;
+
+        struct Walk<'a> {
+            lookup: usize,
+            fst: &'a fst::raw::Fst<Bytes>,
+            key: &'a [u8],
+            depth: usize,
+            addr: fst::raw::CompiledAddr,
+            output: fst::raw::Output,
+        }
+
+        let mut results = vec![None; lookups.len()];
+        let mut walks = Vec::with_capacity(MAX_WALKS.min(lookups.len()));
+        let mut next_lookup = 0;
+        loop {
+            while walks.len() < MAX_WALKS && next_lookup < lookups.len() {
+                let (dictionary, token) = lookups[next_lookup];
+                match &dictionary.tokens {
+                    TokenMap::HashMap(map) => results[next_lookup] = map.get(token).copied(),
+                    TokenMap::Fst(map) => {
+                        let fst = map.as_fst();
+                        walks.push(Walk {
+                            lookup: next_lookup,
+                            fst,
+                            key: token.as_bytes(),
+                            depth: 0,
+                            addr: fst.root().addr(),
+                            output: fst::raw::Output::zero(),
+                        });
+                    }
+                }
+                next_lookup += 1;
+            }
+            if walks.is_empty() {
+                return results;
+            }
+
+            // Mirrors `fst::raw::Fst::get`, one node per walk per round.
+            let mut walk_index = 0;
+            while walk_index < walks.len() {
+                let walk = &mut walks[walk_index];
+                let node = walk.fst.node(walk.addr);
+                let finished = match walk.key.get(walk.depth) {
+                    None => Some(
+                        node.is_final()
+                            .then(|| walk.output.cat(node.final_output()).value() as u32),
+                    ),
+                    Some(&byte) => match node.find_input(byte) {
+                        None => Some(None),
+                        Some(transition_index) => {
+                            let transition = node.transition(transition_index);
+                            walk.output = walk.output.cat(transition.out);
+                            walk.addr = transition.addr;
+                            walk.depth += 1;
+                            prefetch_fst_node(walk.fst.as_bytes(), transition.addr);
+                            None
+                        }
+                    },
+                };
+                if let Some(token_id) = finished {
+                    results[walk.lookup] = token_id;
+                    walks.swap_remove(walk_index);
+                } else {
+                    walk_index += 1;
+                }
+            }
+        }
+    }
+
+    // the `removed_token_ids` must be sorted
+    pub fn remap(&mut self, removed_token_ids: &[u32]) {
+        if removed_token_ids.is_empty() {
+            return;
+        }
+
+        let mut map = match std::mem::take(&mut self.tokens) {
+            TokenMap::HashMap(map) => map,
+            TokenMap::Fst(map) => {
+                let mut new_map = HashMap::with_capacity(map.len());
+                let mut stream = map.into_stream();
+                while let Some((token, token_id)) = stream.next() {
+                    new_map.insert(String::from_utf8_lossy(token).into_owned(), token_id as u32);
+                }
+
+                new_map
+            }
+        };
+
+        let mut retained_length = 0;
+        map.retain(
+            |token, token_id| match removed_token_ids.binary_search(token_id) {
+                Ok(_) => false,
+                Err(index) => {
+                    *token_id -= index as u32;
+                    retained_length += token.len();
+                    true
+                }
+            },
+        );
+
+        self.tokens = TokenMap::HashMap(map);
+
+        // The retain above compacts the surviving token ids into a dense `[0, len)`
+        // range, so `next_id` (handed to the next new token) must follow them down.
+        // `total_length` likewise must drop the removed tokens' bytes; it is persisted
+        // and feeds memory accounting, so a stale value drifts across remap/merge cycles.
+        self.next_id = self.tokens.len() as u32;
+        self.total_length = retained_length;
+    }
+
+    pub fn next_id(&self) -> u32 {
+        self.next_id
+    }
+}
+
+fn arrow_token_batch(
+    mut token_builder: StringBuilder,
+    mut token_id_builder: UInt32Builder,
+) -> Result<RecordBatch> {
+    let schema = arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new(TOKEN_COL, DataType::Utf8, false),
+        arrow_schema::Field::new(TOKEN_ID_COL, DataType::UInt32, false),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(token_builder.finish()) as ArrayRef,
+            Arc::new(token_id_builder.finish()) as ArrayRef,
+        ],
+    )?;
+    Ok(batch)
+}
+
+fn fst_token_batch(
+    fst_map: fst::Map<Bytes>,
+    _next_id: u32,
+    total_length: usize,
+) -> Result<RecordBatch> {
+    let (first_tokens, lookup_blocks) = token_lookup::encode(&fst_map)?;
+    let rows = first_tokens.len();
+    let next_id = u32::try_from(fst_map.len())
+        .map_err(|error| Error::index(format!("token count exceeds u32: {error}")))?;
+    let bytes = fst_map.into_fst().into_inner();
+    // Transfer the original FST allocation, including its native reservation,
+    // into the first Arrow cell. Remaining lookup rows carry empty cells.
+    let end = i64::try_from(bytes.len())
+        .map_err(|error| Error::index(format!("token bytes exceed i64: {error}")))?;
+    let mut offsets = vec![end; rows + 1];
+    offsets[0] = 0;
+    let fst_col = arrow_array::LargeBinaryArray::new(
+        arrow::buffer::OffsetBuffer::new(offsets.into()),
+        arrow::buffer::Buffer::from(bytes),
+        None,
+    );
+
+    let mut next_id_builder = UInt32Builder::with_capacity(rows);
+    next_id_builder.append_value(next_id);
+    for _ in 1..rows {
+        next_id_builder.append_value(0);
+    }
+    let next_id_col = next_id_builder.finish();
+
+    let mut total_length_builder = UInt64Builder::with_capacity(rows);
+    total_length_builder.append_value(total_length as u64);
+    for _ in 1..rows {
+        total_length_builder.append_value(0);
+    }
+    let total_length_col = total_length_builder.finish();
+
+    let schema = arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new(TOKEN_FST_BYTES_COL, DataType::LargeBinary, false),
+        arrow_schema::Field::new(TOKEN_NEXT_ID_COL, DataType::UInt32, false),
+        arrow_schema::Field::new(TOKEN_TOTAL_LENGTH_COL, DataType::UInt64, false),
+        arrow_schema::Field::new(FIRST_TOKEN_COL, DataType::Utf8, false),
+        arrow_schema::Field::new(LOOKUP_FST_COL, DataType::LargeBinary, false),
+    ])
+    .with_metadata(HashMap::from([(
+        LOOKUP_VERSION_KEY.to_owned(),
+        "1".to_owned(),
+    )]));
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema),
+        vec![
+            Arc::new(fst_col) as ArrayRef,
+            Arc::new(next_id_col) as ArrayRef,
+            Arc::new(total_length_col) as ArrayRef,
+            Arc::new(first_tokens) as ArrayRef,
+            Arc::new(lookup_blocks) as ArrayRef,
+        ],
+    )?;
+    Ok(batch)
+}
+
+/// Token dictionary of a partition that is being built.
+///
+/// A distinct token costs its bytes in one shared buffer, an end offset and a
+/// 4-byte hash-table slot. Keying a `HashMap` by owned `String`s instead costs
+/// a separate heap allocation plus a 32-byte slot per token, which dominates
+/// build memory for corpora with tens of millions of distinct tokens.
+#[derive(Debug, Default)]
+pub(in super::super) struct TokenDictionary {
+    // Token bytes, concatenated in token id order.
+    bytes: Vec<u8>,
+    // End offset in `bytes` of each token, indexed by token id.
+    ends: Vec<u64>,
+    // Token ids, hashed by their token bytes.
+    ids: HashTable<u32>,
+    hasher: RandomState,
+}
+
+fn token_bytes<'a>(bytes: &'a [u8], ends: &[u64], token_id: u32) -> &'a [u8] {
+    let token_id = token_id as usize;
+    let start = match token_id {
+        0 => 0,
+        _ => ends[token_id - 1] as usize,
+    };
+    &bytes[start..ends[token_id] as usize]
+}
+
+impl TokenDictionary {
+    /// Rebuilds a dictionary from a token set, keeping its token ids.
+    pub(in super::super) fn try_from_token_set(tokens: TokenSet) -> Result<Self> {
+        let num_tokens = tokens.len();
+        let mut lengths = vec![None::<usize>; num_tokens];
+        tokens.tokens.for_each_token(|token, token_id| {
+            std::str::from_utf8(token).map_err(|err| {
+                Error::index(format!("token {token:?} is not valid UTF-8: {err}"))
+            })?;
+            match lengths.get_mut(token_id as usize) {
+                Some(length @ None) => {
+                    *length = Some(token.len());
+                    Ok(())
+                }
+                _ => Err(Error::index(format!(
+                    "token set with {num_tokens} tokens must map them to distinct ids below \
+                     {num_tokens}, but token {:?} has id {token_id}",
+                    String::from_utf8_lossy(token)
+                ))),
+            }
+        })?;
+
+        let mut ends = Vec::with_capacity(num_tokens);
+        let mut end = 0u64;
+        for length in lengths {
+            end += length.expect("every token id was assigned once") as u64;
+            ends.push(end);
+        }
+        let mut bytes = vec![0u8; end as usize];
+        tokens.tokens.for_each_token(|token, token_id| {
+            let token_id = token_id as usize;
+            let start = match token_id {
+                0 => 0,
+                _ => ends[token_id - 1] as usize,
+            };
+            bytes[start..ends[token_id] as usize].copy_from_slice(token);
+            Ok(())
+        })?;
+
+        let hasher = RandomState::new();
+        let mut ids = HashTable::with_capacity(num_tokens);
+        for token_id in 0..num_tokens as u32 {
+            ids.insert_unique(
+                hasher.hash_one(token_bytes(&bytes, &ends, token_id)),
+                token_id,
+                |&token_id| hasher.hash_one(token_bytes(&bytes, &ends, token_id)),
+            );
+        }
+        Ok(Self {
+            bytes,
+            ends,
+            ids,
+            hasher,
+        })
+    }
+
+    pub(in super::super) fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn token(&self, token_id: u32) -> &str {
+        std::str::from_utf8(token_bytes(&self.bytes, &self.ends, token_id))
+            .expect("dictionary tokens are copied from valid UTF-8")
+    }
+
+    /// Iterates `(token_id, token)` in token id order.
+    pub(in super::super) fn iter(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
+        (0..self.len() as u32).map(|token_id| (token_id, self.token(token_id)))
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn get(&self, token: &str) -> Option<u32> {
+        let hash = self.hasher.hash_one(token.as_bytes());
+        self.ids
+            .find(hash, |&token_id| {
+                token_bytes(&self.bytes, &self.ends, token_id) == token.as_bytes()
+            })
+            .copied()
+    }
+
+    /// Returns the id of `token`, assigning the next id if the token is new.
+    pub(in super::super) fn get_or_add(&mut self, token: &str) -> u32 {
+        let Self {
+            bytes,
+            ends,
+            ids,
+            hasher,
+        } = self;
+        let entry = ids.entry(
+            hasher.hash_one(token.as_bytes()),
+            |&token_id| token_bytes(bytes, ends, token_id) == token.as_bytes(),
+            |&token_id| hasher.hash_one(token_bytes(bytes, ends, token_id)),
+        );
+        match entry {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let token_id = ends.len() as u32;
+                entry.insert(token_id);
+                bytes.extend_from_slice(token.as_bytes());
+                ends.push(bytes.len() as u64);
+                token_id
+            }
+        }
+    }
+
+    /// Drops the tokens with the given sorted ids and compacts the ids of the
+    /// remaining tokens.
+    pub(in super::super) fn remap(&mut self, removed_token_ids: &[u32]) {
+        if removed_token_ids.is_empty() {
+            return;
+        }
+        let mut remapped = Self::default();
+        for (token_id, token) in self.iter() {
+            if removed_token_ids.binary_search(&token_id).is_err() {
+                remapped.get_or_add(token);
+            }
+        }
+        *self = remapped;
+    }
+
+    pub(in super::super) fn memory_size(&self) -> usize {
+        self.bytes.capacity()
+            + self.ends.capacity() * std::mem::size_of::<u64>()
+            + self.ids.allocation_size()
+    }
+
+    /// Writes the dictionary in the same layout as [`TokenSet::to_batch`].
+    pub(in super::super) fn to_batch(&self, format: TokenSetFormat) -> Result<RecordBatch> {
+        let mut sorted_ids = (0..self.len() as u32).collect::<Vec<_>>();
+        sorted_ids.sort_unstable_by(|&lhs, &rhs| {
+            token_bytes(&self.bytes, &self.ends, lhs).cmp(token_bytes(&self.bytes, &self.ends, rhs))
+        });
+        match format {
+            TokenSetFormat::Arrow => {
+                let mut token_builder = StringBuilder::with_capacity(self.len(), self.bytes.len());
+                let mut token_id_builder = UInt32Builder::with_capacity(self.len());
+                for token_id in sorted_ids {
+                    token_builder.append_value(self.token(token_id));
+                    token_id_builder.append_value(token_id);
+                }
+                arrow_token_batch(token_builder, token_id_builder)
+            }
+            TokenSetFormat::Fst => {
+                let mut builder = fst::MapBuilder::memory();
+                for token_id in sorted_ids {
+                    let token = self.token(token_id);
+                    builder.insert(token, token_id as u64).map_err(|e| {
+                        Error::index(format!("failed to insert token {}: {}", token, e))
+                    })?;
+                }
+                let map = builder
+                    .into_map()
+                    .map_data(Bytes::from)
+                    .map_err(|error| Error::index(error.to_string()))?;
+                fst_token_batch(map, self.len() as u32, self.bytes.len())
+            }
+        }
+    }
+}
+
+/// Hint the cache lines holding the FST node at `addr`. A node is decoded
+/// from its state byte at `addr` backwards, so fetch the preceding line too.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_fst_node(fst_bytes: &[u8], addr: fst::raw::CompiledAddr) {
+    for byte in [fst_bytes.get(addr), fst_bytes.get(addr.saturating_sub(63))]
+        .into_iter()
+        .flatten()
+    {
+        // SAFETY: prefetching only hints the cache and cannot fault; the
+        // pointer is in bounds of `fst_bytes` regardless.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(
+                (byte as *const u8).cast(),
+            );
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn prefetch_fst_node(_fst_bytes: &[u8], _addr: fst::raw::CompiledAddr) {}
+
+#[cfg(test)]
+mod query_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fst_bytes_share_and_retain_arrow_allocation() {
+        let buffer = arrow::buffer::Buffer::from_vec(vec![10_u8, 20, 30, 40]);
+        let slice = buffer.slice_with_length(1, 2);
+        let pointer = slice.as_ptr();
+        let bytes = Bytes::from_owner(FstBuffer(slice));
+        assert_eq!(bytes.as_ptr(), pointer);
+        drop(buffer);
+        let retained = bytes.slice(1..);
+        drop(bytes);
+        assert_eq!(retained.as_ref(), &[30]);
+    }
+
+    fn fst_dictionary(terms: &[&str]) -> TokenSet {
+        let mut terms = terms.to_vec();
+        terms.sort_unstable();
+        let map = fst::Map::from_iter(
+            terms
+                .iter()
+                .enumerate()
+                .map(|(token_id, term)| (*term, token_id as u64)),
+        )
+        .unwrap();
+        TokenSet {
+            tokens: TokenMap::Fst(map.map_data(Bytes::from).unwrap()),
+            next_id: terms.len() as u32,
+            total_length: terms.iter().map(|term| term.len()).sum(),
+        }
+    }
+
+    #[test]
+    fn test_get_many_matches_get() {
+        let mut in_memory = TokenSet::default();
+        in_memory.add("a".to_owned());
+        in_memory.add("abc".to_owned());
+        let dictionaries = [
+            fst_dictionary(&["", "a", "ab", "abc", "abd", "b", "banana", "zeta"]),
+            fst_dictionary(&["ab", "abcd", "alpha", "b", "bandana"]),
+            fst_dictionary(&[]),
+            in_memory,
+        ];
+        // Keys that are prefixes of other keys, extend past a leaf, stop
+        // mid-edge, or are empty; more lookups than walks kept in flight.
+        let tokens = [
+            "", "a", "ab", "abc", "abcd", "abd", "abe", "alpha", "b", "ban", "banana", "bandana",
+            "zeta", "zz",
+        ];
+        let lookups = dictionaries
+            .iter()
+            .flat_map(|dictionary| tokens.iter().map(move |token| (dictionary, *token)))
+            .collect::<Vec<_>>();
+        let expected = lookups
+            .iter()
+            .map(|(dictionary, token)| dictionary.get(token))
+            .collect::<Vec<_>>();
+
+        assert_eq!(TokenSet::get_many(&lookups), expected);
+        assert!(expected.iter().any(Option::is_some));
+        assert!(expected.iter().any(Option::is_none));
+    }
+}

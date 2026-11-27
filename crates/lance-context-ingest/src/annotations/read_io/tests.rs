@@ -221,11 +221,11 @@ async fn read_io_native_tables_retain_shared_store_and_classify_both_data_paths(
     .await?;
     let registry = session.store_registry();
     let original_prefix =
-        registry.calculate_object_store_prefix(&narrow.uri, Some(&narrow.options))?;
+        registry.calculate_object_store_prefix(&narrow.uri, narrow.params.storage_options())?;
     let identities = Providers::capture(&narrow, Some(&body.uri))?;
     let scope = Scope::install(&narrow, Some(&body), identities)?;
     assert_eq!(
-        registry.calculate_object_store_prefix(&narrow.uri, Some(&narrow.options))?,
+        registry.calculate_object_store_prefix(&narrow.uri, narrow.params.storage_options())?,
         original_prefix
     );
     let _uploads = super::super::metadata_upload::Scope::install(&narrow)?;
@@ -303,7 +303,7 @@ impl ObjectStoreProvider for AccountProvider {
 
 #[tokio::test]
 async fn read_io_distinguishes_equal_paths_in_separate_backend_accounts() -> Result<()> {
-    use lance_io::object_store::{ObjectStoreRegistry, StorageOptionsAccessor};
+    use lance_io::object_store::ObjectStoreRegistry;
     let registry = Arc::new(ObjectStoreRegistry::default());
     registry.insert(
         "memory",
@@ -336,18 +336,13 @@ async fn read_io_distinguishes_equal_paths_in_separate_backend_accounts() -> Res
     let uri = lance_io::object_store::uri_to_url(&narrow.uri)?;
     assert_eq!(before.extract_path(&uri)?, after.extract_path(&uri)?);
     assert_eq!(
-        before.calculate_object_store_prefix(&uri, Some(&narrow.options))?,
-        after.calculate_object_store_prefix(&uri, Some(&narrow.options))?
+        before.calculate_object_store_prefix(&uri, narrow.params.storage_options())?,
+        after.calculate_object_store_prefix(&uri, narrow.params.storage_options())?
     );
     for storage in [&narrow, &body] {
-        let params = ObjectStoreParams {
-            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                storage.options.clone(),
-            ))),
-            ..Default::default()
-        };
         let (store, _) =
-            LanceStore::from_uri_and_params(registry.clone(), &storage.uri, &params).await?;
+            LanceStore::from_uri_and_params(registry.clone(), &storage.uri, &storage.params)
+                .await?;
         let path = Path::from("table/data/file.lance");
         store
             .inner

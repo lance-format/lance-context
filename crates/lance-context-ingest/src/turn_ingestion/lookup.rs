@@ -1,13 +1,20 @@
 //! Bounded composite-key probes against the full body dataset.
 use super::*;
+use datafusion_physical_plan::ExecutionPlan;
 use futures::TryStreamExt;
-use lance::{dataset::scanner::DatasetRecordBatchStream, Dataset};
+use lance::{
+    dataset::scanner::DatasetRecordBatchStream,
+    io::exec::filtered_read::{FilteredReadExec, FilteredReadThreadingMode},
+    Dataset,
+};
 use lance_context_core::{MergeMemoryBudget, MergeReservation};
 use lance_datafusion::exec::{
     collect_execution_metrics, execute_plan, ExecutionSummaryCounts, LanceExecutionOptions,
 };
+use lance_datafusion::utils::MetricsExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
@@ -15,6 +22,30 @@ const MAX_KEY_BYTES: usize = 64 << 10;
 const SCAN_BATCH_ROWS: usize = 2048;
 #[cfg(test)]
 mod tests;
+
+/// Independent controls within an admitted, unordered membership scan, used
+/// by a standalone lookup or an explicit ingestion Runtime builder override.
+/// More task partitions also increase concurrent decode demand. Both controls
+/// still use the captured Dataset's existing shared native memory pool.
+#[derive(Clone, Copy, Debug)]
+pub struct TurnLookupParallelism {
+    pub task_partitions: usize,
+    pub fragment_readahead: usize,
+}
+
+impl TurnLookupParallelism {
+    pub(crate) fn validate(self, session: &lance::session::Session) -> Result<()> {
+        ensure!(
+            self.task_partitions > 0 && self.fragment_readahead > 0,
+            "body lookup parallelism must be nonzero"
+        );
+        ensure!(
+            session.native_memory().is_some(),
+            "explicit body lookup parallelism requires a shared native memory pool"
+        );
+        Ok(())
+    }
+}
 
 /// One admitted lookup window. Projection counters describe returned key
 /// batches; they are not physical object-store or HTTP bytes. Native counters
@@ -24,6 +55,8 @@ mod tests;
 pub struct TurnLookupObservation {
     pub requested_keys: usize,
     pub staged_keys: usize,
+    /// Committed positive membership reused from the existing Session cache.
+    pub cached_keys: usize,
     /// Exact distinct requested keys found in the captured base, excluding
     /// staged hits and projected cross-product candidates.
     pub history_hits: usize,
@@ -34,6 +67,14 @@ pub struct TurnLookupObservation {
     pub projected_rows: u64,
     pub projected_array_bytes: u64,
     pub elapsed_us: u64,
+    /// Time since window preparation to the first returned key batch, including
+    /// planning/waiting; absent for empty or staging-only results.
+    pub first_result_us: Option<usize>,
+    /// Maximum native scan partition count in this query's plan, not physical I/O.
+    pub scan_partitions: usize,
+    /// Peak owned fragment task producers in a parallel native scan, including
+    /// opening files. Excludes already-issued decode and physical I/O lifetimes.
+    pub fragment_streams_peak: Option<usize>,
     pub lance_bytes_read: Option<usize>,
     pub lance_requests: Option<usize>,
     pub lance_indices_loaded: Option<usize>,
@@ -57,6 +98,8 @@ pub struct TurnLookup {
 /// A bounded input window, before capturing the base and doing any native I/O.
 pub(crate) struct PreparedTurnLookup {
     pub(crate) keys: BTreeMap<String, bool>,
+    pub(crate) cached_keys: usize,
+    pub(crate) native_running: Option<Arc<AtomicBool>>,
     workspace: MergeReservation,
     started: Instant,
 }
@@ -129,6 +172,33 @@ impl TurnIngestionSpec {
         Ok(Some(self.lookup_prepared(base, prepared).await?))
     }
 
+    /// Compare parallelism on an already authorized, fixed snapshot using the
+    /// same key admission, predicates, exact membership and early exit as normal
+    /// ingestion. Only eligible unordered native reads change; indexed inputs,
+    /// row streams and ranged reads retain their existing plans.
+    ///
+    /// This does not open a table, retain a GC lease, change owner defaults or
+    /// create a separate memory pool. The caller must bind a captured key set to
+    /// this exact base and retain its original host pool. Native refusal remains
+    /// an error, never a successful miss. Values must be nonzero; actual
+    /// read/decode allocations remain admitted by the caller's native pool.
+    pub async fn lookup_existing_with_parallelism(
+        &self,
+        base: Arc<Dataset>,
+        keys: &[&str],
+        workspace: &Arc<MergeMemoryBudget>,
+        parallelism: TurnLookupParallelism,
+    ) -> Result<Option<TurnLookup>> {
+        parallelism.validate(&base.session())?;
+        let Some(prepared) = self.prepare_lookup(keys, workspace)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.lookup_prepared_with_parallelism(base, prepared, Some(parallelism))
+                .await?,
+        ))
+    }
+
     pub(crate) fn prepare_lookup(
         &self,
         keys: &[&str],
@@ -152,6 +222,8 @@ impl TurnIngestionSpec {
         };
         Ok(Some(PreparedTurnLookup {
             keys: keys.iter().map(|key| ((*key).to_owned(), false)).collect(),
+            cached_keys: 0,
+            native_running: None,
             workspace: reservation,
             started,
         }))
@@ -162,6 +234,19 @@ impl TurnIngestionSpec {
         base: Arc<Dataset>,
         prepared: PreparedTurnLookup,
     ) -> Result<TurnLookup> {
+        self.lookup_prepared_with_parallelism(base, prepared, None)
+            .await
+    }
+
+    pub(crate) async fn lookup_prepared_with_parallelism(
+        &self,
+        base: Arc<Dataset>,
+        prepared: PreparedTurnLookup,
+        parallelism: Option<TurnLookupParallelism>,
+    ) -> Result<TurnLookup> {
+        if let Some(parallelism) = parallelism {
+            parallelism.validate(&base.session())?;
+        }
         ensure!(
             arrow_schema::Schema::from(base.schema()) == *self.body_schema
                 || arrow_schema::Schema::from(base.schema())
@@ -170,14 +255,18 @@ impl TurnIngestionSpec {
         );
         let PreparedTurnLookup {
             keys: mut requested,
+            cached_keys,
+            native_running,
             workspace: reservation,
             started,
         } = prepared;
-        let staged_keys = requested.values().filter(|present| **present).count();
-        let mut remaining = requested.len() - staged_keys;
+        let known_keys = requested.values().filter(|present| **present).count();
+        let staged_keys = known_keys - cached_keys;
+        let mut remaining = requested.len() - known_keys;
         let mut observation = TurnLookupObservation {
             requested_keys: requested.len(),
             staged_keys,
+            cached_keys,
             ..Default::default()
         };
         if remaining == 0 {
@@ -222,13 +311,28 @@ impl TurnIngestionSpec {
         )?;
         scan.filter(&predicate)?;
         scan.batch_size(SCAN_BATCH_ROWS)
-            .batch_readahead(1)
-            .fragment_readahead(1);
+            .batch_readahead(readahead)
+            .fragment_readahead(readahead);
+        if readahead > 1 {
+            scan.scan_in_order(false);
+        }
         observation.scans_started = 1;
+        // The owner uses this lifetime only to observe overlap of two native
+        // lookup futures. It carries no validity or publication authority.
+        let _activity = NativeActivity::start(native_running);
         // Keep the scanner's plan so an all-hit early exit can report work
         // without polling to EOF just to trigger its completion callback.
         // Preserve Scanner::execution_options and the logical schema adapter.
         let plan = scan.create_plan().await?;
+        let plan = if readahead > 1 {
+            parallel_membership_scan(
+                plan,
+                parallelism.map_or(readahead, |p| p.task_partitions),
+                parallelism.map(|p| p.fragment_readahead),
+            )?
+        } else {
+            plan
+        };
         let mut stream = DatasetRecordBatchStream::new(execute_plan(
             plan.clone(),
             LanceExecutionOptions {
@@ -237,6 +341,13 @@ impl TurnIngestionSpec {
             },
         )?);
         while let Some(batch) = stream.try_next().await? {
+            observation.first_result_us.get_or_insert_with(|| {
+                started
+                    .elapsed()
+                    .as_micros()
+                    .try_into()
+                    .unwrap_or(usize::MAX)
+            });
             observation.projected_rows = observation
                 .projected_rows
                 .saturating_add(batch.num_rows() as u64);
@@ -275,12 +386,13 @@ impl TurnIngestionSpec {
             }
         }
         drop(stream);
-        observation.history_hits = requested.len() - staged_keys - remaining;
+        observation.history_hits = requested.len() - known_keys - remaining;
         observation.history_misses = remaining;
         // One snapshot for either completion path. Do not wait for cancelled
         // background work: these are observed plan metrics, not all store I/O.
         let mut stats = ExecutionSummaryCounts::default();
         collect_execution_metrics(plan.as_ref(), &mut stats);
+        collect_scan_activity(plan.as_ref(), &mut observation);
         drop(plan);
         observation.lance_bytes_read = Some(stats.bytes_read);
         observation.lance_requests = Some(stats.requests);
@@ -296,5 +408,93 @@ impl TurnIngestionSpec {
             observation,
             _workspace: reservation,
         })
+    }
+}
+
+/// Membership needs no row order. Use the native shared task stream so each
+/// fragment is scanned once, with bounded readers and streaming result merging.
+/// Keep indexed/row-stream/ranged reads on their original execution path: their
+/// selectors can require a particular input partition or logical row order.
+fn parallel_membership_scan(
+    plan: Arc<dyn ExecutionPlan>,
+    partitions: usize,
+    fragment_readahead: Option<usize>,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+        if read.index_input().is_some()
+            || read.row_stream_input().is_some()
+            || read.options().scan_range_before_filter.is_some()
+            || read.options().scan_range_after_filter.is_some()
+        {
+            return Ok(plan);
+        }
+        let mut options = read
+            .options()
+            .clone()
+            .with_threading_mode(FilteredReadThreadingMode::MultiplePartitions(partitions));
+        if let Some(fragments) = fragment_readahead {
+            options = options.with_fragment_readahead(fragments);
+        }
+        return Ok(Arc::new(FilteredReadExec::try_new(
+            read.dataset().clone(),
+            options,
+            None,
+        )?));
+    }
+    let children = plan
+        .children()
+        .iter()
+        .map(|child| parallel_membership_scan((*child).clone(), partitions, fragment_readahead))
+        .collect::<Result<Vec<_>>>()?;
+    if children.is_empty() {
+        Ok(plan)
+    } else {
+        Ok(plan.with_new_children(children)?)
+    }
+}
+
+fn collect_scan_activity(plan: &dyn ExecutionPlan, observation: &mut TurnLookupObservation) {
+    if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+        let partitions = match read.options().threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => 1,
+            FilteredReadThreadingMode::MultiplePartitions(n) => n,
+        };
+        observation.scan_partitions = observation.scan_partitions.max(partitions);
+        if partitions > 1 {
+            if let Some(metrics) = read.metrics() {
+                for (name, gauge) in metrics.iter_gauges() {
+                    if name.as_ref() == "parallel_fragment_streams_peak" {
+                        observation.fragment_streams_peak = Some(
+                            observation
+                                .fragment_streams_peak
+                                .unwrap_or(0)
+                                .max(gauge.value()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    for child in plan.children() {
+        collect_scan_activity(child.as_ref(), observation);
+    }
+}
+
+struct NativeActivity(Option<Arc<AtomicBool>>);
+
+impl NativeActivity {
+    fn start(active: Option<Arc<AtomicBool>>) -> Self {
+        if let Some(active) = &active {
+            active.store(true, Ordering::Relaxed);
+        }
+        Self(active)
+    }
+}
+
+impl Drop for NativeActivity {
+    fn drop(&mut self) {
+        if let Some(active) = &self.0 {
+            active.store(false, Ordering::Relaxed);
+        }
     }
 }

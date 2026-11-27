@@ -48,3 +48,15 @@ original writer-bookkeeping window. It also checks the correct normal cursor.
 These patches remain necessary for context's existing flush-retry, replay-boundary,
 publication-loss, scalar-index, and task-lifetime regressions. They do not add a
 new persisted format. Remove only when upstream semantics and tests cover them.
+
+Fragment open retries through the optional task-owned lance-file read policy
+after failed open state is released. Per-file recovery remains disabled for
+adaptive multi-file reads to preserve merged physical batch alignment. See
+../lance-file/BACKPORT.md.
+
+`index/scalar` exposes `prepare_query_index` and `query_index_metadata_ready`
+for the bounded query-metadata conversion in lance-index. Preparation validates
+a committed local single-field segment and a fresh destination UUID, then returns
+replacement metadata with the original coverage. Publication remains the caller's
+responsibility. Lance 14's file-metadata caching, native admission and row-ID
+remapping paths are retained.

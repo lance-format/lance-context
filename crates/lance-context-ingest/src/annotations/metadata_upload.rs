@@ -36,21 +36,21 @@ struct Counters {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Observation {
-    pub(crate) waiting_objects: u64,
+pub struct Observation {
+    pub waiting_objects: u64,
     /// Calls to the underlying store, not HTTP attempts inside its SDK.
-    pub(crate) put_resubmissions: u64,
+    pub put_resubmissions: u64,
     /// Parts currently waiting in the SDK policy's backoff.
-    pub(crate) waiting_part_retries: u64,
+    pub waiting_part_retries: u64,
     /// Policy approvals, not HTTP attempts inside the SDK.
-    pub(crate) part_retry_decisions: u64,
-    pub(crate) waiting_completion_retries: u64,
-    pub(crate) completion_retry_decisions: u64,
+    pub part_retry_decisions: u64,
+    pub waiting_completion_retries: u64,
+    pub completion_retry_decisions: u64,
 }
 
 /// Held by the owner role, never by its detached file writers. Dropping this
 /// scope cancels even a writer whose scheduling caller has already disappeared.
-pub(crate) struct Scope {
+pub struct Scope {
     lifetime: Option<watch::Sender<()>>,
     enabled: Arc<AtomicBool>,
     counters: Arc<Counters>,
@@ -58,7 +58,7 @@ pub(crate) struct Scope {
 
 impl Scope {
     /// Install before opening a dataset, in this owner's private fresh session.
-    pub(crate) fn install(storage: &Storage) -> Result<Self> {
+    pub fn install(storage: &Storage) -> Result<Self> {
         let registry = storage.session.store_registry();
         ensure!(
             registry.active_stores().is_empty(),
@@ -93,15 +93,16 @@ impl Scope {
 
     /// Activate only once the owner can monitor its lease and shutdown. During
     /// connection/recovery the existing bounded SDK failure behavior remains.
-    pub(crate) fn start(&self) {
+    pub fn start(&self) {
         self.enabled.store(true, Ordering::Release);
     }
 
-    pub(crate) fn cancel(&mut self) {
+    /// Cancel owned uploads before joining tasks after lease loss or shutdown.
+    pub fn cancel(&mut self) {
         self.lifetime.take();
     }
 
-    pub(crate) fn observation(&self) -> Observation {
+    pub fn observation(&self) -> Observation {
         Observation {
             waiting_objects: self.counters.waiting.load(Ordering::Relaxed),
             put_resubmissions: self.counters.resubmissions.load(Ordering::Relaxed),

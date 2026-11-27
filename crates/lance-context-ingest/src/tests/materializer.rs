@@ -436,7 +436,7 @@ async fn real_rollout_recovery(pipeline: bool, source_read_policy: SourceReadPol
     let storage = Storage {
         uri: path.to_str().unwrap().into(),
         base: ObjectPath::parse(object_base)?,
-        options: HashMap::new(),
+        params: Default::default(),
         session: Arc::new(lance::session::Session::default()),
     };
     drop(base);

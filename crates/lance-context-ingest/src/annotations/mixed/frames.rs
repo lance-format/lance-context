@@ -105,6 +105,11 @@ pub(crate) struct Window {
     frozen: Option<Frozen>,
 }
 
+pub(crate) struct RetainedFrameObservation {
+    pub reservation_bytes: usize,
+    pub arrow_backing_bytes: Option<usize>,
+}
+
 impl Window {
     #[cfg(test)]
     pub fn record(
@@ -122,7 +127,7 @@ impl Window {
             input_bytes,
             input_allocation,
             None,
-        )
+        );
     }
 
     pub fn record_with_spec(
@@ -133,12 +138,16 @@ impl Window {
         input_bytes: usize,
         input_allocation: Option<(usize, usize)>,
         spec: Option<Arc<crate::turn_ingestion::TurnIngestionSpec>>,
-    ) {
-        if let Some(bytes) =
-            memory::retained_bytes(&batches, input_bytes, reservation.bytes(), input_allocation)
-        {
-            reservation.shrink_to(bytes);
+    ) -> RetainedFrameObservation {
+        let retention =
+            memory::retained_bytes(&batches, input_bytes, reservation.bytes(), input_allocation);
+        if let Some(retention) = &retention {
+            reservation.shrink_to(retention.charge);
         }
+        let observed = RetainedFrameObservation {
+            reservation_bytes: reservation.bytes(),
+            arrow_backing_bytes: retention.map(|retention| retention.backing_bytes),
+        };
         assert!(self
             .active
             .insert(
@@ -150,6 +159,7 @@ impl Window {
                 })
             )
             .is_none());
+        observed
     }
 
     pub fn row(

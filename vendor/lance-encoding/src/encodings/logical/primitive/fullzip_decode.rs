@@ -16,6 +16,9 @@ use itertools::Itertools;
 use lance_core::Result;
 use lance_core::cache::{Context, DeepSizeOf};
 use lance_core::error::Error;
+use lance_core::memory::{
+    NativeMemory, NativeMemoryKind, NativeReservation, reserve_vec, try_reserve,
+};
 
 use crate::EncodingsIo;
 use crate::buffer::LanceBuffer;
@@ -50,6 +53,7 @@ enum PerValueDecompressor {
 
 #[derive(Debug)]
 struct FullZipDecodeDetails {
+    native_memory: lance_core::memory::NativeMemory,
     value_decompressor: PerValueDecompressor,
     def_meaning: Arc<[DefinitionInterpretation]>,
     ctrl_word_parser: ControlWordParser,
@@ -213,6 +217,7 @@ impl FullZipScheduler {
         };
 
         let details = Arc::new(FullZipDecodeDetails {
+            native_memory: decompressors.native_memory(),
             value_decompressor,
             def_meaning: def_meaning.into(),
             ctrl_word_parser,
@@ -763,6 +768,7 @@ struct VariableFullZipDecoder {
     data_starts: Vec<usize>,
     offset_starts: Vec<usize>,
     visible_item_counts: Vec<u64>,
+    row_reservations: [NativeReservation; 4],
     bits_per_offset: u8,
     current_idx: usize,
     num_rows: u64,
@@ -792,10 +798,11 @@ impl VariableFullZipDecoder {
             rep: LanceBuffer::empty().borrow_to_typed_slice(),
             def: LanceBuffer::empty().borrow_to_typed_slice(),
             bits_per_offset: out_bits_per_offset,
-            repdef_starts: Vec::with_capacity(num_rows as usize + 1),
-            data_starts: Vec::with_capacity(num_rows as usize + 1),
-            offset_starts: Vec::with_capacity(num_rows as usize + 1),
-            visible_item_counts: Vec::with_capacity(num_rows as usize + 1),
+            repdef_starts: Vec::new(),
+            data_starts: Vec::new(),
+            offset_starts: Vec::new(),
+            visible_item_counts: Vec::new(),
+            row_reservations: [None, None, None, None],
             current_idx: 0,
             num_rows,
         };
@@ -828,6 +835,7 @@ impl VariableFullZipDecoder {
     fn slice_batch_data_and_rebase_offsets_typed<T>(
         data: &LanceBuffer,
         offsets: &LanceBuffer,
+        memory: &NativeMemory,
     ) -> Result<(LanceBuffer, LanceBuffer)>
     where
         T: arrow_buffer::ArrowNativeType
@@ -837,7 +845,7 @@ impl VariableFullZipDecoder {
             + std::fmt::Display
             + TryInto<usize>,
     {
-        let offsets_slice = offsets.borrow_to_typed_slice::<T>();
+        let offsets_slice = offsets.borrow_to_typed_slice_with_native_memory::<T>(memory)?;
         let offsets_slice = offsets_slice.as_ref();
         if offsets_slice.is_empty() {
             return Err(Error::internal(
@@ -866,6 +874,11 @@ impl VariableFullZipDecoder {
             )));
         }
 
+        let offsets_reservation = try_reserve(
+            memory,
+            NativeMemoryKind::Decode,
+            std::mem::size_of_val(offsets_slice),
+        )?;
         let mut rebased_offsets = Vec::with_capacity(offsets_slice.len());
         for &offset in offsets_slice {
             if offset < base {
@@ -878,8 +891,10 @@ impl VariableFullZipDecoder {
 
         let sliced_data = data.slice_with_length(data_start, data_end - data_start);
         // Copy into a compact buffer so each output batch owns only what it references.
-        let sliced_data = LanceBuffer::copy_slice(&sliced_data);
-        let rebased_offsets = LanceBuffer::reinterpret_vec(rebased_offsets);
+        let data_reservation = try_reserve(memory, NativeMemoryKind::Decode, sliced_data.len())?;
+        let sliced_data = LanceBuffer::copy_slice(&sliced_data).with_reservation(data_reservation);
+        let rebased_offsets =
+            LanceBuffer::reinterpret_vec(rebased_offsets).with_reservation(offsets_reservation);
         Ok((sliced_data, rebased_offsets))
     }
 
@@ -887,10 +902,11 @@ impl VariableFullZipDecoder {
         data: &LanceBuffer,
         offsets: &LanceBuffer,
         bits_per_offset: u8,
+        memory: &NativeMemory,
     ) -> Result<(LanceBuffer, LanceBuffer)> {
         match bits_per_offset {
-            32 => Self::slice_batch_data_and_rebase_offsets_typed::<u32>(data, offsets),
-            64 => Self::slice_batch_data_and_rebase_offsets_typed::<u64>(data, offsets),
+            32 => Self::slice_batch_data_and_rebase_offsets_typed::<u32>(data, offsets, memory),
+            64 => Self::slice_batch_data_and_rebase_offsets_typed::<u64>(data, offsets, memory),
             _ => Err(Error::internal(format!(
                 "Unsupported bits_per_offset={bits_per_offset}"
             ))),
@@ -934,15 +950,40 @@ impl VariableFullZipDecoder {
         num_rows: u64,
     ) -> Result<()> {
         // This undercounts if there are lists but, at this point, we don't really know how many items we have
-        let mut rep = Vec::with_capacity(num_rows as usize);
-        let mut def = Vec::with_capacity(num_rows as usize);
+        let memory = &self.details.native_memory;
+        let mut rep = Vec::new();
+        let mut def = Vec::new();
+        let mut rep_reservation = None;
+        let mut def_reservation = None;
+        reserve_vec(
+            &mut rep,
+            &mut rep_reservation,
+            memory,
+            NativeMemoryKind::Decode,
+            num_rows as usize,
+        )?;
+        reserve_vec(
+            &mut def,
+            &mut def_reservation,
+            memory,
+            NativeMemoryKind::Decode,
+            num_rows as usize,
+        )?;
         let bytes_cw = self.details.ctrl_word_parser.bytes_per_word() * num_rows as usize;
 
         // This undercounts if there are lists
         // It can also overcount if there are invisible items
         let bytes_per_offset = out_bits_per_offset as usize / 8;
         let bytes_offsets = bytes_per_offset * (num_rows as usize + 1);
-        let mut offsets_data = Vec::with_capacity(bytes_offsets);
+        let mut offsets_data = Vec::new();
+        let mut offsets_reservation = None;
+        reserve_vec(
+            &mut offsets_data,
+            &mut offsets_reservation,
+            memory,
+            NativeMemoryKind::Decode,
+            bytes_offsets,
+        )?;
 
         let bytes_per_length = in_bits_per_length as usize / 8;
         let bytes_lengths = bytes_per_length * num_rows as usize;
@@ -950,8 +991,15 @@ impl VariableFullZipDecoder {
         let bytes_data = data.iter().map(|d| d.len()).sum::<usize>();
         // This overcounts since bytes_lengths and bytes_cw are undercounts
         // It can also undercount if there are invisible items (hence the saturating_sub)
-        let mut unzipped_data =
-            Vec::with_capacity((bytes_data - bytes_cw).saturating_sub(bytes_lengths));
+        let mut unzipped_data = Vec::new();
+        let mut data_reservation = None;
+        reserve_vec(
+            &mut unzipped_data,
+            &mut data_reservation,
+            memory,
+            NativeMemoryKind::Decode,
+            (bytes_data - bytes_cw).saturating_sub(bytes_lengths),
+        )?;
 
         let mut current_offset = 0_u64;
         let mut visible_item_count = 0_u64;
@@ -969,18 +1017,67 @@ impl VariableFullZipDecoder {
                     self.details.max_rep,
                     self.details.max_visible_def,
                 );
+                reserve_vec(
+                    &mut rep,
+                    &mut rep_reservation,
+                    memory,
+                    NativeMemoryKind::Decode,
+                    1,
+                )?;
+                reserve_vec(
+                    &mut def,
+                    &mut def_reservation,
+                    memory,
+                    NativeMemoryKind::Decode,
+                    1,
+                )?;
                 self.details
                     .ctrl_word_parser
                     .parse(databuf, &mut rep, &mut def);
                 databuf = &databuf[self.details.ctrl_word_parser.bytes_per_word()..];
 
                 if ctrl_desc.is_new_row {
+                    reserve_vec(
+                        &mut self.repdef_starts,
+                        &mut self.row_reservations[0],
+                        memory,
+                        NativeMemoryKind::Decode,
+                        1,
+                    )?;
                     self.repdef_starts.push(repdef_start);
+                    reserve_vec(
+                        &mut self.data_starts,
+                        &mut self.row_reservations[1],
+                        memory,
+                        NativeMemoryKind::Decode,
+                        1,
+                    )?;
                     self.data_starts.push(data_start);
+                    reserve_vec(
+                        &mut self.offset_starts,
+                        &mut self.row_reservations[2],
+                        memory,
+                        NativeMemoryKind::Decode,
+                        1,
+                    )?;
                     self.offset_starts.push(offset_start);
+                    reserve_vec(
+                        &mut self.visible_item_counts,
+                        &mut self.row_reservations[3],
+                        memory,
+                        NativeMemoryKind::Decode,
+                        1,
+                    )?;
                     self.visible_item_counts.push(visible_item_count);
                 }
                 if ctrl_desc.is_visible {
+                    reserve_vec(
+                        &mut offsets_data,
+                        &mut offsets_reservation,
+                        memory,
+                        NativeMemoryKind::Decode,
+                        bytes_per_offset,
+                    )?;
                     visible_item_count += 1;
                     if ctrl_desc.is_valid_item {
                         let length = Self::parse_length(databuf, in_bits_per_length)?;
@@ -1002,6 +1099,13 @@ impl VariableFullZipDecoder {
                                 ),
                             ));
                         }
+                        reserve_vec(
+                            &mut unzipped_data,
+                            &mut data_reservation,
+                            memory,
+                            NativeMemoryKind::Decode,
+                            length as usize,
+                        )?;
                         unzipped_data.extend_from_slice(&databuf[..length as usize]);
                         databuf = &databuf[length as usize..];
                         current_offset += length;
@@ -1017,19 +1121,58 @@ impl VariableFullZipDecoder {
                 }
             }
         }
+        reserve_vec(
+            &mut self.repdef_starts,
+            &mut self.row_reservations[0],
+            memory,
+            NativeMemoryKind::Decode,
+            1,
+        )?;
         self.repdef_starts.push(rep.len().max(def.len()));
+        reserve_vec(
+            &mut self.data_starts,
+            &mut self.row_reservations[1],
+            memory,
+            NativeMemoryKind::Decode,
+            1,
+        )?;
         self.data_starts.push(unzipped_data.len());
+        reserve_vec(
+            &mut self.offset_starts,
+            &mut self.row_reservations[2],
+            memory,
+            NativeMemoryKind::Decode,
+            1,
+        )?;
         self.offset_starts.push(offsets_data.len());
+        reserve_vec(
+            &mut self.visible_item_counts,
+            &mut self.row_reservations[3],
+            memory,
+            NativeMemoryKind::Decode,
+            1,
+        )?;
         self.visible_item_counts.push(visible_item_count);
+        reserve_vec(
+            &mut offsets_data,
+            &mut offsets_reservation,
+            memory,
+            NativeMemoryKind::Decode,
+            bytes_per_offset,
+        )?;
         match out_bits_per_offset {
             32 => offsets_data.extend_from_slice(&(current_offset as u32).to_le_bytes()),
             64 => offsets_data.extend_from_slice(&current_offset.to_le_bytes()),
             _ => unreachable!(),
         };
-        self.rep = ScalarBuffer::from(rep);
-        self.def = ScalarBuffer::from(def);
-        self.data = LanceBuffer::from(unzipped_data);
-        self.offsets = LanceBuffer::from(offsets_data);
+        self.rep = LanceBuffer::reinterpret_vec(rep)
+            .with_reservation(rep_reservation)
+            .borrow_to_typed_slice();
+        self.def = LanceBuffer::reinterpret_vec(def)
+            .with_reservation(def_reservation)
+            .borrow_to_typed_slice();
+        self.data = LanceBuffer::from(unzipped_data).with_reservation(data_reservation);
+        self.offsets = LanceBuffer::from(offsets_data).with_reservation(offsets_reservation);
         Ok(())
     }
 }
@@ -1045,8 +1188,12 @@ impl StructuralPageDecoder for VariableFullZipDecoder {
             .offsets
             .slice_with_length(offset_start, offset_end - offset_start);
         // Keep each batch's variable data buffer bounded to the selected rows.
-        let (data, offsets) =
-            Self::slice_batch_data_and_rebase_offsets(&self.data, &offsets, self.bits_per_offset)?;
+        let (data, offsets) = Self::slice_batch_data_and_rebase_offsets(
+            &self.data,
+            &offsets,
+            self.bits_per_offset,
+            &self.details.native_memory,
+        )?;
 
         let repdef_start = self.repdef_starts[start];
         let repdef_end = self.repdef_starts[end];
@@ -1171,7 +1318,8 @@ impl DecodePageTask for FixedFullZipDecodeTask {
                 .sum::<u64>()
                 * 2
         };
-        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes)
+            .with_native_memory(self.details.native_memory.clone());
 
         if self.details.ctrl_word_parser.bytes_per_word() == 0 {
             // Fast path, no need to unzip because there is no rep/def
@@ -1311,6 +1459,7 @@ mod tests {
     ) -> DataBlock {
         Box::new(FixedFullZipDecodeTask {
             details: Arc::new(FullZipDecodeDetails {
+                native_memory: None,
                 value_decompressor: PerValueDecompressor::Fixed(decompressor),
                 def_meaning: Arc::from([]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 0),
@@ -1540,7 +1689,7 @@ mod tests {
         let offsets = LanceBuffer::reinterpret_vec(vec![6_u32, 8_u32, 8_u32, 12_u32]);
 
         let (sliced_data, normalized_offsets) =
-            VariableFullZipDecoder::slice_batch_data_and_rebase_offsets(&data, &offsets, 32)
+            VariableFullZipDecoder::slice_batch_data_and_rebase_offsets(&data, &offsets, 32, &None)
                 .unwrap();
 
         assert_eq!(sliced_data.as_ref(), b"6789ab");
@@ -1554,7 +1703,7 @@ mod tests {
         let offsets = LanceBuffer::reinterpret_vec(vec![10_u64, 12_u64, 16_u64, 20_u64]);
 
         let (sliced_data, normalized_offsets) =
-            VariableFullZipDecoder::slice_batch_data_and_rebase_offsets(&data, &offsets, 64)
+            VariableFullZipDecoder::slice_batch_data_and_rebase_offsets(&data, &offsets, 64, &None)
                 .unwrap();
 
         assert_eq!(sliced_data.as_ref(), b"klmnopqrst");
@@ -1567,8 +1716,9 @@ mod tests {
         let data = LanceBuffer::copy_slice(b"abcd");
         let offsets = LanceBuffer::reinterpret_vec(vec![3_u32, 2_u32]);
 
-        let err = VariableFullZipDecoder::slice_batch_data_and_rebase_offsets(&data, &offsets, 32)
-            .expect_err("offset end before start should error");
+        let err =
+            VariableFullZipDecoder::slice_batch_data_and_rebase_offsets(&data, &offsets, 32, &None)
+                .expect_err("offset end before start should error");
         assert!(err.to_string().contains("less than base"));
     }
 
@@ -1644,6 +1794,7 @@ mod tests {
             rows_in_page: 100,
             bits_per_offset: 32,
             details: Arc::new(FullZipDecodeDetails {
+                native_memory: None,
                 value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
                 def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
@@ -1770,6 +1921,7 @@ mod tests {
             rows_in_page,
             bits_per_offset: 32,
             details: Arc::new(FullZipDecodeDetails {
+                native_memory: None,
                 value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
                 def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
@@ -1895,6 +2047,7 @@ mod tests {
             rows_in_page,
             bits_per_offset: 32,
             details: Arc::new(FullZipDecodeDetails {
+                native_memory: None,
                 value_decompressor: PerValueDecompressor::Fixed(Arc::new(TestFixedDecompressor)),
                 def_meaning: Arc::new([crate::repdef::DefinitionInterpretation::NullableItem]),
                 ctrl_word_parser: crate::repdef::ControlWordParser::new(0, 1),
@@ -2034,6 +2187,7 @@ mod tests {
         use crate::repdef::{ControlWordParser, DefinitionInterpretation};
         use std::sync::Arc;
         Arc::new(super::FullZipDecodeDetails {
+            native_memory: None,
             value_decompressor: super::PerValueDecompressor::Variable(Arc::new(
                 VariableDecoder::default(),
             )
@@ -2123,6 +2277,7 @@ mod tests {
         }
 
         let details = Arc::new(super::FullZipDecodeDetails {
+            native_memory: None,
             value_decompressor: super::PerValueDecompressor::Fixed(Arc::new(
                 UnusedFixedDecompressor,
             )),

@@ -73,12 +73,21 @@ impl LookupMetricObservation {
 }
 
 /// Lookup totals count successful windows, including probes whose captured base
-/// was subsequently replaced. Cached reuse and admission refusals add no lookup
-/// totals; prefetch decisions and fallback attempts have separate counters.
+/// was subsequently replaced. Reusing a completed window or refusing admission
+/// adds no lookup totals; prefetch and fallback attempts have separate counters.
 /// Failed/cancelled lookups remain visible in the existing lookup phase.
-/// A window entirely resolved by staging starts no native scan.
+/// A window resolved by staging or committed membership starts no native scan.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BodyLookupObservation {
+    /// Full-body Applied batches with an actual first-create count of zero.
+    /// Byte totals count frame admissions, not live memory, freed bytes or RSS.
+    pub all_duplicate_batches: u64,
+    pub all_duplicate_rows: u64,
+    /// Coverage of the known-capacity, within-frame deduplicated Arrow total.
+    pub all_duplicate_known_arrow_batches: u64,
+    pub all_duplicate_arrow_backing_bytes: u64,
+    /// Final retained apply reservation; includes conservative bookkeeping.
+    pub all_duplicate_reservation_bytes: u64,
     pub completed_lookups: u64,
     /// Original requests/wire bytes covered by successful lookup windows.
     /// Re-probes count again; these are not unique writes or publication ACKs.
@@ -89,10 +98,24 @@ pub struct BodyLookupObservation {
     /// Attempts releasing prefetched bodies before a head-only lookup. The
     /// replacement lookup can still fail admission; this is not a success count.
     pub lookahead_admission_fallbacks: u64,
+    /// Successor windows whose native lookup was observed active while the
+    /// current native lookup was also active. Not a count of physical I/O.
+    pub history_query_overlaps: u64,
+    pub prefetched_lookups_started: u64,
+    pub prefetched_lookups_completed: u64,
+    /// Completed speculative lookups accepted by ordered apply at least once.
+    pub prefetched_lookups_reused: u64,
+    /// Speculative results rejected by the existing captured-base check.
+    pub prefetched_lookups_stale: u64,
+    /// Prepared speculative queries dropped before completion, including
+    /// admission pressure and owner cancellation. Their WAL positions remain.
+    pub prefetched_lookups_cancelled: u64,
     pub prefetch: BodyPrefetchObservation,
     pub requested_keys: u64,
     /// Keys resolved from the same captured active/frozen view, without history I/O.
     pub staged_keys: u64,
+    /// Committed positive membership reused without native history I/O.
+    pub cached_keys: u64,
     /// Exact distinct keys per successful window, after composite matching.
     /// Re-probes count again; these are not applied or globally unique rows.
     pub history_hits: u64,
@@ -104,8 +127,15 @@ pub struct BodyLookupObservation {
     pub projected_array_bytes: u64,
     pub elapsed_us: u64,
     pub max_elapsed_us: u64,
-    /// Number of completed lookups with a native scan summary. Bytes, requests
-    /// and indices totals cover these summaries; no summaries means unavailable.
+    pub first_result_us: LookupMetricObservation,
+    pub parallel_scan_queries: u64,
+    pub last_scan_partitions: usize,
+    /// Native fragment task producers, not physical I/O or decoded batches.
+    pub last_fragment_streams_peak: Option<usize>,
+    pub max_fragment_streams_peak: usize,
+    /// Completed lookups with native plan metrics sampled at completion,
+    /// including all-hit early exits. Totals exclude later background work
+    /// and staging-only resolutions; they are not all object-store I/O.
     pub native_summaries: u64,
     pub lance_bytes_read: u64,
     pub lance_requests: u64,
@@ -140,6 +170,7 @@ impl BodyLookupObservation {
             .requested_keys
             .saturating_add(value.requested_keys as u64);
         self.staged_keys = self.staged_keys.saturating_add(value.staged_keys as u64);
+        self.cached_keys = self.cached_keys.saturating_add(value.cached_keys as u64);
         self.history_hits = self.history_hits.saturating_add(value.history_hits as u64);
         self.history_misses = self
             .history_misses
@@ -151,6 +182,15 @@ impl BodyLookupObservation {
             .saturating_add(value.projected_array_bytes);
         self.elapsed_us = self.elapsed_us.saturating_add(value.elapsed_us);
         self.max_elapsed_us = self.max_elapsed_us.max(value.elapsed_us);
+        self.first_result_us.record(value.first_result_us);
+        self.parallel_scan_queries = self
+            .parallel_scan_queries
+            .saturating_add(u64::from(value.scan_partitions > 1));
+        self.last_scan_partitions = value.scan_partitions;
+        self.last_fragment_streams_peak = value.fragment_streams_peak;
+        self.max_fragment_streams_peak = self
+            .max_fragment_streams_peak
+            .max(value.fragment_streams_peak.unwrap_or(0));
         self.fragments_scanned.record(value.fragments_scanned);
         self.ranges_scanned.record(value.ranges_scanned);
         self.rows_scanned.record(value.rows_scanned);

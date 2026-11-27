@@ -134,7 +134,7 @@ use lance_datafusion::{
     dataframe::BatchStreamGrouper,
     exec::{
         HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec, OneShotPartitionStream,
-        analyze_plan, execute_plan, get_session_context, provider_to_stream,
+        analyze_plan, execute_plan, get_session_context, provider_to_stream_with_context,
     },
     spill::spilling_table_provider,
     utils::{StreamingWriteSource, reader_to_stream},
@@ -1674,6 +1674,7 @@ impl MergeInsertJob {
         execute_plan(
             joined,
             LanceExecutionOptions {
+                runtime_env: self.dataset.session.runtime_env(),
                 use_spilling: true,
                 ..Default::default()
             },
@@ -1718,7 +1719,10 @@ impl MergeInsertJob {
         source: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
         let session_config = SessionConfig::default().with_target_partitions(1);
-        let session_ctx = SessionContext::new_with_config(session_config);
+        let session_ctx = SessionContext::new_with_config_rt(
+            session_config,
+            self.dataset.session.runtime_env().unwrap_or_default(),
+        );
         let schema = source.schema();
         let new_data = session_ctx.read_one_shot(source)?;
         let join_cols = self
@@ -1842,6 +1846,7 @@ impl MergeInsertJob {
         // Expected source schema: _rowaddr, updated_cols*
         use datafusion::logical_expr::{col, lit};
         let session_ctx = get_session_context(&LanceExecutionOptions {
+            runtime_env: dataset.session.runtime_env(),
             use_spilling: true,
             target_partition: Some(get_num_compute_intensive_cpus().min(8)),
             ..Default::default()
@@ -2670,7 +2675,10 @@ impl MergeInsertJob {
         // Goal: we shouldn't have to add new branches in this code to handle
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let write_sink = self.select_write_sink(provider.schema().as_ref())?;
-        let session_ctx = SessionContext::new();
+        let session_ctx = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            self.dataset.session.runtime_env().unwrap_or_default(),
+        );
         let mut target_provider =
             crate::datafusion::dataframe::LanceTableProvider::new_with_ordering(
                 self.dataset.clone(),
@@ -2846,6 +2854,7 @@ impl MergeInsertJob {
         Option<RowAddrTreeMap>,
         Option<KeyExistenceFilter>,
     )> {
+        let runtime_env = self.dataset.session.runtime_env();
         let plan = self.create_plan(provider).await?;
 
         // Execute the plan
@@ -2860,8 +2869,11 @@ impl MergeInsertJob {
         }
 
         // Execute partition 0 (the only partition)
-        let task_context = Arc::new(datafusion::execution::TaskContext::default());
-        let mut stream = plan.execute(0, task_context)?;
+        let mut task_context = datafusion::execution::TaskContext::default();
+        if let Some(runtime_env) = runtime_env {
+            task_context = task_context.with_runtime(runtime_env);
+        }
+        let mut stream = plan.execute(0, Arc::new(task_context))?;
 
         // Assert that the execution produces no output (this is a write operation)
         if let Some(batch) = stream.next().await {
@@ -3088,7 +3100,11 @@ impl MergeInsertJob {
         let target_bases_info = resolve_target_bases(&self.dataset, &self.params).await?;
 
         // The slow path consumes a single stream; adapt the provider back into one.
-        let source = provider_to_stream(provider).await?;
+        let source_context = SessionContext::new_with_config_rt(
+            SessionConfig::default(),
+            self.dataset.session.runtime_env().unwrap_or_default(),
+        );
+        let source = provider_to_stream_with_context(provider, &source_context).await?;
         let source_schema = source.schema();
         let lance_schema = lance_core::datatypes::Schema::try_from(source_schema.as_ref())?;
         let full_schema = self.dataset.schema();
@@ -3548,7 +3564,10 @@ impl MergeInsertJob {
         let plan = cloned_job.create_plan(provider).await?;
 
         // Use the analyze_plan function from lance_datafusion, but strip out the wrapper lines
-        let options = LanceExecutionOptions::default();
+        let options = LanceExecutionOptions {
+            runtime_env: self.dataset.session.runtime_env(),
+            ..Default::default()
+        };
         let full_analysis = analyze_plan(plan, options).await?;
 
         // Remove the AnalyzeExec and TracedExec lines from the output

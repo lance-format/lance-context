@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::execution::runtime_env::RuntimeEnv;
 use lance_core::cache::{CacheBackend, LanceCache, QuickCacheBackend, QuickCacheShardPolicy};
 use lance_core::deepsize::DeepSizeOf;
 use lance_core::{Error, Result};
@@ -74,6 +75,9 @@ pub struct Session {
     store_registry: Arc<ObjectStoreRegistry>,
 
     spill_store: Arc<dyn SpillStore>,
+
+    runtime_env: Option<Arc<RuntimeEnv>>,
+    native_memory: lance_core::memory::NativeMemory,
 }
 
 impl DeepSizeOf for Session {
@@ -138,6 +142,8 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            runtime_env: None,
+            native_memory: None,
         }
     }
 
@@ -159,6 +165,8 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            runtime_env: None,
+            native_memory: None,
         }
     }
 
@@ -185,6 +193,28 @@ impl Session {
     /// state that overflows memory (e.g. index builders).
     pub fn spill_store(&self) -> &dyn SpillStore {
         &*self.spill_store
+    }
+
+    /// Share native read, decoder and index admission with the caller.
+    /// Reservations remain attached to borrowed buffers after cache eviction.
+    pub fn with_native_memory(mut self, memory: Arc<dyn lance_core::memory::NativeMemoryPool>) -> Self {
+        self.native_memory = Some(memory);
+        self
+    }
+
+    pub fn native_memory(&self) -> lance_core::memory::NativeMemory {
+        self.native_memory.clone()
+    }
+
+    /// Share DataFusion execution resources across this session's scans and merges.
+    /// Native decoder/index allocations and Lance's spill store are separate.
+    pub fn with_runtime_env(mut self, runtime_env: Arc<RuntimeEnv>) -> Self {
+        self.runtime_env = Some(runtime_env);
+        self
+    }
+
+    pub fn runtime_env(&self) -> Option<Arc<RuntimeEnv>> {
+        self.runtime_env.clone()
     }
 
     /// Create a session with custom backends for both caches.
@@ -238,6 +268,8 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             spill_store: Arc::new(LocalSpillStore::default()),
+            runtime_env: None,
+            native_memory: None,
         }
     }
 
