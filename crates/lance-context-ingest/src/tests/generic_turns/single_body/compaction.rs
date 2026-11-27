@@ -135,6 +135,11 @@ async fn full_body_compaction_preserves_bodies_row_ids_and_request_results() -> 
     assert_eq!(old.manifest().fragments.len(), 3);
     let before = service.observation_with_manifest().await.0.installed_base;
     assert_eq!(before.version, old.version_id());
+    let before_indices = service.inspect_installed_indices().await?;
+    assert_eq!(before_indices.version, before.version);
+    assert_eq!(before_indices.source, before.source);
+    assert_eq!(before_indices.fragments, 3);
+    assert!(before_indices.indices.is_empty());
     let fragments = before.fragment_summary.unwrap();
     assert_eq!(fragments.fragments, 3);
     assert_eq!(fragments.known_size_fragments, 3);
@@ -196,6 +201,10 @@ async fn full_body_compaction_preserves_bodies_row_ids_and_request_results() -> 
     let installed = service.observation_with_manifest().await.0.installed_base;
     assert_eq!(installed.rows, Some(6));
     assert_eq!(installed.version, rewritten.version_id());
+    let after_indices = service.inspect_installed_indices().await?;
+    assert_eq!(after_indices.version, installed.version);
+    assert_eq!(after_indices.materialized, before_indices.materialized);
+    assert_eq!(after_indices.fragments, 1);
     let fragments = installed.fragment_summary.unwrap();
     assert_eq!(fragments.fragments, 1);
     assert_eq!(fragments.known_size_fragments, 1);
