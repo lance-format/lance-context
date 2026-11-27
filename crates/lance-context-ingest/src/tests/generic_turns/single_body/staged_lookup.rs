@@ -59,7 +59,7 @@ impl Drop for CaptureCharge {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn staged_duplicates_skip_history_and_publication_restores_base_lookup() -> Result<()> {
+async fn staged_and_published_duplicates_skip_history_and_eviction_restores_lookup() -> Result<()> {
     tokio::time::timeout(DEADLINE, exercise()).await?
 }
 
@@ -233,9 +233,27 @@ async fn exercise() -> Result<()> {
         annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
     assert_eq!(durable.count_rows(None).await?, 4);
     let before = service.body_lookup_observation();
+    let mut keys = capture.arm(diagnostic_budget.clone())?;
+    let repeated = request(&service, &lane, 5, encode(1)?).await?;
+    let result = service.submit(&repeated, DEADLINE).await?;
+    assert_eq!(result.result, MutationResult::Applied);
+    let after = service.body_lookup_observation();
+    assert_eq!(after.cached_keys, before.cached_keys + 2);
+    assert_eq!(after.staged_keys, before.staged_keys);
+    assert_eq!(after.scans_started, before.scans_started);
+    assert!(matches!(
+        keys.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    drop(keys);
+    drained(&c, &service, result.index).await?;
+    let selected = service.selected_full_body(DEADLINE).await?;
+    // Eviction removes acceleration only; the same durable rows still dedup.
+    storage.session.file_metadata_cache().clear().await;
+    let before = service.body_lookup_observation();
     let pool = Arc::new(CapturePool::default());
     let keys = capture.arm_with_pool(diagnostic_budget.clone(), pool.clone())?;
-    let repeated = request(&service, &lane, 5, encode(1)?).await?;
+    let repeated = request(&service, &lane, 6, encode(1)?).await?;
     let result = service.submit(&repeated, DEADLINE).await?;
     let after = service.body_lookup_observation();
     let captured = tokio::time::timeout(DEADLINE, keys).await???;
@@ -259,11 +277,11 @@ async fn exercise() -> Result<()> {
     assert_eq!(after.history_misses, before.history_misses);
     assert_eq!(
         after.requested_keys,
-        after.staged_keys + after.history_hits + after.history_misses
+        after.staged_keys + after.cached_keys + after.history_hits + after.history_misses
     );
     let applied = service.observation().await.0.immutable_apply;
-    assert_eq!((applied.batches, applied.rows), (5, 12));
-    assert_eq!((applied.inserted_rows, applied.duplicate_rows), (4, 8));
+    assert_eq!((applied.batches, applied.rows), (6, 14));
+    assert_eq!((applied.inserted_rows, applied.duplicate_rows), (4, 10));
     // A materialized key is no longer a staged hit; the original body wins.
     let key = spec.row_key(&input[0], 0, 4096)?;
     assert_eq!(
@@ -277,11 +295,12 @@ async fn exercise() -> Result<()> {
     drained(&c, &service, result.index).await?;
     // Diagnostic refusal cannot fail or delay durable apply. The snapshot is
     // one-shot even on failure, and releases every partial allocation.
+    storage.session.file_metadata_cache().clear().await;
     let held = diagnostic_budget
         .try_reserve(diagnostic_budget.limit())
         .unwrap();
     let keys = capture.arm(diagnostic_budget.clone())?;
-    let repeated = request(&service, &lane, 6, encode(1)?).await?;
+    let repeated = request(&service, &lane, 7, encode(1)?).await?;
     let result = service.submit(&repeated, DEADLINE).await?;
     assert_eq!(result.result, MutationResult::Applied);
     let error = tokio::time::timeout(DEADLINE, keys)
@@ -293,8 +312,9 @@ async fn exercise() -> Result<()> {
     assert_eq!(diagnostic_budget.reserved(), 0);
     drained(&c, &service, result.index).await?;
     pool.refuse.store(true, Ordering::SeqCst);
+    storage.session.file_metadata_cache().clear().await;
     let keys = capture.arm_with_pool(diagnostic_budget.clone(), pool.clone())?;
-    let repeated = request(&service, &lane, 7, encode(1)?).await?;
+    let repeated = request(&service, &lane, 8, encode(1)?).await?;
     let result = service.submit(&repeated, DEADLINE).await?;
     assert_eq!(result.result, MutationResult::Applied);
     let error = tokio::time::timeout(DEADLINE, keys)
@@ -309,10 +329,11 @@ async fn exercise() -> Result<()> {
     drained(&c, &service, result.index).await?;
 
     pool.refuse.store(false, Ordering::SeqCst);
+    storage.session.file_metadata_cache().clear().await;
     let backed = pool.backed.load(Ordering::SeqCst);
     *pool.cancel.lock().unwrap() =
         Some(capture.arm_with_pool(diagnostic_budget.clone(), pool.clone())?);
-    let repeated = request(&service, &lane, 8, encode(1)?).await?;
+    let repeated = request(&service, &lane, 9, encode(1)?).await?;
     let result = service.submit(&repeated, DEADLINE).await?;
     assert_eq!(result.result, MutationResult::Applied);
     assert!(pool.cancel.lock().unwrap().is_none());

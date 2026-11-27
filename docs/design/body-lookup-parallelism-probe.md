@@ -122,6 +122,13 @@ Decoded keys/metadata remain outside native pool accounting. The existing
 production key contract still applies. No keys or credential values appear in
 stdout/report.
 
+Captures distinguish `staged_keys` from `cached_keys` (committed positive
+membership reused in the existing Session cache). The complete-key invariant is
+`staged_keys + cached_keys + keys.len() == requested_keys`. Older captures omit
+`cached_keys`, which the example reads as zero. A cache miss remains unresolved;
+the capture contains every such key. A fully resolved window starts no native
+scan and leaves the diagnostic request armed.
+
 `record` validates the capture against the configured binding, key specification
 and shard, then checks the publisher binding through an authenticated quorum read
 and reads `Some(capture.base_version)` from the existing manifest catalog. It

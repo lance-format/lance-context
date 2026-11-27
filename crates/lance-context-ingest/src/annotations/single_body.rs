@@ -222,13 +222,10 @@ impl Service {
                 else {
                     return Ok(None);
                 };
-                self.shared.lookup_capture.record(
-                    self,
-                    spec,
-                    base.dataset(),
-                    &prepared.keys,
-                    window,
-                );
+                prepared.cached_keys = base.cached_keys();
+                self.shared
+                    .lookup_capture
+                    .record(self, spec, &base, &prepared.keys, window);
                 let keys = match spec.lookup_prepared(base.dataset().clone(), prepared).await {
                     Ok(keys) => keys,
                     Err(error)

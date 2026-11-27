@@ -80,6 +80,7 @@ fn fixture(uri: String) -> Result<(Config, Capture)> {
         },
         requested_keys: 3,
         staged_keys: 0,
+        cached_keys: 0,
         primary_key_columns: spec.primary_key().to_vec(),
         keys,
     };

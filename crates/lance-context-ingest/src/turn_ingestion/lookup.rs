@@ -54,6 +54,8 @@ impl TurnLookupParallelism {
 pub struct TurnLookupObservation {
     pub requested_keys: usize,
     pub staged_keys: usize,
+    /// Committed positive membership reused from the existing Session cache.
+    pub cached_keys: usize,
     /// Exact distinct requested keys found in the captured base, excluding
     /// staged hits and projected cross-product candidates.
     pub history_hits: usize,
@@ -95,6 +97,7 @@ pub struct TurnLookup {
 /// A bounded input window, before capturing the base and doing any native I/O.
 pub(crate) struct PreparedTurnLookup {
     pub(crate) keys: BTreeMap<String, bool>,
+    pub(crate) cached_keys: usize,
     pub(crate) native_running: Option<Arc<AtomicBool>>,
     workspace: MergeReservation,
     started: Instant,
@@ -216,6 +219,7 @@ impl TurnIngestionSpec {
         };
         Ok(Some(PreparedTurnLookup {
             keys: keys.iter().map(|key| ((*key).to_owned(), false)).collect(),
+            cached_keys: 0,
             native_running: None,
             workspace: reservation,
             started,
@@ -245,15 +249,18 @@ impl TurnIngestionSpec {
         );
         let PreparedTurnLookup {
             keys: mut requested,
+            cached_keys,
             native_running,
             workspace: reservation,
             started,
         } = prepared;
-        let staged_keys = requested.values().filter(|present| **present).count();
-        let mut remaining = requested.len() - staged_keys;
+        let known_keys = requested.values().filter(|present| **present).count();
+        let staged_keys = known_keys - cached_keys;
+        let mut remaining = requested.len() - known_keys;
         let mut observation = TurnLookupObservation {
             requested_keys: requested.len(),
             staged_keys,
+            cached_keys,
             ..Default::default()
         };
         if remaining == 0 {
@@ -382,7 +389,7 @@ impl TurnIngestionSpec {
             }
         }
         drop(stream);
-        observation.history_hits = requested.len() - staged_keys - remaining;
+        observation.history_hits = requested.len() - known_keys - remaining;
         observation.history_misses = remaining;
         // One snapshot for either completion path. Do not wait for cancelled
         // background work: these are observed plan metrics, not all store I/O.

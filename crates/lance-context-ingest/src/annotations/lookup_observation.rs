@@ -73,10 +73,10 @@ impl LookupMetricObservation {
 }
 
 /// Lookup totals count successful windows, including probes whose captured base
-/// was subsequently replaced. Cached reuse and admission refusals add no lookup
-/// totals; prefetch decisions and fallback attempts have separate counters.
+/// was subsequently replaced. Reusing a completed window or refusing admission
+/// adds no lookup totals; prefetch and fallback attempts have separate counters.
 /// Failed/cancelled lookups remain visible in the existing lookup phase.
-/// A window entirely resolved by staging starts no native scan.
+/// A window resolved by staging or committed membership starts no native scan.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct BodyLookupObservation {
     pub completed_lookups: u64,
@@ -105,6 +105,8 @@ pub struct BodyLookupObservation {
     pub requested_keys: u64,
     /// Keys resolved from the same captured active/frozen view, without history I/O.
     pub staged_keys: u64,
+    /// Committed positive membership reused without native history I/O.
+    pub cached_keys: u64,
     /// Exact distinct keys per successful window, after composite matching.
     /// Re-probes count again; these are not applied or globally unique rows.
     pub history_hits: u64,
@@ -159,6 +161,7 @@ impl BodyLookupObservation {
             .requested_keys
             .saturating_add(value.requested_keys as u64);
         self.staged_keys = self.staged_keys.saturating_add(value.staged_keys as u64);
+        self.cached_keys = self.cached_keys.saturating_add(value.cached_keys as u64);
         self.history_hits = self.history_hits.saturating_add(value.history_hits as u64);
         self.history_misses = self
             .history_misses

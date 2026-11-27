@@ -38,6 +38,8 @@ pub struct Capture {
     pub window: Window,
     pub requested_keys: usize,
     pub staged_keys: usize,
+    #[serde(default)]
+    pub cached_keys: usize,
     pub primary_key_columns: Vec<String>,
     pub keys: Vec<String>,
 }
@@ -119,7 +121,10 @@ impl Config {
         );
         ensure!(
             !capture.keys.is_empty()
-                && capture.staged_keys.checked_add(capture.keys.len())
+                && capture
+                    .staged_keys
+                    .checked_add(capture.cached_keys)
+                    .and_then(|known| known.checked_add(capture.keys.len()))
                     == Some(capture.requested_keys)
                 && capture.keys.windows(2).all(|p| p[0] < p[1])
                 && capture

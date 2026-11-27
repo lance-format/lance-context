@@ -2,7 +2,7 @@
 //! No route, logging, native scan, publication or durable state is added here.
 use super::*;
 use crate::turn_ingestion::TurnIngestionSpec;
-use lance::Dataset;
+use lance_context_core::annotation_staging::ImmutableBase;
 use lance_context_wal::replication::publication::Authority;
 use lance_context_wal::replication::runtime::client::payload_memory::{Pool, Reservation};
 use std::{collections::BTreeMap, mem::size_of};
@@ -56,6 +56,7 @@ pub struct Data {
     pub window: Window,
     pub requested_keys: usize,
     pub staged_keys: usize,
+    pub cached_keys: usize,
     pub primary_key_columns: Box<[Box<str>]>,
     /// Exact canonical JSON string arrays, in primary_key_columns order.
     /// Contains every distinct unresolved key; never truncates or samples.
@@ -86,7 +87,7 @@ impl Handle {
         Self { state, owner }
     }
 
-    /// Capture the next window needing a historical lookup. All-staged windows
+    /// Capture the next window needing a historical lookup. Fully resolved windows
     /// leave the request armed. Only one request may be armed per owner.
     /// Use a separate diagnostic budget; refusal only fails the capture, never
     /// the lookup or apply. The returned payload retains admission until drop.
@@ -141,7 +142,7 @@ impl State {
         &self,
         service: &Service,
         spec: &TurnIngestionSpec,
-        base: &Dataset,
+        base: &ImmutableBase,
         keys: &BTreeMap<String, bool>,
         window: Window,
     ) {
@@ -168,11 +169,13 @@ fn capture(
     request: &Request,
     service: &Service,
     spec: &TurnIngestionSpec,
-    base: &Dataset,
+    base: &ImmutableBase,
     keys: &BTreeMap<String, bool>,
     window: Window,
 ) -> Result<Capture> {
     let unresolved = keys.values().filter(|present| !**present).count();
+    let cached_keys = base.cached_keys();
+    let base = base.dataset();
     let fragments = base.fragments();
     let bytes = size_of::<Capture>()
         .checked_add(
@@ -223,7 +226,8 @@ fn capture(
         base_fragment_ids: fragments.iter().map(|fragment| fragment.id).collect(),
         window,
         requested_keys: keys.len(),
-        staged_keys: keys.len() - unresolved,
+        staged_keys: keys.len() - unresolved - cached_keys,
+        cached_keys,
         primary_key_columns: spec
             .primary_key()
             .iter()

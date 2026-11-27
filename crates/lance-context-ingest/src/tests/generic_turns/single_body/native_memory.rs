@@ -9,6 +9,7 @@ mod coalescing;
 #[derive(Debug, Default)]
 struct Admission {
     refuse: AtomicBool,
+    refuse_index: AtomicBool,
     typed: AtomicBool,
     refused: AtomicUsize,
     held: Arc<AtomicUsize>,
@@ -63,6 +64,11 @@ impl NativeMemoryPool for Admission {
         bytes: usize,
     ) -> lance_core::Result<Box<dyn NativeMemoryReservation>> {
         let typed = self.typed.load(Ordering::SeqCst);
+        if kind == NativeMemoryKind::Index && self.refuse_index.load(Ordering::SeqCst) {
+            return Err(lance_core::Error::backpressure(
+                "optional membership admission refused".to_owned(),
+            ));
+        }
         if self.refuse.load(Ordering::SeqCst) && (!typed || kind == NativeMemoryKind::Decode) {
             self.refused.fetch_add(1, Ordering::SeqCst);
             let owner = match kind {
@@ -93,6 +99,7 @@ async fn native_lookup_refusal_preserves_wal_suffix_and_first_create_on_recovery
     let root = tempfile::tempdir()?;
     let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
     let admission = Arc::new(Admission::default());
+    admission.refuse_index.store(true, Ordering::SeqCst);
     let storage = Storage::resolve(
         root.path().join("full-body.lance").to_str().unwrap().into(),
         Default::default(),
@@ -128,6 +135,9 @@ async fn native_lookup_refusal_preserves_wal_suffix_and_first_create_on_recovery
     let first = request(&service, &lane, 1, encode(0)?).await?;
     let first_result = service.submit(&first, DEADLINE).await?;
     drained(&c, &service, first_result.index).await?;
+    // Optional membership warming cannot prevent application/publication.
+    assert!(service.observation().await.0.immutable_membership.refusals >= 2);
+    admission.refuse_index.store(false, Ordering::SeqCst);
     stop.send(()).unwrap();
     task.await??;
     drop(service);
@@ -187,10 +197,15 @@ async fn native_lookup_refusal_preserves_wal_suffix_and_first_create_on_recovery
         annotation_publication::read(&c, &storage, Some(selected.manifest.version)).await?;
     assert_eq!(durable.count_rows(None).await?, 4);
     assert_eq!(service.retained_body_frames(), (0, 0));
+    assert!(service.observation().await.0.immutable_membership.warms >= 4);
     stop.send(()).unwrap();
     task.await??;
     drop(durable);
     drop(service);
+    // The existing Session cache owns the marker's native backing charge even
+    // after its staging owner retires, and eviction releases that charge.
+    assert!(admission.held.load(Ordering::SeqCst) >= 4 * 512);
+    storage.session.file_metadata_cache().clear().await;
     drop(storage);
     assert_eq!(admission.held.load(Ordering::SeqCst), 0);
     c.shutdown().await
