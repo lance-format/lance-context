@@ -89,8 +89,9 @@ pub async fn compare(
     config.validate_capture(capture)?;
     validate_base(capture, &base)?;
     ensure!(
-        (1..=10).contains(&options.rounds)
-            && (Duration::from_secs(1)..=Duration::from_secs(600)).contains(&options.timeout),
+        options.rounds > 0
+            && !options.timeout.is_zero()
+            && Instant::now().checked_add(options.timeout).is_some(),
         "invalid probe bounds"
     );
     let store = base.object_store(None).await?;
@@ -98,7 +99,7 @@ pub async fn compare(
     let mut expected = None;
     // Include ordinary production lookup as the membership reference. Reorder
     // explicit settings each round, never call this a cold-cache comparison.
-    for (ordinal, setting) in schedule(options.rounds).into_iter().enumerate() {
+    for (ordinal, setting) in schedule(options.rounds).enumerate() {
         let io_before = store.io_stats_snapshot();
         let native_before = native_snapshot();
         let start = Instant::now();
@@ -182,21 +183,19 @@ pub async fn compare(
     }
     emit(
         out,
-        &json!({"complete":true, "membership_equal":true, "queries":1 + 5 * options.rounds}),
+        &json!({"complete":true, "membership_equal":true, "queries":1u128 + 5 * options.rounds as u128}),
     )?;
     Ok(())
 }
 
-fn schedule(rounds: usize) -> Vec<Option<(usize, usize)>> {
+fn schedule(rounds: usize) -> impl Iterator<Item = Option<(usize, usize)>> {
     let settings = [(8, 8), (16, 8), (32, 8), (8, 16), (8, 32)];
-    let mut result = vec![None];
-    for round in 0..rounds {
-        let mut order = settings.to_vec();
+    std::iter::once(None).chain((0..rounds).flat_map(move |round| {
+        let mut order = settings;
         order.rotate_left(round % settings.len());
         if round % 2 == 1 {
             order.reverse();
         }
-        result.extend(order.into_iter().map(Some));
-    }
-    result
+        order.into_iter().map(Some)
+    }))
 }

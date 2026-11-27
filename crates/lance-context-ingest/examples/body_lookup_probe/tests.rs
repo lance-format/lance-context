@@ -299,20 +299,25 @@ async fn pinned_fixture_compares_all_settings_and_reports_refusal_without_keys()
 }
 
 #[test]
-fn private_outputs_are_exclusive_and_inputs_bounded() -> Result<()> {
+fn private_inputs_and_atomic_record_outputs() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("record.json");
-    let mut file = output(&path)?;
-    file.write_all(b"[1,2,3]")?;
-    assert!(output(&path).is_err());
-    assert_eq!(input::read::<Vec<u64>>(&path, 8)?, [1, 2, 3]);
-    assert!(input::read::<Vec<u64>>(&path, 4).is_err());
+    let (_, capture) = fixture("unused".into())?;
+    let record = selected(&capture, 1024, Uuid::new_v4());
+    assert!(!path.exists());
+    record_output(&path, &record)?;
+    assert!(record_output(&path, &record).is_err());
+    assert_eq!(input::read::<Record>(&path)?.manifest, record.manifest);
+    assert_eq!(std::fs::read_dir(directory.path())?.count(), 1);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
-        assert!(input::read::<Vec<u64>>(&path, 8).is_err());
+        assert!(input::read::<Record>(&path).is_err());
     }
     Ok(())
 }

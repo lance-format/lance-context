@@ -1,3 +1,4 @@
+use super::Failure;
 use anyhow::{ensure, Context, Result};
 use lance_context_core::annotation_staging::Limits;
 use lance_context_ingest::{
@@ -6,7 +7,7 @@ use lance_context_ingest::{
 };
 use lance_context_wal::replication::{publication::Authority, query::Cut};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{collections::HashMap, fs::File, io::Read, path::Path};
+use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 use uuid::Uuid;
 
 /// Deployment-authorized input, not a discovery mechanism or owner config.
@@ -66,26 +67,21 @@ pub struct Record {
     pub manifest: lance_context_wal::replication::publication::ManifestRecord,
 }
 
-pub fn read<T: DeserializeOwned>(path: &Path, max: u64) -> Result<T> {
-    let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    ensure!(
-        metadata.is_file() && metadata.len() <= max,
-        "invalid input size/type"
-    );
+pub fn read<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let file = File::open(path).context(Failure("input", "open"))?;
+    let metadata = file.metadata().context(Failure("input", "metadata"))?;
+    ensure!(metadata.is_file(), Failure("input", "not_regular_file"));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         ensure!(
             metadata.permissions().mode() & 0o077 == 0,
-            "input must be private (0600)"
+            Failure("input", "not_private")
         );
     }
-    let mut bytes = Vec::new();
-    file.take(max + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.len() as u64 <= max, "input grew past limit");
-    // Do not leak keys or credential values in serde error messages.
-    serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid input JSON"))
+    // Stream from the protected artifact without a second full input buffer.
+    // Deserialized keys/metadata remain outside the experimental native pool.
+    serde_json::from_reader(BufReader::new(file)).context(Failure("input", "json_decode"))
 }
 
 impl Config {

@@ -116,16 +116,22 @@ Use the actual host values, including staging limits. The full-body wire hash
 differs from both the ordinary dataset schema and the mixed body/narrow-table
 wire hash. Do not guess it. `CAPTURE.json` is the complete existing serialized
 lookup capture, without an extra envelope. Inputs must be regular files, private
-on Unix (0600 or stricter); JSON sizes are capped at 2 MiB config, 32 MiB capture,
-64 KiB saved record. No keys or credential values appear in stdout/report.
+on Unix (0600 or stricter). JSON is decoded from a buffered file reader without
+a duplicate full-input byte vector or an example-imposed file-size ceiling.
+Decoded keys/metadata remain outside native pool accounting. The existing
+production key contract still applies. No keys or credential values appear in
+stdout/report.
 
 `record` validates the capture against the configured binding, key specification
 and shard, then checks the publisher binding through an authenticated quorum read
 and reads `Some(capture.base_version)` from the existing manifest catalog. It
 never selects latest, acquires an owner, starts an applier or changes retention.
-It fails if selection is unavailable, unknown or retired. The new private record
-file is flushed and synced; an existing output is never overwritten. An empty or
-partial file after failure is not a valid record. Preserve the authenticated
+It fails if selection is unavailable, unknown or retired. After successful
+selection, a private temporary file is serialized and synced, then atomically
+persisted without overwriting an existing destination. Failed selection leaves
+no empty destination. Errors emit static stage/category labels, including
+manifest-retired/absent/unknown versus RPC failure; raw backend error strings
+are never printed. Preserve the authenticated
 provenance of this artifact: deserializing a supplied record is not authentication.
 
 The record can be used after catalog-directory retirement while the referenced
@@ -141,7 +147,12 @@ native/key memory limits (MiB), rounds and per-query deadline (seconds):
 body_lookup_probe run CONFIG.json CAPTURE.json RECORD.json NEW_REPORT.jsonl 256 64 3 120
 ```
 
-These numeric limits are examples, not recommendations for production. The
+These numeric limits are caller inputs, not recommendations for production.
+Budgets, rounds and deadline must be nonzero and representable, with checked
+MiB-to-byte conversion; the example adds no numeric ceiling. Round order is
+generated lazily. Tokio uses its normal available-parallelism default or the
+caller's `TOKIO_WORKER_THREADS`; the report records the actual worker count.
+The
 standalone CLI uses its own bounded pool and one session; it does not share the
 live host pool. It is not a production ACK or backlog-drain benchmark. Native
 allocation capacity, JSON/plan/cache overhead and RSS are different quantities.
@@ -175,5 +186,5 @@ online ingestion throughput are not measured by this example.
 Example tests use a real four-fragment local Lance snapshot: all 16 lookups in
 three rounds agree with independently expected two hits and one miss. They also
 exercise wrong fragment order, foreign wire/binding/version, incomplete capture,
-native refusal, reservation release, private input limits and exclusive outputs.
+native refusal, reservation release, private inputs and atomic exclusive outputs.
 This verifies the runner, not performance on production data.
