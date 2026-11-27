@@ -164,7 +164,7 @@ impl Service {
         self.ingress.group(self.bucket())
     }
 
-    fn validate_turn(&self, turn: &str) -> Result<()> {
+    pub(crate) fn validate_turn(&self, turn: &str) -> Result<()> {
         let routing = self
             .ingress
             .turn_spec

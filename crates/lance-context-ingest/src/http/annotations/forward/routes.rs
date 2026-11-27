@@ -139,7 +139,7 @@ impl Routes {
                         .map_err(|_| Failure::bad("invalid_open"))?
                         .bucket
                 }
-                Operation::Read => {
+                Operation::Read | Operation::ReadBody => {
                     let point: PointRequest = serde_json::from_slice(&bytes)
                         .map_err(|_| Failure::bad("invalid_point_read"))?;
                     if point.turn.is_empty() {

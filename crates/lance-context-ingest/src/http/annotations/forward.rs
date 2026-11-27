@@ -97,6 +97,7 @@ impl Forwarder {
             .route("/api/v1/annotations/{table}/producer", post(open))
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
+            .route("/api/v1/annotations/{table}/read-body", post(read_body))
             .route(
                 "/api/v1/annotations/{table}/selected-body",
                 post(selected_body),
@@ -121,6 +122,12 @@ impl Forwarder {
             Ok(guard) => guard,
             Err(error) => return early(error, version),
         };
+        if matches!(operation, Operation::ReadBody) {
+            return match self.process(&table, request, operation).await {
+                Ok((response, reservation)) => hold_response(response, guard, Some(reservation)),
+                Err(error) => early(error, version),
+            };
+        }
         match tokio::spawn(async move {
             let (response, reservation) = self.process(&table, request, operation).await?;
             Ok::<_, Failure>(hold_response(response, guard, Some(reservation)))
@@ -144,22 +151,42 @@ impl Forwarder {
             code: "unknown_table",
             outcome: "not_submitted",
         })?;
-        let maximum_reply =
+        let control_limit =
             reply_limit(ingress).map_err(|_| Failure::bad("invalid_annotation_scope"))?;
+        let maximum_reply = if matches!(operation, Operation::ReadBody) {
+            body_read::reply_limit(ingress).map_err(|_| Failure::bad("invalid_body_scope"))?
+        } else {
+            control_limit
+        };
         let (maximum, content_type) = match operation {
             Operation::Update => (ingress.scope.contract.max_record_bytes as usize, ARROW_FILE),
-            Operation::Read | Operation::FilterStatus => (maximum_reply, "application/json"),
+            Operation::Read | Operation::ReadBody | Operation::FilterStatus => {
+                (control_limit, "application/json")
+            }
             _ => (32 << 10, "application/json"),
         };
         let length = body::length(&request, maximum, content_type)?;
         let options = &self.gate.0.options;
-        let reservation = if matches!(operation, Operation::FilterStatus) {
+        if matches!(operation, Operation::ReadBody)
+            && length
+                .checked_add(maximum_reply)
+                .is_none_or(|bytes| bytes > ingress.budget.limit())
+        {
+            return Err(Failure::unavailable("body_read_capacity", "not_submitted"));
+        }
+        let reservation = if matches!(operation, Operation::FilterStatus | Operation::ReadBody) {
             // Optional filtering must not queue a reservation in front of
             // ingestion at either the forwarding ingress or the owner.
             ingress
                 .budget
                 .try_reserve(length + maximum_reply)
-                .ok_or_else(|| self.gate.status_memory_refusal())?
+                .ok_or_else(|| {
+                    if matches!(operation, Operation::FilterStatus) {
+                        self.gate.status_memory_refusal()
+                    } else {
+                        Failure::unavailable("body_read_capacity", "not_submitted")
+                    }
+                })?
         } else {
             tokio::time::timeout(
                 options.admission_timeout,
@@ -238,12 +265,18 @@ impl Forwarder {
         let status = upstream.status();
         let retry_after = upstream.headers().get(header::RETRY_AFTER).cloned();
         let is_empty = status == StatusCode::NO_CONTENT;
+        let arrow_body = matches!(operation, Operation::ReadBody) && status == StatusCode::OK;
+        let response_type = if arrow_body {
+            ARROW_FILE
+        } else {
+            "application/json"
+        };
         if !is_empty
             && upstream
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                != Some("application/json")
+                != Some(response_type)
         {
             return Err(Failure::unavailable("invalid_owner_response", "unknown"));
         }
@@ -252,6 +285,41 @@ impl Forwarder {
             .is_some_and(|n| n > maximum_reply as u64)
         {
             return Err(Failure::unavailable("oversized_owner_response", "unknown"));
+        }
+        if arrow_body {
+            let length = upstream
+                .content_length()
+                .filter(|length| *length > 0)
+                .ok_or_else(|| Failure::unavailable("invalid_owner_response", "unknown"))?;
+            // Share the owner's Arrow chunks, with no decode or whole-response
+            // coalescing. A truncated/oversized stream remains an error.
+            let frames = stream::try_unfold(
+                (upstream, length),
+                move |(mut upstream, remaining)| async move {
+                    let chunk = timeout_at(deadline.min(Instant::now() + idle), upstream.chunk())
+                        .await
+                        .map_err(|_| std::io::Error::other("body response deadline"))?
+                        .map_err(std::io::Error::other)?;
+                    match chunk {
+                        Some(chunk) if chunk.len() as u64 <= remaining => {
+                            let remaining = remaining - chunk.len() as u64;
+                            Ok(Some((chunk, (upstream, remaining))))
+                        }
+                        Some(_) => Err(std::io::Error::other("body response too long")),
+                        None if remaining == 0 => Ok(None),
+                        None => Err(std::io::Error::other("body response truncated")),
+                    }
+                },
+            );
+            let mut response = (
+                [(header::CONTENT_TYPE, ARROW_FILE)],
+                axum::body::Body::from_stream(frames),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, length.into());
+            return Ok((response, reservation));
         }
         let mut bytes = BytesMut::new();
         while let Some(chunk) = upstream
@@ -293,6 +361,9 @@ async fn update(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -
 }
 async fn read(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Read).await
+}
+async fn read_body(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
+    g.dispatch(t, r, Operation::ReadBody).await
 }
 async fn close(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Close).await
