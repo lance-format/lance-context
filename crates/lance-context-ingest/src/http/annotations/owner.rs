@@ -40,6 +40,7 @@ impl Owner {
             )
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
+            .route("/api/v1/annotations/{table}/full-body", post(full_body))
             .route(
                 "/api/v1/annotations/{table}/selected-body",
                 post(selected_body),
@@ -225,7 +226,10 @@ impl Owner {
             )
                 .into_response()
         } else {
-            let maximum = if matches!(operation, Operation::Read | Operation::FilterStatus) {
+            let maximum = if matches!(
+                operation,
+                Operation::Read | Operation::FullBody | Operation::FilterStatus
+            ) {
                 self.reply_limit
             } else {
                 32 << 10
@@ -307,6 +311,19 @@ impl Owner {
                             Failure::unavailable("annotation_read_unavailable", "not_submitted")
                         })?;
                     Json(value).into_response()
+                }
+                Operation::FullBody => {
+                    let point: PointRequest = serde_json::from_slice(&bytes)
+                        .map_err(|_| Failure::bad("invalid_point_read"))?;
+                    let (response, held) = super::full_body::read(
+                        &self.service,
+                        point,
+                        self.recovery_cut,
+                        options.body_total_timeout,
+                    )
+                    .await?;
+                    reservation = held;
+                    response
                 }
                 Operation::FilterStatus => {
                     let query: StatusRequest = serde_json::from_slice(&bytes)
@@ -431,6 +448,13 @@ async fn update(
 }
 async fn read(State(owner): State<Owner>, Path(table): Path<String>, request: Request) -> Response {
     owner.dispatch(table, request, Operation::Read).await
+}
+async fn full_body(
+    State(owner): State<Owner>,
+    Path(table): Path<String>,
+    request: Request,
+) -> Response {
+    owner.dispatch(table, request, Operation::FullBody).await
 }
 async fn close(
     State(owner): State<Owner>,

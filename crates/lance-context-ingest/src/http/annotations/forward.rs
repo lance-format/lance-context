@@ -101,6 +101,7 @@ impl Forwarder {
             )
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
+            .route("/api/v1/annotations/{table}/full-body", post(full_body))
             .route(
                 "/api/v1/annotations/{table}/selected-body",
                 post(selected_body),
@@ -148,22 +149,36 @@ impl Forwarder {
             code: "unknown_table",
             outcome: "not_submitted",
         })?;
-        let maximum_reply =
-            reply_limit(ingress).map_err(|_| Failure::bad("invalid_annotation_scope"))?;
+        let maximum_reply = if matches!(operation, Operation::FullBody) {
+            super::full_body::reply_limit(ingress)
+        } else {
+            reply_limit(ingress)
+        }
+        .map_err(|_| Failure::bad("invalid_annotation_scope"))?;
         let (maximum, content_type) = match operation {
             Operation::Update => (ingress.scope.contract.max_record_bytes as usize, ARROW_FILE),
-            Operation::Read | Operation::FilterStatus => (maximum_reply, "application/json"),
+            Operation::Read | Operation::FullBody | Operation::FilterStatus => (
+                reply_limit(ingress).map_err(|_| Failure::bad("invalid_annotation_scope"))?,
+                "application/json",
+            ),
             _ => (32 << 10, "application/json"),
         };
         let length = body::length(&request, maximum, content_type)?;
         let options = &self.gate.0.options;
-        let reservation = if matches!(operation, Operation::FilterStatus) {
-            // Optional filtering must not queue a reservation in front of
+        let mut reservation = if matches!(operation, Operation::FilterStatus | Operation::FullBody)
+        {
+            // These reads must not queue a response reservation in front of
             // ingestion at either the forwarding ingress or the owner.
             ingress
                 .budget
                 .try_reserve(length + maximum_reply)
-                .ok_or_else(|| self.gate.status_memory_refusal())?
+                .ok_or_else(|| {
+                    if matches!(operation, Operation::FilterStatus) {
+                        self.gate.status_memory_refusal()
+                    } else {
+                        Failure::unavailable("body_response_capacity", "not_submitted")
+                    }
+                })?
         } else {
             tokio::time::timeout(
                 options.admission_timeout,
@@ -242,12 +257,17 @@ impl Forwarder {
         let status = upstream.status();
         let retry_after = upstream.headers().get(header::RETRY_AFTER).cloned();
         let is_empty = status == StatusCode::NO_CONTENT;
+        let is_body = matches!(operation, Operation::FullBody) && status == StatusCode::OK;
         if !is_empty
             && upstream
                 .headers()
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                != Some("application/json")
+                != Some(if is_body {
+                    ARROW_FILE
+                } else {
+                    "application/json"
+                })
         {
             return Err(Failure::unavailable("invalid_owner_response", "unknown"));
         }
@@ -256,6 +276,35 @@ impl Forwarder {
             .is_some_and(|n| n > maximum_reply as u64)
         {
             return Err(Failure::unavailable("oversized_owner_response", "unknown"));
+        }
+        if is_body {
+            // Preserve the owner's Arrow bytes across ingress: no decoding,
+            // re-encoding or whole-response copy. The outer response guard
+            // retains admission through the last transmitted frame.
+            if let Some(size) = upstream.content_length() {
+                reservation.shrink_to(length + size as usize);
+            }
+            let frames = stream::try_unfold(
+                (upstream, maximum_reply),
+                |(mut response, remaining)| async move {
+                    let Some(bytes) = response.chunk().await.map_err(std::io::Error::other)? else {
+                        return Ok::<_, std::io::Error>(None);
+                    };
+                    if bytes.len() > remaining {
+                        return Err(std::io::Error::other("oversized owner body response"));
+                    }
+                    let next = remaining - bytes.len();
+                    Ok(Some((bytes, (response, next))))
+                },
+            );
+            return Ok((
+                (
+                    [(header::CONTENT_TYPE, ARROW_FILE)],
+                    axum::body::Body::from_stream(frames),
+                )
+                    .into_response(),
+                reservation,
+            ));
         }
         let mut bytes = BytesMut::new();
         while let Some(chunk) = upstream
@@ -300,6 +349,9 @@ async fn update(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -
 }
 async fn read(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Read).await
+}
+async fn full_body(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
+    g.dispatch(t, r, Operation::FullBody).await
 }
 async fn close(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Close).await

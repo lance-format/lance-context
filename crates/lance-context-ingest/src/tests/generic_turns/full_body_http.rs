@@ -36,6 +36,15 @@ async fn owner(
     storage: &Storage,
     spec: &TurnIngestionSpec,
 ) -> Result<(Service, Runtime)> {
+    owner_with_wait(c, storage, spec, Duration::from_millis(20)).await
+}
+
+async fn owner_with_wait(
+    c: &network::Cluster,
+    storage: &Storage,
+    spec: &TurnIngestionSpec,
+    max_batch_wait: Duration,
+) -> Result<(Service, Runtime)> {
     let view = annotation_publication::state(c).await?;
     Runtime::connect_body_shard(
         c.client.clone(),
@@ -51,7 +60,7 @@ async fn owner(
                 max_source_bytes: 1 << 20,
                 min_source_bytes: 1 << 20,
                 max_records: 2,
-                max_batch_wait: Duration::from_millis(20),
+                max_batch_wait,
                 ..Default::default()
             },
         },
@@ -85,6 +94,141 @@ fn wire(spec: &TurnIngestionSpec, body: &RecordBatch) -> Result<Bytes> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_body_http_client_dedups_across_producers_reopens_and_selects() -> Result<()> {
     tokio::time::timeout(Duration::from_secs(120), exercise()).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_body_point_read_crosses_ingresses_before_and_after_publication() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(90), exercise_point_read()).await?
+}
+
+async fn exercise_point_read() -> Result<()> {
+    let input = bodies()?;
+    let spec = spec(&input)?;
+    let key = spec.prepare(input[0].clone(), 4096)?.keys()[0].clone();
+    let root = tempfile::tempdir()?;
+    let c = network::Cluster::open_signed(root.path(), annotation_publication::one_shard()).await?;
+    let body = fixture::storage(root.path(), "full-body-point.lance").await?;
+    crate::bootstrap::provision_body_shard(
+        c.client.clone(),
+        annotation_publication::one_shard(),
+        binding(),
+        body.clone(),
+        Identity {
+            owner: Uuid::new_v4(),
+            acquisition: Uuid::new_v4(),
+            manifest: Uuid::new_v4(),
+        },
+        &fixture::limits(),
+        Shard { bucket: 0 },
+        &spec,
+    )
+    .await?;
+    // One source record remains staged; the second reaches the existing
+    // two-record flush threshold. No storage timing is used as evidence.
+    let (service, runtime) = owner_with_wait(&c, &body, &spec, Duration::from_secs(60)).await?;
+    let server = Server::start(Owner::new(&runtime, keys()?, Default::default())?.router()).await?;
+    let (stop, task) = run_owner(runtime);
+    let forward = || {
+        Forwarder::new(
+            vec![(service.ingress().clone(), server.base.to_string())],
+            keys()?,
+            Default::default(),
+            "test-only-token-012345678901234567890".into(),
+        )
+    };
+    let a = Server::start(forward()?.router()).await?;
+    let b = Server::start(forward()?.router()).await?;
+    let writer = open_client(
+        &executor(root.path(), "writer")?,
+        a.base.clone(),
+        &spec,
+        open(1, 0, 301),
+        true,
+    )
+    .await?;
+    let first = writer.append(0, wire(&spec, &input[0])?).await?;
+    assert_eq!(first.completion.result, MutationResult::Applied);
+    let client = transport()?;
+    let url = b.base.join(&format!(
+        "api/v1/annotations/{}/full-body",
+        binding().qualified_table
+    ))?;
+    let request = crate::http::annotations::PointRequest { turn: key.clone() };
+    let budget = &service.ingress().budget;
+    let held = budget.reserve(budget.limit()).await;
+    let refused = client.post(url.clone()).json(&request).send().await?;
+    assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await?["error"],
+        "body_response_capacity"
+    );
+    let direct = server.base.join(&format!(
+        "api/v1/annotations/{}/full-body",
+        binding().qualified_table,
+    ))?;
+    let refused = client
+        .post(direct.clone())
+        .timeout(Duration::from_secs(2))
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        refused.json::<serde_json::Value>().await?["error"],
+        "body_response_capacity"
+    );
+    assert_eq!(service.observation().await.0.readers, 0);
+    assert!(!task.is_finished());
+    drop(held);
+    let response = client.post(url.clone()).json(&request).send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        crate::http::ARROW_FILE
+    );
+    let decoded = ipc::decode(response.bytes().await?, spec.body_schema().clone())?;
+    assert_eq!(decoded, vec![input[0].slice(0, 1)]);
+    // Selection AFTER the successful read rules out a concurrent publication
+    // turning an old pre-read cut into a false staged-read success.
+    assert!(writer.selected_full_body().await?.through < first.completion.index);
+    assert_eq!(service.observation().await.0.materialized, 0);
+
+    let second = writer.append(0, wire(&spec, &input[2])?).await?;
+    drained(&c, &service, second.completion.index).await?;
+    assert_eq!(service.retained_body_frames(), (0, 0));
+    let held = budget.reserve(budget.limit()).await;
+    let refused = client
+        .post(direct)
+        .timeout(Duration::from_secs(2))
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    drop(held);
+    let response = client.post(url.clone()).json(&request).send().await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        ipc::decode(response.bytes().await?, spec.body_schema().clone())?,
+        vec![input[0].slice(0, 1)]
+    );
+    let missing = spec.business_key(&["missing-session", "missing-id"], 4096)?;
+    let response = client
+        .post(url)
+        .json(&crate::http::annotations::PointRequest { turn: missing })
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.json::<serde_json::Value>().await?["error"],
+        "turn_not_found"
+    );
+    writer.shutdown().await?;
+    a.shutdown().await?;
+    b.shutdown().await?;
+    server.shutdown().await?;
+    stop.send(()).unwrap();
+    task.await??;
+    c.shutdown().await
 }
 
 async fn exercise() -> Result<()> {

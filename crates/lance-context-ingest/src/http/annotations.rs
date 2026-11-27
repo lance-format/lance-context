@@ -7,6 +7,7 @@ use lance_context_wal::replication::publication as p;
 
 #[cfg(feature = "service")]
 mod forward;
+mod full_body;
 mod owner;
 #[cfg(feature = "service")]
 pub use forward::Forwarder;
@@ -68,6 +69,7 @@ enum Operation {
     Replace,
     Update,
     Read,
+    FullBody,
     FilterStatus,
     SelectedBody,
     Close,
@@ -80,13 +82,17 @@ impl Operation {
             Self::Replace => "replace-producer",
             Self::Update => "update",
             Self::Read => "read",
+            Self::FullBody => "full-body",
             Self::FilterStatus => "filter-status",
             Self::SelectedBody => "selected-body",
             Self::Close => "close",
         }
     }
     fn is_write(self) -> bool {
-        !matches!(self, Self::Read | Self::FilterStatus | Self::SelectedBody)
+        !matches!(
+            self,
+            Self::Read | Self::FullBody | Self::FilterStatus | Self::SelectedBody
+        )
     }
 }
 
