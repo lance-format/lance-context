@@ -46,6 +46,31 @@ fn options() -> Options {
         preparers: None,
     }
 }
+
+// Fixture creation must not assume a stable leader across all of its writes.
+// Unknown is not rejection: keep the exact prepared bytes and producer sequence
+// until confirmed. The worker assertions still require every seeded record.
+async fn append_confirmed(ingress: &Ingress, prepared: &PreparedAppend) -> Result<AcceptedAppend> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ingress.append(prepared).await {
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<AppendFailure>(),
+                        Some(AppendFailure::Unknown)
+                    ) =>
+                {
+                    eprintln!("fixture append unresolved; retrying exact request: {error:#}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
+    })
+    .await
+    .context("fixture append did not resolve within its deadline")?
+}
+
 async fn append(
     ingress: &Ingress,
     producer: &Producer,
@@ -62,7 +87,7 @@ async fn append(
             sequence,
         )
         .await?;
-    Ok((body, ingress.append(&prepared).await?))
+    Ok((body, append_confirmed(ingress, &prepared).await?))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -180,7 +205,7 @@ async fn worker_releases_claims_without_losing_progress_past_other_tables() -> R
                 sequence,
             )
             .await?;
-        other.append(&prepared).await?;
+        append_confirmed(&other, &prepared).await?;
     }
     let producer = target.open_producer(open(1)).await?;
     let (body, receipt) = append(&target, &producer, 1, "target-row").await?;
