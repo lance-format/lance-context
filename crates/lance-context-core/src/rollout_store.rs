@@ -9941,15 +9941,26 @@ mod tests {
                 ],
             ),
         ];
+        let write_phase_allowed: &[(&str, &[&str])] = &[(
+            "phase",
+            &[
+                "writer_open",
+                "admission",
+                "state_lock",
+                "prepare",
+                "insert",
+                "visibility",
+            ],
+        )];
 
         for (key, _, _, _) in snapshotter.snapshot().into_vec() {
             if key.kind() != MetricKind::Histogram {
                 continue;
             }
-            let allowed = if key.key().name() == "lance_object_store_request_duration_seconds" {
-                lance_io_allowed
-            } else {
-                allowed
+            let allowed = match key.key().name() {
+                "lance_object_store_request_duration_seconds" => lance_io_allowed,
+                "rollout_write_phase_duration_seconds" => write_phase_allowed,
+                _ => allowed,
             };
             for label in key.key().labels() {
                 let (k, v) = (label.key(), label.value());

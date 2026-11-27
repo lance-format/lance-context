@@ -23,6 +23,27 @@ use lance_core::Error;
 /// Every method defaults to a no-op, so adding an event is not a breaking
 /// change for existing implementors.
 pub trait WalObserver: Send + Sync + Debug {
+    /// Begin one put phase. The returned token is private to this observer and
+    /// pairs concurrent starts with their finish; never use it as a metric label.
+    fn on_write_phase_start(&self, _phase: WritePhase) -> u64 {
+        0
+    }
+
+    /// Finish one put phase, including errors and locally abandoned futures.
+    /// Abandonment does not establish whether the write persisted remotely.
+    fn on_write_phase_finish(
+        &self,
+        _token: u64,
+        _phase: WritePhase,
+        _duration: Duration,
+        _outcome: FlushPhaseOutcome,
+    ) {
+    }
+
+    /// The cursors this put is waiting for. Both can advance concurrently;
+    /// these are in-memory observations, not additional storage requests.
+    fn on_write_visibility_progress(&self, _token: u64, _progress: WriteVisibilityProgress) {}
+
     /// One actual flush phase started. Skipped work on a retry emits no event.
     fn on_memtable_flush_phase_start(&self, _phase: MemtableFlushPhase) {}
 
@@ -65,6 +86,96 @@ pub trait WalObserver: Send + Sync + Debug {
     /// oldest failure. Bytes are resident payload/index bytes, not WAL bytes.
     /// A generation remains counted while its retry is in flight.
     fn on_memtable_flush_retry_state(&self, _generations: usize, _bytes: usize) {}
+}
+
+/// Work on the MemTable put path. Background WAL and SSTable work have their
+/// own observations; visibility waits can include both WAL and index progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePhase {
+    WriterOpen,
+    Admission,
+    StateLock,
+    Prepare,
+    Insert,
+    Visibility,
+}
+
+impl WritePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WriterOpen => "writer_open",
+            Self::Admission => "admission",
+            Self::StateLock => "state_lock",
+            Self::Prepare => "prepare",
+            Self::Insert => "insert",
+            Self::Visibility => "visibility",
+        }
+    }
+}
+
+/// Batch counts use two coordinate spaces: durability is writer-global,
+/// indexing is local to this put's memtable. Compare each only with its target.
+#[derive(Clone, Copy, Debug)]
+pub struct WriteVisibilityProgress {
+    pub durable: usize,
+    pub target_durable: usize,
+    pub indexed: usize,
+    pub target_indexed: usize,
+    pub requires_durable: bool,
+}
+
+pub(crate) struct WritePhaseGuard<'a> {
+    observer: Option<&'a dyn WalObserver>,
+    token: u64,
+    phase: WritePhase,
+    start: Option<Instant>,
+    outcome: FlushPhaseOutcome,
+}
+
+impl<'a> WritePhaseGuard<'a> {
+    pub(crate) fn new(observer: Option<&'a dyn WalObserver>, phase: WritePhase) -> Self {
+        Self {
+            observer,
+            token: observer.map_or(0, |observer| observer.on_write_phase_start(phase)),
+            phase,
+            start: observer.map(|_| Instant::now()),
+            outcome: FlushPhaseOutcome::Abandoned,
+        }
+    }
+
+    pub(crate) fn finish<T, E>(&mut self, result: &Result<T, E>) {
+        self.outcome = if result.is_ok() {
+            FlushPhaseOutcome::Ok
+        } else {
+            FlushPhaseOutcome::Error
+        };
+    }
+
+    pub(crate) fn progress(&self, progress: WriteVisibilityProgress) {
+        if let Some(observer) = self.observer {
+            observer.on_write_visibility_progress(self.token, progress);
+        }
+    }
+}
+
+impl Drop for WritePhaseGuard<'_> {
+    fn drop(&mut self) {
+        if let (Some(observer), Some(start)) = (self.observer, self.start) {
+            observer.on_write_phase_finish(self.token, self.phase, start.elapsed(), self.outcome);
+        }
+    }
+}
+
+/// Observe one phase without changing its result, polling or cancellation behavior.
+pub async fn observe_write_phase<T, E>(
+    observer: Option<&dyn WalObserver>,
+    phase: WritePhase,
+    work: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let mut observation = WritePhaseGuard::new(observer, phase);
+    let result = work.await;
+    observation.finish(&result);
+    result
 }
 
 /// Non-overlapping work within a memtable flush attempt. Queueing before the
@@ -147,6 +258,68 @@ pub(crate) async fn observe_flush_phase<T, E>(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[derive(Debug, Default)]
+    struct WriteObserver {
+        next: std::sync::atomic::AtomicU64,
+        active: Mutex<std::collections::BTreeSet<u64>>,
+        finished: Mutex<Vec<FlushPhaseOutcome>>,
+    }
+
+    impl WalObserver for WriteObserver {
+        fn on_write_phase_start(&self, _: WritePhase) -> u64 {
+            let token = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert!(self.active.lock().unwrap().insert(token));
+            token
+        }
+
+        fn on_write_phase_finish(
+            &self,
+            token: u64,
+            _: WritePhase,
+            _: Duration,
+            outcome: FlushPhaseOutcome,
+        ) {
+            assert!(self.active.lock().unwrap().remove(&token));
+            self.finished.lock().unwrap().push(outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_write_phases_settle_independently_on_cancellation_and_error() {
+        let observer = WriteObserver::default();
+        let mut pending = Box::pin(observe_write_phase(
+            Some(&observer),
+            WritePhase::Admission,
+            std::future::pending::<Result<(), ()>>(),
+        ));
+        assert!(futures::poll!(&mut pending).is_pending());
+        let result = observe_write_phase(Some(&observer), WritePhase::Admission, async {
+            Ok::<_, ()>(42)
+        })
+        .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(
+            observer.active.lock().unwrap().len(),
+            1,
+            "another put finishing must not clear the pending put"
+        );
+        let result = observe_write_phase(Some(&observer), WritePhase::Prepare, async {
+            Err::<(), _>("prepare failed")
+        })
+        .await;
+        assert_eq!(result, Err("prepare failed"));
+        drop(pending);
+        assert!(observer.active.lock().unwrap().is_empty());
+        assert!(matches!(
+            observer.finished.lock().unwrap().as_slice(),
+            [
+                FlushPhaseOutcome::Ok,
+                FlushPhaseOutcome::Error,
+                FlushPhaseOutcome::Abandoned
+            ]
+        ));
+    }
 
     #[derive(Debug, Default)]
     struct Observer(Mutex<(usize, Vec<FlushPhaseOutcome>)>);

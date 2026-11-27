@@ -38,6 +38,7 @@ use super::util::{
 
 use super::index::IndexStore;
 use super::memtable::batch_store::{BatchStore, StoredBatch};
+use super::observer::{WalObserver, WritePhase, WritePhaseGuard, WriteVisibilityProgress};
 
 /// Key for storing writer epoch in Arrow IPC file schema metadata.
 pub const WRITER_EPOCH_KEY: &str = "writer_epoch";
@@ -240,6 +241,7 @@ pub struct BatchDurableWatcher {
     /// restart at 0 in every memtable while the durability cursor spans the
     /// writer's whole life, so the caller must globalize this.
     target_durable: usize,
+    observer: Option<Arc<dyn WalObserver>>,
 }
 
 impl BatchDurableWatcher {
@@ -256,7 +258,13 @@ impl BatchDurableWatcher {
             indexes,
             target_indexed,
             target_durable,
+            observer: None,
         }
+    }
+
+    pub(crate) fn with_observer(mut self, observer: Option<Arc<dyn WalObserver>>) -> Self {
+        self.observer = observer;
+        self
     }
 
     /// Whether the write's batches are indexed — the weaker half of
@@ -280,7 +288,8 @@ impl BatchDurableWatcher {
     /// case no cursor will ever reach the target, so surface the typed error
     /// rather than blocking forever.
     pub async fn wait(&mut self) -> Result<()> {
-        self.wait_until(Self::is_visible).await
+        self.wait_until(Self::is_visible, self.cursors.durable_write())
+            .await
     }
 
     /// Wait until the write is indexed, leaving durability outstanding. Pairs
@@ -290,23 +299,46 @@ impl BatchDurableWatcher {
     /// Not an acknowledgement: a caller promising durability must still await
     /// [`Self::wait`].
     pub async fn wait_indexed(&mut self) -> Result<()> {
-        self.wait_until(Self::is_indexed).await
+        self.wait_until(Self::is_indexed, false).await
     }
 
-    async fn wait_until(&mut self, reached: fn(&Self) -> bool) -> Result<()> {
-        loop {
-            // Mark the current version seen *before* testing, so a wake-up landing
-            // between the test and `changed()` below is not lost.
-            self.rx.borrow_and_update();
-            self.cursors.check_poisoned()?;
-            if reached(self) {
-                return Ok(());
+    async fn wait_until(
+        &mut self,
+        reached: fn(&Self) -> bool,
+        requires_durable: bool,
+    ) -> Result<()> {
+        let observer = self.observer.clone();
+        let mut observation = WritePhaseGuard::new(observer.as_deref(), WritePhase::Visibility);
+        let result = async {
+            loop {
+                // Mark the current version seen *before* testing, so a wake-up landing
+                // between the test and `changed()` below is not lost.
+                self.rx.borrow_and_update();
+                if observer.is_some() {
+                    observation.progress(WriteVisibilityProgress {
+                        durable: self.cursors.durable(),
+                        target_durable: self.target_durable,
+                        indexed: self
+                            .indexes
+                            .as_ref()
+                            .map_or(self.target_indexed, |indexes| indexes.indexed_count()),
+                        target_indexed: self.target_indexed,
+                        requires_durable,
+                    });
+                }
+                self.cursors.check_poisoned()?;
+                if reached(self) {
+                    return Ok(());
+                }
+                self.rx
+                    .changed()
+                    .await
+                    .map_err(|_| Error::io("Writer cursor channel closed"))?;
             }
-            self.rx
-                .changed()
-                .await
-                .map_err(|_| Error::io("Writer cursor channel closed"))?;
         }
+        .await;
+        observation.finish(&result);
+        result
     }
 
     /// Non-blocking check.
@@ -1974,6 +2006,51 @@ mod tests {
 
         // Watcher should not be durable yet
         assert!(!watcher.is_durable());
+    }
+
+    #[tokio::test]
+    async fn visibility_observer_tracks_both_cursors_without_acknowledging_early() {
+        #[derive(Debug, Default)]
+        struct Observer(StdMutex<Vec<WriteVisibilityProgress>>);
+        impl WalObserver for Observer {
+            fn on_write_visibility_progress(&self, _: u64, progress: WriteVisibilityProgress) {
+                self.0.lock().unwrap().push(progress);
+            }
+        }
+        let cursors = Arc::new(WriterCursors::new(true));
+        let indexes = Arc::new(IndexStore::new());
+        let observer = Arc::new(Observer::default());
+        let store = Arc::new(BatchStore::with_capacity(2));
+        store
+            .append(create_test_batch(&create_test_schema(), 3))
+            .unwrap();
+        let mut watcher = BatchDurableWatcher::new(cursors.clone(), Some(indexes.clone()), 1, 1)
+            .with_observer(Some(observer.clone()));
+        let mut waiting = Box::pin(watcher.wait());
+        assert!(futures::poll!(&mut waiting).is_pending());
+        let initial = *observer.0.lock().unwrap().last().unwrap();
+        assert_eq!((initial.durable, initial.indexed), (0, 0));
+        cursors.advance_durable(1);
+        assert!(
+            futures::poll!(&mut waiting).is_pending(),
+            "durability alone is not visibility"
+        );
+        let only_wal = *observer.0.lock().unwrap().last().unwrap();
+        assert_eq!((only_wal.durable, only_wal.indexed), (1, 0));
+        apply_index_range(
+            &cursors,
+            TriggerIndexApply {
+                batch_store: store,
+                indexes,
+                end_batch_position: 1,
+            },
+        )
+        .await
+        .unwrap();
+        waiting.await.unwrap();
+        let visible = *observer.0.lock().unwrap().last().unwrap();
+        assert_eq!((visible.durable, visible.indexed), (1, 1));
+        assert!(visible.requires_durable);
     }
 
     // Regression test: track_batch must return a watcher wired to the real

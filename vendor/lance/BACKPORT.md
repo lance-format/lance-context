@@ -26,6 +26,12 @@ Existing correctness patches are retained as well:
   predecessor (#824). The finite-attempt/idle-retry behavior is preserved.
 - memtable/batch_store.rs and wal.rs preserve each store's WAL receipt through
   coalesced flushes (#827). A later writer-global position is not its receipt.
+- mem_wal/{observer,write,wal}.rs expose optional put-phase observations and the
+  last observed durability/index cursors of unfinished visibility waits. Observer
+  callbacks default to no-ops; no admission, scheduling, persistence or ACK
+  semantics change. Concurrent puts have independent observation tokens, and
+  dropped futures are reported as abandoned rather than successful. This is
+  diagnostic instrumentation, not a write-timeout fix.
 
 The 14.0.2 index plugin/schema API is retained: each queued generation carries
 its own index specifications. The close cancellation token remains effective
