@@ -79,6 +79,7 @@ async fn key_scan_reports_native_work_for_early_hit() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "materializer")]
 #[tokio::test]
 async fn key_scan_reports_native_work_for_missing_composite_key() -> Result<()> {
     let directory = tempfile::tempdir()?;
