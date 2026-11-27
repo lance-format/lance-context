@@ -47,13 +47,13 @@ async fn lose_reply(State(lost): State<Arc<LostReply>>, request: Request, next: 
     response
 }
 
-struct Server {
-    base: reqwest::Url,
+pub(super) struct Server {
+    pub(super) base: reqwest::Url,
     stop: oneshot::Sender<()>,
     task: JoinHandle<std::io::Result<()>>,
 }
 impl Server {
-    async fn start(router: Router) -> Result<Self> {
+    pub(super) async fn start(router: Router) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let base = format!("http://{}/", listener.local_addr()?).parse()?;
         let (stop, stopped) = oneshot::channel();
@@ -66,15 +66,39 @@ impl Server {
         });
         Ok(Self { base, stop, task })
     }
-    async fn shutdown(self) -> Result<()> {
+    pub(super) async fn shutdown(self) -> Result<()> {
         let _ = self.stop.send(());
         self.task.await??;
         Ok(())
     }
 }
 
-fn keys() -> Result<ReceiptKeys> {
+pub(super) fn keys() -> Result<ReceiptKeys> {
     ReceiptKeys::new(1, [(1, [0x42; 32])])
+}
+
+pub(super) fn journal(root: &std::path::Path, base: reqwest::Url, open: ProducerOpen) -> Config {
+    Config {
+        directory: root.join("client-journal"),
+        opens: vec![open],
+        base,
+        request_timeout: DEADLINE,
+        journal: Settings {
+            state_bytes: 16 << 20,
+            queue_bytes: 8 << 20,
+            batch_bytes: 2 << 20,
+            file_bytes: 64 << 10,
+            log_bytes: 96 << 20,
+            ..Default::default()
+        },
+    }
+}
+
+pub(super) fn transport() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 async fn client(
@@ -83,34 +107,22 @@ async fn client(
     spec: &TurnIngestionSpec,
 ) -> Result<DurableMutationClient> {
     DurableMutationClient::open(
-        Config {
-            directory: root.join("client-journal"),
-            opens: vec![ProducerOpen {
+        journal(
+            root,
+            base,
+            ProducerOpen {
                 bucket: 0,
                 slot: 1,
                 expected_generation: 0,
                 operation: Uuid::from_u128(101),
-            }],
-            base,
-            request_timeout: DEADLINE,
-            journal: Settings {
-                state_bytes: 16 << 20,
-                queue_bytes: 8 << 20,
-                batch_bytes: 2 << 20,
-                file_bytes: 64 << 10,
-                log_bytes: 96 << 20,
-                ..Default::default()
             },
-        },
+        ),
         &annotation_publication::one_shard(),
         binding(),
         spec,
         &fixture::limits(),
         Shard { bucket: 0 },
-        reqwest::Client::builder()
-            .retry(reqwest::retry::never())
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
+        transport()?,
         MergeMemoryBudget::new(64 << 20),
     )
     .await

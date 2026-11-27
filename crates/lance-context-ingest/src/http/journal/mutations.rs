@@ -12,6 +12,32 @@ pub struct DurableMutationClient {
 }
 
 impl DurableMutationClient {
+    /// Full original-schema first-create writes, using the existing durable
+    /// journal and mutation ACK protocol with the single-body schema binding.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_full_body(
+        config: Config,
+        layout: &Layout,
+        binding: TableBinding,
+        spec: &TurnIngestionSpec,
+        limits: &Limits,
+        shard: Shard,
+        client: reqwest::Client,
+        budget: Arc<MergeMemoryBudget>,
+    ) -> Result<Self> {
+        ensure!(
+            config.opens.iter().all(|open| open.bucket == shard.bucket),
+            "mutation producer lane belongs to another physical shard"
+        );
+        let contract = crate::annotations::single_body::contract(&binding, spec, limits, shard)?;
+        Ok(Self {
+            inner: DurableClient::open_with_contract(
+                config, layout, binding, contract, client, budget,
+            )
+            .await?,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn open(
         config: Config,
@@ -107,6 +133,48 @@ impl DurableMutationClient {
                 && selected.body.table_instance == selected.source.table_instance,
             "foreign selected body scope"
         );
+        Ok(selected)
+    }
+
+    /// Exact selected full-body manifest and covered shard position. This does
+    /// not grant retention, write authority, or an external checkpoint ACK.
+    pub async fn selected_full_body(
+        &self,
+    ) -> Result<crate::annotations::single_body::SelectedBody> {
+        let response = self
+            .inner
+            .client
+            .post(self.inner.endpoint("selected-body"))
+            .timeout(self.inner.timeout)
+            .json(&super::super::annotations::SelectedBodyRequest {
+                bucket: self.inner.opens[0].bucket,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        let selected: crate::annotations::single_body::SelectedBody =
+            bounded_json(response).await?;
+        let scope = &self.inner.scope;
+        ensure!(
+            selected.cluster == scope.cluster
+                && selected.layout == scope.layout
+                && selected.table == scope.table
+                && selected.incarnation == scope.incarnation
+                && selected.schema == scope.contract.schema
+                && selected.source.table_instance == scope.incarnation.to_string()
+                && selected.source.shard == self.inner.opens[0].bucket
+                && selected.source.source_group == self.inner.groups[0]
+                && selected.through < u64::MAX
+                && !selected.uri.is_empty()
+                && selected.uri.len() <= 8192
+                && !selected.manifest.identity.is_nil()
+                && !selected.manifest.transaction.is_nil(),
+            "foreign selected full body scope"
+        );
+        selected
+            .manifest
+            .object
+            .validate(selected.manifest.version)?;
         Ok(selected)
     }
 
