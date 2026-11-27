@@ -23,13 +23,17 @@ enum Acknowledged {
     Append(Accepted),
     #[cfg(feature = "materializer")]
     Mutation(super::annotations::MutationReply),
+    #[cfg(feature = "materializer")]
+    Commit(super::annotations::CommitReply),
 }
 impl Acknowledged {
     fn append(self) -> Result<Accepted> {
         match self {
             Self::Append(value) => Ok(value),
             #[cfg(feature = "materializer")]
-            Self::Mutation(_) => anyhow::bail!("mutation result on immutable append client"),
+            Self::Mutation(_) | Self::Commit(_) => {
+                anyhow::bail!("mutation result on immutable append client")
+            }
         }
     }
 }
@@ -110,6 +114,11 @@ struct Saved {
     #[cfg(feature = "materializer")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_mutation: Option<super::annotations::MutationReply>,
+    /// Latest commit-ack (durable WAL commit, outcome not yet known). Only
+    /// metadata and the receipt; the body is released when this persists.
+    #[cfg(feature = "materializer")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_commit: Option<super::annotations::CommitReply>,
     pending: Option<Pending>,
 }
 impl Default for Saved {
@@ -121,6 +130,8 @@ impl Default for Saved {
             last: None,
             #[cfg(feature = "materializer")]
             last_mutation: None,
+            #[cfg(feature = "materializer")]
+            last_commit: None,
             pending: None,
         }
     }
@@ -426,7 +437,7 @@ impl DurableClient {
     pub async fn append(&self, key: usize, body: Bytes) -> Result<Accepted> {
         let mut lane = self.lane(key)?.lock().await;
         self.stage_locked(key, &mut lane, body).await?;
-        self.resume_locked(key, &mut lane)
+        self.resume_locked(key, &mut lane, false)
             .await?
             .context("staged append disappeared")?
             .append()
@@ -435,12 +446,19 @@ impl DurableClient {
     /// leaves this intent intact; the caller decides when to retry it.
     pub async fn resume(&self, key: usize) -> Result<Option<Accepted>> {
         let mut lane = self.lane(key)?.lock().await;
-        self.resume_locked(key, &mut lane)
+        self.resume_locked(key, &mut lane, false)
             .await?
             .map(Acknowledged::append)
             .transpose()
     }
-    async fn resume_locked(&self, key: usize, lane: &mut Lane) -> Result<Option<Acknowledged>> {
+    /// `commit` selects the commit-ack update mode for mutation tables: the
+    /// lane is released on durable WAL commit instead of applied outcome.
+    async fn resume_locked(
+        &self,
+        key: usize,
+        lane: &mut Lane,
+        #[allow(unused_variables)] commit: bool,
+    ) -> Result<Option<Acknowledged>> {
         ensure!(
             !lane.reopen,
             "local journal outcome unknown; reopen before continuing"
@@ -469,7 +487,7 @@ impl DurableClient {
             next.producer = Some(credential);
             self.persist(key, lane, next).await?;
         }
-        let response = self
+        let mut request = self
             .client
             .post(self.endpoint(
                 if self.scope.contract.policy == WritePolicy::TurnIngestion {
@@ -477,7 +495,19 @@ impl DurableClient {
                 } else {
                     "append"
                 },
-            ))
+            ));
+        #[cfg(feature = "materializer")]
+        if commit {
+            ensure!(
+                self.scope.contract.policy == WritePolicy::TurnIngestion,
+                "commit-ack mode requires a mutation table"
+            );
+            request = request.header(
+                super::annotations::ACK_MODE,
+                super::annotations::ACK_COMMIT,
+            );
+        }
+        let response = request
             .timeout(self.timeout)
             .header(header::CONTENT_TYPE.as_str(), ARROW_FILE)
             .header(PRODUCER, &lane.saved.producer.as_ref().unwrap().producer)
@@ -485,6 +515,28 @@ impl DurableClient {
             .body(pending.body.clone())
             .send()
             .await?;
+        #[cfg(feature = "materializer")]
+        if commit {
+            // Same exact identity/digest checks as an applied ACK. A retry of
+            // an already-committed request returns the same committed index.
+            if response.status() != reqwest::StatusCode::ACCEPTED {
+                return Err(unresolved_append(response).await);
+            }
+            let result: super::annotations::CommitReply = bounded_json(response).await?;
+            mutations::validate_commit(&result, &self.scope, &self.opens[key])?;
+            ensure!(
+                result.meta.sequence == pending.sequence
+                    && result.meta.digest == pending.digest
+                    && result.meta.body_bytes == pending.bytes as u64,
+                "foreign commit ACK"
+            );
+            let mut next = lane.saved.clone();
+            next.next = pending.sequence + 1;
+            next.last_commit = Some(result.clone());
+            next.pending = None;
+            self.persist(key, lane, next).await?;
+            return Ok(Some(Acknowledged::Commit(result)));
+        }
         #[cfg(feature = "materializer")]
         if self.scope.contract.policy == WritePolicy::TurnIngestion {
             let status = response.status();
@@ -564,14 +616,23 @@ fn recovered_sequence(
     #[cfg(feature = "materializer")]
     if scope.contract.policy == WritePolicy::TurnIngestion {
         ensure!(saved.last.is_none(), "immutable ACK in mutation journal");
-        return saved
+        let applied = saved
             .last_mutation
             .as_ref()
             .map(|last| {
                 mutations::validate(last, scope, _open)?;
                 Ok(last.completion.meta.sequence)
             })
-            .transpose();
+            .transpose()?;
+        let committed = saved
+            .last_commit
+            .as_ref()
+            .map(|last| {
+                mutations::validate_commit(last, scope, _open)?;
+                Ok::<_, anyhow::Error>(last.meta.sequence)
+            })
+            .transpose()?;
+        return Ok(applied.max(committed));
     }
     ensure!(
         scope.contract.policy == WritePolicy::ImmutableUniqueIds,
@@ -579,7 +640,7 @@ fn recovered_sequence(
     );
     #[cfg(feature = "materializer")]
     ensure!(
-        saved.last_mutation.is_none(),
+        saved.last_mutation.is_none() && saved.last_commit.is_none(),
         "mutation ACK in immutable journal"
     );
     saved

@@ -1,9 +1,13 @@
 //! Mutation transport over the same journal, lane fencing and exact-intent
-//! state machine as immutable ingestion. An ACK includes Applied/Rejected;
-//! it is not a selected Lance publication or an external source checkpoint.
+//! state machine as immutable ingestion. An applied ACK includes
+//! Applied/Rejected; a commit ACK only proves durable WAL commit and its
+//! outcome is fetched with `wait_applied`. Neither is a selected Lance
+//! publication or an external source checkpoint.
 use super::*;
 use crate::{
-    annotations::Shard, http::annotations::MutationReply, turn_ingestion::TurnIngestionSpec,
+    annotations::Shard,
+    http::annotations::{AppliedRequest, CommitReply, MutationReply},
+    turn_ingestion::TurnIngestionSpec,
 };
 use lance_context_core::annotation_staging::Limits;
 
@@ -71,16 +75,98 @@ impl DurableMutationClient {
         self.inner.stage_locked(key, &mut lane, body).await?;
         Self::mutation(
             self.inner
-                .resume_locked(key, &mut lane)
+                .resume_locked(key, &mut lane, false)
                 .await?
                 .context("staged mutation disappeared")?,
         )
     }
 
+    /// Commit-ack append: persist the intent, send it, and return as soon as
+    /// the owner reports a durable WAL commit. The lane lock is held only for
+    /// stage + commit (one in-flight body per lane, as before) and is free for
+    /// the next body immediately after. The returned reply holds no body.
+    pub async fn commit(&self, key: usize, body: Bytes) -> Result<CommitReply> {
+        let mut lane = self.inner.lane(key)?.lock().await;
+        self.inner.stage_locked(key, &mut lane, body).await?;
+        Self::committed(
+            self.inner
+                .resume_locked(key, &mut lane, true)
+                .await?
+                .context("staged mutation disappeared")?,
+        )
+    }
+
+    /// Resend a recovered/staged intent in commit-ack mode.
+    pub async fn resume_commit(&self, key: usize) -> Result<Option<CommitReply>> {
+        let mut lane = self.inner.lane(key)?.lock().await;
+        self.inner
+            .resume_locked(key, &mut lane, true)
+            .await?
+            .map(Self::committed)
+            .transpose()
+    }
+
+    /// Latest durable commit ACK persisted for this lane, if any.
+    pub async fn last_committed(&self, key: usize) -> Result<Option<CommitReply>> {
+        let lane = self.inner.lane(key)?.lock().await;
+        ensure!(
+            !lane.reopen,
+            "local journal outcome unknown; reopen before continuing"
+        );
+        Ok(lane.saved.last_commit.clone())
+    }
+
+    /// Wait (one bounded request) for the applied outcome of a committed
+    /// receipt. Takes no lane lock. `Ok(reply)` carries Applied or Rejected;
+    /// an earlier rejected request of this producer returns HTTP 409
+    /// `prior_request_rejected` as an `AppendResponseError`. A 503
+    /// `applied_pending` means the applier has not reached the index yet.
+    pub async fn wait_applied(&self, key: usize, commit: &CommitReply) -> Result<MutationReply> {
+        let open = self.inner.opens.get(key).context("client lane out of range")?;
+        validate_commit(commit, &self.inner.scope, open)?;
+        let response = self
+            .inner
+            .client
+            .post(self.inner.endpoint("applied"))
+            .timeout(self.inner.timeout)
+            .json(&AppliedRequest {
+                bucket: open.bucket,
+                receipt: commit.receipt.clone(),
+            })
+            .send()
+            .await?;
+        let status = response.status();
+        if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        {
+            return Err(super::unresolved_append(response).await);
+        }
+        let result: MutationReply = super::bounded_json(response).await?;
+        validate(&result, &self.inner.scope, open)?;
+        ensure!(
+            result.receipt == commit.receipt
+                && result.completion.index == commit.index
+                && result.completion.meta == commit.meta
+                && (status == reqwest::StatusCode::OK)
+                    == matches!(
+                        result.completion.result,
+                        crate::annotations::MutationResult::Applied
+                    ),
+            "foreign applied outcome"
+        );
+        Ok(result)
+    }
+
+    fn committed(value: Acknowledged) -> Result<CommitReply> {
+        match value {
+            Acknowledged::Commit(result) => Ok(result),
+            _ => anyhow::bail!("non-commit result on commit-ack request"),
+        }
+    }
+
     pub async fn resume(&self, key: usize) -> Result<Option<MutationReply>> {
         let mut lane = self.inner.lane(key)?.lock().await;
         self.inner
-            .resume_locked(key, &mut lane)
+            .resume_locked(key, &mut lane, false)
             .await?
             .map(Self::mutation)
             .transpose()
@@ -89,7 +175,7 @@ impl DurableMutationClient {
     fn mutation(value: Acknowledged) -> Result<MutationReply> {
         match value {
             Acknowledged::Mutation(result) => Ok(result),
-            Acknowledged::Append(_) => anyhow::bail!("immutable result on mutation client"),
+            _ => anyhow::bail!("non-applied result on mutation client"),
         }
     }
 
@@ -200,6 +286,26 @@ pub(super) fn validate(value: &MutationReply, scope: &Scope, open: &ProducerOpen
             && !value.receipt.is_empty()
             && value.receipt.len() <= MAX_TOKEN,
         "foreign mutation ACK scope"
+    );
+    Ok(())
+}
+
+pub(super) fn validate_commit(value: &CommitReply, scope: &Scope, open: &ProducerOpen) -> Result<()> {
+    let meta = &value.meta;
+    ensure!(
+        value.index > 0
+            && value.index < u64::MAX
+            && meta.stream == scope.table
+            && meta.bucket == open.bucket
+            && meta.kind == lance_context_wal::record::RecordKind::Data
+            && meta.producer == producer::producer_id(open.slot, open.expected_generation + 1)
+            && meta.sequence > 0
+            && meta.sequence < u64::MAX
+            && meta.body_bytes > 0
+            && meta.body_bytes <= scope.contract.max_record_bytes as u64
+            && !value.receipt.is_empty()
+            && value.receipt.len() <= MAX_TOKEN,
+        "foreign mutation commit ACK scope"
     );
     Ok(())
 }

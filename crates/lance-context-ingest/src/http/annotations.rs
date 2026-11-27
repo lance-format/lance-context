@@ -20,6 +20,29 @@ pub struct MutationReply {
     pub completion: Completed,
 }
 
+/// Request header selecting the commit-ack update mode. Its only value is
+/// `commit`. Without it, `/update` keeps acknowledging after apply.
+pub const ACK_MODE: &str = "x-lance-context-ack";
+pub const ACK_COMMIT: &str = "commit";
+
+/// Commit-ack reply (HTTP 202): the exact request is durably committed in the
+/// WAL at `index`. It is not an applied outcome; POST the receipt to
+/// `/applied` to obtain Applied or Rejected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitReply {
+    pub receipt: String,
+    pub index: u64,
+    pub meta: lance_context_wal::record::BatchMeta,
+}
+
+/// Wait for the applied outcome of a committed receipt on one physical shard.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppliedRequest {
+    pub bucket: u32,
+    pub receipt: String,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PointRequest {
@@ -69,6 +92,7 @@ enum Operation {
     Open,
     Replace,
     Update,
+    Applied,
     Read,
     ReadBody,
     FilterStatus,
@@ -82,6 +106,7 @@ impl Operation {
             Self::Open => "producer",
             Self::Replace => "replace-producer",
             Self::Update => "update",
+            Self::Applied => "applied",
             Self::Read => "read",
             Self::ReadBody => "read-body",
             Self::FilterStatus => "filter-status",
@@ -92,7 +117,7 @@ impl Operation {
     fn is_write(self) -> bool {
         !matches!(
             self,
-            Self::Read | Self::ReadBody | Self::FilterStatus | Self::SelectedBody
+            Self::Read | Self::ReadBody | Self::FilterStatus | Self::SelectedBody | Self::Applied
         )
     }
 }
