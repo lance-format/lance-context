@@ -47,11 +47,21 @@ async fn retired_body_can_recapture_installed_base_with_one_reader_permit() -> R
     );
     drop(lookup);
     let mut staged = staging.capture_immutable_body("a").await?;
-    assert_eq!(origin(&staged).record_index, 1);
+    let record_index = origin(&staged).record_index;
+    assert_eq!(record_index, 1);
+    assert!(
+        !staging
+            .recapture_immutable_installed(&mut staged, record_index)
+            .await?
+    );
+    assert_eq!(origin(&staged).record_index, record_index);
     let selected = publish(&staging, &["a"]).await?;
 
-    let cut = staging.recapture_immutable_installed(&mut staged).await?;
-    assert_eq!(cut, 1);
+    assert!(
+        staging
+            .recapture_immutable_installed(&mut staged, record_index)
+            .await?
+    );
     assert_eq!(staging.observation().await.readers, 1);
     let TurnBodySource::Materialized(base) = staged.source() else {
         panic!("retired body must recapture the installed dataset");
