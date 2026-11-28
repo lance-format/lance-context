@@ -182,10 +182,15 @@ async fn fenced_read() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_body_http_crosses_wal_retirement_with_one_reader_permit() -> Result<()> {
-    tokio::time::timeout(DEADLINE, read_across_retirement()).await?
+    tokio::time::timeout(DEADLINE, read_across_retirement(false)).await?
 }
 
-async fn read_across_retirement() -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_body_http_uses_installed_cut_when_apply_memory_is_full() -> Result<()> {
+    tokio::time::timeout(DEADLINE, read_across_retirement(true)).await?
+}
+
+async fn read_across_retirement(apply_pressure: bool) -> Result<()> {
     let root = tempfile::tempdir()?;
     let layout = layout();
     let input = body("session", "retired-before-fetch", 7)?;
@@ -272,10 +277,19 @@ async fn read_across_retirement() -> Result<()> {
 
     publish_and_retire(&c, &physical, &service, &mut runtime, ack.index, None).await?;
     assert_eq!(service.observation().await.0.readers, 1);
+    let apply_hold = if apply_pressure {
+        let budget = service.apply_budget_for_test();
+        let hold = idle_budget(budget).await?;
+        assert_eq!(budget.reserved(), budget.limit());
+        Some(hold)
+    } else {
+        None
+    };
     resume
         .send(())
         .expect("body read still waiting for WAL fetch");
     read.await??;
+    drop(apply_hold);
     owner.shutdown().await;
     server.shutdown().await?;
     drop((runtime, service));

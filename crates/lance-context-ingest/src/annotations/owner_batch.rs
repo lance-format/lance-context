@@ -429,23 +429,19 @@ impl Service {
             .is_some_and(|b| b.active_rows() >= b.options.target_rows)
     }
 
-    /// Refetch and decode one committed WAL request for publication or a
-    /// staged point read. Waits for apply memory rather than refusing: the
-    /// caller holds no ordered gate, and the publisher must make progress.
-    pub(super) async fn refetch_bodies(
+    /// Fetch one committed body record, returning `None` on admission pressure.
+    pub(super) async fn try_refetch_bodies(
         &self,
         index: u64,
         meta: BatchMeta,
-    ) -> Result<(Vec<RecordBatch>, MergeReservation)> {
-        loop {
-            if let Some(pending) = prefetch::fetch(self, index, meta.clone()).await? {
-                let mixed::Decoded::Creates { bodies, .. } = pending.decoded else {
-                    bail!("immutable body cannot contain patches")
-                };
-                return Ok((bodies, pending._reservation));
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+    ) -> Result<Option<(Vec<RecordBatch>, MergeReservation)>> {
+        let Some(pending) = prefetch::fetch(self, index, meta).await? else {
+            return Ok(None);
+        };
+        let mixed::Decoded::Creates { bodies, .. } = pending.decoded else {
+            bail!("immutable body cannot contain patches");
+        };
+        Ok(Some((bodies, pending._reservation)))
     }
 
     /// Stream exactly the frozen survivors in the stored full-body schema.
@@ -498,15 +494,11 @@ impl Service {
                     // Never wait for apply memory while this chunk holds
                     // some: flush it first so its reservations are released.
                     let (bodies, reservation) = loop {
-                        let fetched = prefetch::fetch(&service, survivors.index, survivors.meta.clone())
+                        let fetched = service.try_refetch_bodies(survivors.index, survivors.meta.clone())
                             .await
                             .map_err(external)?;
-                        if let Some(pending) = fetched {
-                            let mixed::Decoded::Creates { bodies, .. } = pending.decoded else {
-                                Err::<(), _>(external(anyhow::anyhow!("immutable body cannot contain patches")))?;
-                                unreachable!()
-                            };
-                            break (bodies, pending._reservation);
+                        if let Some(bodies) = fetched {
+                            break bodies;
                         }
                         if chunk.is_empty() {
                             tokio::time::sleep(Duration::from_millis(5)).await;

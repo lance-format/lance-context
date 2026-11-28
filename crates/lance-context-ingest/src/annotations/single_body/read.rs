@@ -30,6 +30,11 @@ impl Body {
 
 impl Service {
     #[cfg(all(test, feature = "http-client", feature = "service"))]
+    pub(crate) fn apply_budget_for_test(&self) -> &Arc<MergeMemoryBudget> {
+        &self.apply_budget
+    }
+
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
     pub(crate) fn pause_body_fetch_for_test(
         &self,
     ) -> (
@@ -76,18 +81,22 @@ impl Service {
             index <= closure.through,
             "unpublished WAL payload unavailable"
         );
-        let materialized = {
+        let covers_index = {
             let _ordered = self.shared.ordered.lock().await;
             self.shared
                 .staging
-                .recapture_immutable_installed(view)
+                .recapture_immutable_installed(view, index)
                 .await?
         };
+        ensure!(
+            covers_index,
+            "installed view does not cover the retired WAL payload"
+        );
         let TurnBodySource::Materialized(base) = view.source() else {
             bail!("installed recapture is not a materialized base")
         };
         ensure!(
-            materialized >= index && base.version().version >= closure.version,
+            base.version().version >= closure.version,
             "installed view does not cover the retired WAL payload"
         );
         Ok(())
@@ -169,14 +178,43 @@ impl Service {
                 // Capture -> Close -> Fetch: publication can retire the WAL
                 // record after the ordered capture. The row is then in the
                 // installed base; recapture it below and read from Lance.
-                match self.refetch_bodies(source.record_index, meta).await {
-                    Ok(fetched) => refetched = Some((source, fetched)),
-                    Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
-                        self.recapture_retired(&mut view, source.record_index)
-                            .await?;
-                        recaptured = true;
+                let retry_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    match self
+                        .try_refetch_bodies(source.record_index, meta.clone())
+                        .await
+                    {
+                        Ok(Some(fetched)) => {
+                            refetched = Some((source, fetched));
+                            break;
+                        }
+                        Ok(None) => {
+                            // Admission can refuse before the Fetch reaches the
+                            // WAL. Use the already-installed cut when it covers
+                            // the captured record, even if the WAL is unreadable.
+                            if self
+                                .shared
+                                .staging
+                                .recapture_immutable_installed(&mut view, source.record_index)
+                                .await?
+                            {
+                                recaptured = true;
+                                break;
+                            }
+                            ensure!(
+                                tokio::time::Instant::now() < retry_until,
+                                "owner batch body refetch memory unavailable"
+                            );
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
+                            self.recapture_retired(&mut view, source.record_index)
+                                .await?;
+                            recaptured = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
                 }
             }
             let (batch, hold) = if let Some(row) = staged {
@@ -232,9 +270,12 @@ impl Service {
                     .join(" AND ");
                 let mut scan = base.scan();
                 scan.filter(&filter)?.limit(Some(2), None)?;
+                // Point lookups return at most one row, so fragments can be
+                // read in parallel without preserving their physical order.
                 scan.batch_size(128)
                     .batch_readahead(1)
-                    .fragment_readahead(1)
+                    .fragment_readahead(4)
+                    .scan_in_order(false)
                     .io_buffer_size(self.ingress.scope.contract.max_record_bytes as u64);
                 let mut stream = scan.try_into_stream().await?;
                 let mut found = None;
