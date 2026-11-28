@@ -619,12 +619,10 @@ fn cluster(
         }
     }
     {
-        let body = spec.body_schema().clone();
         let mut keyed = order
             .into_iter()
             .map(|(b, row)| {
-                let original = RecordBatch::try_new(body.clone(), selected[b].columns().to_vec())?;
-                let id = spec.row_key(&original, row, value_bytes)?;
+                let id = spec.row_key(&selected[b], row, value_bytes)?;
                 Ok(((spec.routing_key(&id)?, id), (b, row)))
             })
             .collect::<Result<Vec<_>>>()?;
