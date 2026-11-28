@@ -21,6 +21,10 @@ pub enum TurnIdIndexType {
     /// a candidate; the existing exact `id` filter still decides membership.
     /// Compaction withdraws rewritten fragments, which are then rebuilt.
     Zonemap,
+    /// Per-zone Bloom filters over the canonical key: point membership does
+    /// not depend on key order, so this prunes even unclustered fragments.
+    /// Withdrawn by rewrites and rebuilt like ZoneMap; never merged.
+    Bloomfilter,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,12 +36,18 @@ pub struct TurnIdIndex {
     /// Native index structure. Changing it requires a fresh table binding: a
     /// table never mixes BTree and ZoneMap turn-ID segments.
     pub index_type: TurnIdIndexType,
+    /// Also keep a ZoneMap on the turn specification's routing column (e.g.
+    /// `session_id`), with the same bounded build/merge/withdrawal policy. It
+    /// prunes only where rows are clustered by that column, i.e. after a
+    /// rewrite with `SmallFileCompaction::sort_by` led by the routing column.
+    pub routing_zonemap: bool,
 }
 impl Default for TurnIdIndex {
     fn default() -> Self {
         Self {
             min_rows: 64 << 10,
             index_type: TurnIdIndexType::Btree,
+            routing_zonemap: false,
         }
     }
 }
@@ -51,12 +61,13 @@ impl TurnIdIndex {
         Ok(())
     }
 
-    pub(crate) fn validate_base(dataset: &Dataset) -> Result<()> {
+    pub(crate) fn validate_base(dataset: &Dataset, index_type: TurnIdIndexType) -> Result<()> {
+        let strict_row_limit = index_type == TurnIdIndexType::Btree;
         ensure!(
             dataset.manifest().uses_stable_row_ids()
                 && dataset.fragments().iter().all(|f| f.deletion_file.is_none()
-                    && f.physical_rows.is_some_and(|n| n <= MAX_BUILD_ROWS)),
-            "turn ID indexing requires stable IDs and fragments of at most 1048576 physical rows without deletions"
+                    && f.physical_rows.is_some_and(|n| !strict_row_limit || n <= MAX_BUILD_ROWS)),
+            "turn ID indexing requires stable IDs, known fragment row counts and no deletions. BTree and status indexes require at most {MAX_BUILD_ROWS} rows per fragment"
         );
         Ok(())
     }
@@ -87,14 +98,36 @@ impl TurnIdIndex {
         None
     }
 
-    pub(super) async fn action(&self, dataset: &Dataset) -> Result<Option<Action>> {
-        Self::validate_base(dataset)?;
+    /// The next bounded index action: turn IDs first, then the routing ZoneMap.
+    pub(super) async fn action(&self, dataset: &Dataset) -> Result<Option<(Action, Key)>> {
+        Self::validate_base(dataset, self.index_type)?;
+        // A full-body table may name its turn key differently; it then gets
+        // only the routing ZoneMap.
+        let has_id = dataset.schema().field(Key::Turn.column()).is_some();
+        if has_id || !self.routing_zonemap {
+            if let Some(action) = self.action_for(dataset, Key::Turn).await? {
+                return Ok(Some((action, Key::Turn)));
+            }
+        }
+        if self.routing_zonemap && session_index::routing_column(dataset)?.is_some() {
+            if let Some(action) = self.action_for(dataset, Key::Routing).await? {
+                return Ok(Some((action, Key::Routing)));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn action_for(&self, dataset: &Dataset, key: Key) -> Result<Option<Action>> {
         let fragments: BTreeMap<_, _> = dataset
             .fragments()
             .iter()
             .map(|f| Ok((u32::try_from(f.id)?, f.physical_rows.unwrap())))
             .collect::<Result<_>>()?;
-        let zonemap = self.index_type == TurnIdIndexType::Zonemap;
+        let bloom = matches!(key, Key::Turn) && self.index_type == TurnIdIndexType::Bloomfilter;
+        let zonemap = matches!(key, Key::Routing) || self.index_type == TurnIdIndexType::Zonemap;
+        // Both skipping kinds are withdrawn by rewrites and rebuilt per
+        // uncovered fragment; only BTree uses remaps and tiered merges.
+        let skipping = zonemap || bloom;
         let mut covered = BTreeSet::new();
         let mut segments = Vec::new();
         let mut empty_sources = Vec::new();
@@ -102,18 +135,19 @@ impl TurnIdIndex {
             .load_indices()
             .await?
             .iter()
-            .filter(|i| i.name == Key::Turn.name())
+            .filter(|i| i.name == key.name())
         {
-            session_index::validate_metadata(dataset, index, Key::Turn)?;
+            session_index::validate_metadata(dataset, index, key)?;
             ensure!(
-                session_index::is_zonemap(index) == zonemap,
-                "turn ID index type differs from the table's existing segments"
+                session_index::is_zonemap(index) == zonemap
+                    && session_index::is_bloom_filter(index) == bloom,
+                "turn index type differs from the table's existing segments"
             );
             let coverage = index.fragment_bitmap.as_ref().unwrap();
             // A rewrite withdraws a ZoneMap segment's rewritten fragments. A
             // fully withdrawn segment is retired by the next build; it is never
             // merged, so its obsolete zone files are not read again.
-            if zonemap && coverage.is_empty() {
+            if skipping && coverage.is_empty() {
                 if empty_sources.len() < 64 {
                     empty_sources.push(index.uuid);
                 }
@@ -123,13 +157,13 @@ impl TurnIdIndex {
             for id in coverage.iter() {
                 ensure!(
                     covered.insert(id),
-                    "turn ID segments have overlapping coverage"
+                    "turn index segments have overlapping coverage"
                 );
                 rows = rows
                     .checked_add(
                         *fragments
                             .get(&id)
-                            .context("turn ID index covers a foreign fragment")?,
+                            .context("turn index covers a foreign fragment")?,
                     )
                     .context("turn ID segment row count overflow")?;
             }
@@ -139,11 +173,15 @@ impl TurnIdIndex {
             if let Some(tier) = Self::merge_tier(segments) {
                 return Ok(Some(Action::MergeZoneMap(tier)));
             }
+        } else if bloom {
+            // Bloom segments are rebuilt, not merged: one per bounded build.
         } else if let Some(action) = Self::merge(segments) {
             return Ok(Some(action));
         }
         let mut selected = Vec::new();
         let mut rows = 0;
+        // Skipping indexes can leave larger historical fragments uncovered.
+        // The native scan still visits them and applies the exact predicate.
         for (id, count) in fragments {
             if covered.contains(&id) || count == 0 || count > MAX_BUILD_ROWS - rows {
                 continue;
@@ -154,15 +192,23 @@ impl TurnIdIndex {
                 break;
             }
         }
-        if zonemap {
+        if skipping {
             // Rebuild only uncovered fragments, including any a rewrite just
             // withdrew. Bounded by the same row/fragment limits as BTree.
-            return Ok((!selected.is_empty()
-                && (rows >= self.min_rows || selected.len() == 128 || !empty_sources.is_empty()))
-            .then_some(Action::BuildZoneMap {
-                fragments: selected,
-                empty_sources,
-            }));
+            let ready = !selected.is_empty()
+                && (rows >= self.min_rows || selected.len() == 128 || !empty_sources.is_empty());
+            let action = if bloom {
+                Action::BuildBloomFilter {
+                    fragments: selected,
+                    empty_sources,
+                }
+            } else {
+                Action::BuildZoneMap {
+                    fragments: selected,
+                    empty_sources,
+                }
+            };
+            return Ok(ready.then_some(action));
         }
         Ok((rows >= self.min_rows || selected.len() == 128).then_some(Action::Build(selected)))
     }
@@ -195,11 +241,11 @@ pub(super) async fn prepare(
         return Ok(None);
     };
     let dataset = compaction::read_compaction_base(publisher, pending.plan.read_version).await?;
-    let Some(action) = options.action(&dataset).await? else {
+    let Some((action, key)) = options.action(&dataset).await? else {
         return Ok(None);
     };
     Ok(Some(
-        session_index::prepare_action(publisher, dataset, action, Key::Turn).await?,
+        session_index::prepare_action(publisher, dataset, action, key).await?,
     ))
 }
 

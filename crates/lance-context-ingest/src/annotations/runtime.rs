@@ -367,10 +367,19 @@ impl Runtime {
         shard: Shard,
         spec: &crate::turn_ingestion::TurnIngestionSpec,
     ) -> Result<(Service, Self)> {
+        let mut configuration = configuration;
+        Self::turn_defaults(&mut configuration, spec);
+        // Address-domain BTree remaps and status indexes stay with the
+        // consumer. Managed skipping indexes (ZoneMap, Bloom filter) are
+        // withdrawn by a rewrite and rebuilt here.
         ensure!(
-            configuration.publication.turn_id_index.is_none()
+            configuration
+                .publication
+                .turn_id_index
+                .as_ref()
+                .is_none_or(|i| i.index_type != materializer::TurnIdIndexType::Btree)
                 && configuration.publication.status_index.is_none(),
-            "single body indexing is supplied by its consumer"
+            "single body indexing is supplied by its consumer, except managed skipping indexes"
         );
         Self::connect_mode(
             client,
@@ -384,6 +393,42 @@ impl Runtime {
             Some(spec),
         )
         .await
+    }
+
+    /// Turns default to both dedup-lookup indexes: a Bloom filter on `id`
+    /// (prunes regardless of layout) plus write-time clustering, i.e.
+    /// compaction sorted by (routing column, key) with a routing ZoneMap.
+    /// Applied only to options the caller left unset, and only when the
+    /// publication budget covers the shared index workspace.
+    fn turn_defaults(
+        configuration: &mut Configuration,
+        spec: &crate::turn_ingestion::TurnIngestionSpec,
+    ) {
+        let publication = &mut configuration.publication;
+        if publication.turn_id_index.is_none()
+            && configuration.publication_budget.limit() >= materializer::INDEX_WORKSPACE
+            && configuration.limits.retained_entries <= materializer::turn_id_index::MAX_BUILD_ROWS
+        {
+            publication.turn_id_index = Some(materializer::TurnIdIndex {
+                index_type: materializer::TurnIdIndexType::Bloomfilter,
+                routing_zonemap: true,
+                ..Default::default()
+            });
+        }
+        if let Some(compaction) = publication.compaction.as_mut() {
+            if compaction.sort_by.is_empty() {
+                let routing = spec.routing_column().to_owned();
+                compaction.sort_by = std::iter::once(routing.clone())
+                    .chain(
+                        spec.primary_key()
+                            .iter()
+                            .filter(|c| **c != routing)
+                            .cloned(),
+                    )
+                    .take(4)
+                    .collect();
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)] // Explicit routing augments the existing owned connection.
@@ -486,7 +531,15 @@ impl Runtime {
                 .context("annotation manifests unavailable")?
                 .head;
             let base = checkpoint::load(&service.ingress, &storage, version).await?;
-            materializer::TurnIdIndex::validate_base(&base)?;
+            let index_type = c
+                .publication
+                .turn_id_index
+                .as_ref()
+                .filter(|_| c.publication.status_index.is_none())
+                .map_or(materializer::TurnIdIndexType::Btree, |index| {
+                    index.index_type
+                });
+            materializer::TurnIdIndex::validate_base(&base, index_type)?;
         }
         if service.is_single_body() {
             // Single-body Turns owners run the streaming owner batch pipeline

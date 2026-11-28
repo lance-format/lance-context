@@ -1,6 +1,7 @@
 //! New managed stable-ID indexes and existing native address indexes must both
 //! survive segment extension, consolidation, compaction, and snapshot reopening.
 use super::*;
+use crate::materializer::{turn_id_index::MAX_BUILD_ROWS, TurnIdIndex, TurnIdIndexType};
 use arrow_array::{RecordBatch, RecordBatchIterator, StringArray};
 use futures::TryStreamExt;
 use lance::dataset::{
@@ -55,6 +56,80 @@ async fn query(base: &Dataset, predicate: &str, expected: &[&str]) -> Result<()>
     }
     rows.sort();
     assert_eq!(rows, expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_bloom_indexes_the_tail_beside_an_oversized_historical_fragment() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let uri = root.path().join("turns.lance");
+    let large_rows = MAX_BUILD_ROWS + 1;
+    let historical = RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(StringArray::from_iter_values(
+            (0..large_rows).map(|id| id.to_string()),
+        )) as arrow_array::ArrayRef,
+    )])?;
+    let mut base = Dataset::write(
+        RecordBatchIterator::new(vec![Ok(historical.clone())], historical.schema()),
+        uri.to_str().unwrap(),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: large_rows,
+            max_rows_per_group: large_rows,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let tail = RecordBatch::try_new(
+        historical.schema(),
+        vec![Arc::new(StringArray::from(vec!["tail-a", "tail-b"]))],
+    )?;
+    base.append(
+        RecordBatchIterator::new(vec![Ok(tail.clone())], tail.schema()),
+        None,
+    )
+    .await?;
+    assert_eq!(
+        base.fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows)
+            .collect::<Vec<_>>(),
+        [Some(large_rows), Some(2)]
+    );
+    let options = TurnIdIndex {
+        min_rows: 1,
+        index_type: TurnIdIndexType::Bloomfilter,
+        routing_zonemap: false,
+    };
+    let (action, key) = options
+        .action(&base)
+        .await?
+        .context("missing tail index plan")?;
+    let indexed = managed(&base, action, key).await?;
+    let indices = indexed.load_indices().await?;
+    assert_eq!(indices.len(), 1);
+    let coverage = indices[0].fragment_bitmap.as_ref().unwrap();
+    assert_eq!(
+        coverage.iter().collect::<Vec<_>>(),
+        [u32::try_from(base.fragments()[1].id)?]
+    );
+    for (predicate, expected) in [
+        ("id = '1'", Some("1")),
+        ("id = 'tail-b'", Some("tail-b")),
+        ("id = 'missing'", None),
+    ] {
+        let rows = indexed.scan().filter(predicate)?.try_into_batch().await?;
+        assert_eq!(rows.num_rows(), usize::from(expected.is_some()));
+        if let Some(expected) = expected {
+            let ids = rows
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(ids.value(0), expected);
+        }
+    }
     Ok(())
 }
 
@@ -225,6 +300,7 @@ async fn exercise(existing_address_index: bool) -> Result<()> {
                     query(snapshot, "status IS NULL", &["B", "D"]).await?;
                     query(snapshot, "status = 'ready'", &["A", "E"]).await?;
                 }
+                Key::Routing => unreachable!("routing keys are ZoneMap-only"),
             }
         }
     }

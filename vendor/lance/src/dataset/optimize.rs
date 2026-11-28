@@ -367,6 +367,22 @@ pub struct CompactionOptions {
     #[doc(hidden)]
     #[serde(default)]
     pub has_eager_remappable_index: Option<bool>,
+    /// Rewrite each task's live rows in ascending order of these top-level
+    /// columns (then by stable row id), instead of source order. Empty keeps
+    /// the source order. Clustering narrows per-fragment and per-zone min/max
+    /// ranges, so ZoneMap pruning can skip most of the rewritten output.
+    ///
+    /// Requires stable row ids: each row keeps its row id and version
+    /// lineage, carried as a permutation. Row addresses are not preserved in
+    /// order, so this refuses tasks whose indices need an address remap
+    /// (eager or deferred); indices that a rewrite withdraws (e.g. ZoneMap)
+    /// and row-id-domain indices are unaffected. Implies a re-encode.
+    #[serde(default)]
+    pub sort_by: Vec<String>,
+    /// Memory pool for the sort, in bytes. The sort spills to the default
+    /// temporary directory beyond it. `None` uses Lance's default pool size.
+    #[serde(default)]
+    pub sort_memory_bytes: Option<u64>,
 }
 
 #[allow(deprecated)]
@@ -396,6 +412,8 @@ impl Default for CompactionOptions {
             data_storage_version: None,
             transaction_properties: None,
             has_eager_remappable_index: None,
+            sort_by: Vec::new(),
+            sort_memory_bytes: None,
         }
     }
 }
@@ -2670,6 +2688,15 @@ async fn rewrite_files(
             || load_indices_for_remapping(dataset.as_ref())
                 .await?
                 .is_some());
+    let sorted = !options.sort_by.is_empty();
+    if sorted {
+        validate_sorted_rewrite(
+            dataset.as_ref(),
+            options,
+            &fragments,
+            records_from_fragment_metadata || capture_row_addrs,
+        )?;
+    }
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -2679,7 +2706,8 @@ async fn rewrite_files(
         fragments.len()
     );
     let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    let can_binary_copy =
+        !sorted && can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         if let Some((path, actual)) = first_binary_copy_version_mismatch(&fragments, write_version)?
         {
@@ -2696,8 +2724,13 @@ async fn rewrite_files(
     }
     let mut row_ids_rx: Option<std::sync::mpsc::Receiver<CapturedRowIds>> = None;
     let mut reader: Option<SendableRecordBatchStream> = None;
+    let mut sorted_lineage: Option<SortedLineage> = None;
 
-    if !can_binary_copy {
+    if sorted {
+        let (stream, lineage) = sorted_reader(dataset.as_ref(), &fragments, options).await?;
+        reader = Some(stream);
+        sorted_lineage = Some(lineage);
+    } else if !can_binary_copy {
         let (prepared_reader, rx_initial, has_blob_v2_columns) = prepare_reader(
             dataset.as_ref(),
             &fragments,
@@ -2868,7 +2901,9 @@ async fn rewrite_files(
         // cut at the row counts actually written, and holds none of it while
         // writing. Binary copy cannot add columns to the files it copies, so
         // it always takes that path.
-        let spill_budget = if dataset.manifest.uses_stable_row_ids() {
+        // A sorted rewrite carries its lineage as a permutation, collected
+        // while writing; it never uses the in-order in-file plan.
+        let spill_budget = if dataset.manifest.uses_stable_row_ids() && !sorted {
             inline_row_lineage_max_bytes(dataset.as_ref())?
         } else {
             None
@@ -2922,6 +2957,11 @@ async fn rewrite_files(
     let row_addrs_result: Result<Option<Vec<u8>>> = async {
         if uses_stable_row_ids {
             log::info!("Compaction task {}: rechunking stable row ids", task_id);
+            if let Some(lineage) = sorted_lineage.take() {
+                place_sorted_row_lineage(dataset.as_ref(), &mut new_fragments, lineage).await?;
+                // Validated above: nothing consumes old row addresses.
+                return Ok(None);
+            }
             match lineage_plan {
                 Some(planned) => {
                     place_planned_row_lineage(dataset.as_ref(), &mut new_fragments, planned).await?
@@ -2981,6 +3021,205 @@ async fn rewrite_files(
         original_fragments: fragments,
         row_addrs,
     })
+}
+
+/// Per-row lineage of a sorted rewrite, in output order: stable row ids,
+/// created-at versions and last-updated-at versions.
+type SortedLineage = Arc<std::sync::Mutex<(Vec<u64>, Vec<u64>, Vec<u64>)>>;
+
+fn validate_sorted_rewrite(
+    dataset: &Dataset,
+    options: &CompactionOptions,
+    fragments: &[Fragment],
+    consumes_row_addrs: bool,
+) -> Result<()> {
+    if !dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::not_supported(
+            "sorted compaction requires stable row ids",
+        ));
+    }
+    if options.defer_index_remap || consumes_row_addrs {
+        return Err(Error::not_supported(
+            "sorted compaction cannot remap address-domain indices: rows change order",
+        ));
+    }
+    if dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob())
+    {
+        return Err(Error::not_supported(
+            "sorted compaction does not support blob columns",
+        ));
+    }
+    if fragments
+        .iter()
+        .any(|fragment| !fragment.overlays.is_empty())
+    {
+        return Err(Error::not_supported(
+            "sorted compaction does not support overlays",
+        ));
+    }
+    for name in &options.sort_by {
+        if !dataset
+            .schema()
+            .fields
+            .iter()
+            .any(|field| &field.name == name)
+        {
+            return Err(Error::invalid_input(format!(
+                "sorted compaction key '{name}' is not a top-level column"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Scan the task's live rows with their lineage, sort them by the sort key
+/// then stable row id under a spilling memory pool, and strip the lineage
+/// into the returned buffers while the writer consumes the stream.
+async fn sorted_reader(
+    dataset: &Dataset,
+    fragments: &[Fragment],
+    options: &CompactionOptions,
+) -> Result<(SendableRecordBatchStream, SortedLineage)> {
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion_physical_expr::expressions::Column;
+    use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
+    use lance_datafusion::exec::{LanceExecutionOptions, OneShotExec, execute_plan};
+
+    let mut scanner = dataset.scan();
+    let mut columns = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect::<Vec<_>>();
+    columns.push(ROW_CREATED_AT_VERSION.to_owned());
+    columns.push(ROW_LAST_UPDATED_AT_VERSION.to_owned());
+    scanner.project(&columns)?;
+    scanner.with_row_id();
+    if let Some(batch_size) = options.batch_size {
+        scanner.batch_size(batch_size);
+    }
+    if let Some(io_buffer_size) = options.io_buffer_size {
+        scanner.io_buffer_size(io_buffer_size);
+    }
+    scanner
+        .with_fragments(fragments.to_vec())
+        .scan_in_order(true);
+    let input = SendableRecordBatchStream::from(scanner.try_into_stream().await?);
+    let input_schema = input.schema();
+    let mut keys = Vec::with_capacity(options.sort_by.len() + 1);
+    for name in options.sort_by.iter().map(String::as_str).chain([ROW_ID]) {
+        keys.push(PhysicalSortExpr::new(
+            Arc::new(Column::new_with_schema(name, input_schema.as_ref())?),
+            arrow_schema::SortOptions::default(),
+        ));
+    }
+    let ordering = LexOrdering::new(keys).expect("at least the row id sort key");
+    let plan = Arc::new(SortExec::new(ordering, Arc::new(OneShotExec::new(input))));
+    // Row-at-a-time input (large records) would make every spill run and
+    // merge step one row; emit small multi-row batches instead.
+    let sorted = execute_plan(
+        plan,
+        LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: options.sort_memory_bytes,
+            batch_size: options.batch_size.map(|rows| rows.max(64)),
+            skip_logging: true,
+            ..Default::default()
+        },
+    )?;
+    let lineage_columns = [ROW_ID, ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION];
+    let data_schema: SchemaRef = Arc::new(ArrowSchema::new_with_metadata(
+        input_schema
+            .fields()
+            .iter()
+            .filter(|field| !lineage_columns.contains(&field.name().as_str()))
+            .cloned()
+            .collect::<Vec<_>>(),
+        input_schema.metadata().clone(),
+    ));
+    let lineage: SortedLineage = Arc::default();
+    let collected = lineage.clone();
+    let output = data_schema.clone();
+    let stream = sorted.map(move |batch| -> datafusion::error::Result<RecordBatch> {
+        let batch = batch?;
+        let to_df = |message: String| datafusion::error::DataFusionError::Execution(message);
+        let mut values = Vec::with_capacity(3);
+        for name in lineage_columns {
+            let column = batch
+                .column_by_name(name)
+                .and_then(|column| column.as_primitive_opt::<UInt64Type>())
+                .filter(|column| column.null_count() == 0)
+                .ok_or_else(|| to_df(format!("sorted compaction lost lineage column {name}")))?;
+            values.push(column.values().clone());
+        }
+        {
+            let mut guard = collected.lock().unwrap();
+            guard.0.extend_from_slice(&values[0]);
+            guard.1.extend_from_slice(&values[1]);
+            guard.2.extend_from_slice(&values[2]);
+        }
+        let columns = output
+            .fields()
+            .iter()
+            .map(|field| {
+                batch
+                    .column_by_name(field.name())
+                    .cloned()
+                    .ok_or_else(|| to_df(format!("sorted compaction lost column {}", field.name())))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(RecordBatch::try_new(output.clone(), columns)?)
+    });
+    Ok((
+        Box::pin(RecordBatchStreamAdapter::new(data_schema, stream)),
+        lineage,
+    ))
+}
+
+/// Give each written fragment of a sorted rewrite the lineage of exactly the
+/// rows it holds, cut at the written row counts.
+async fn place_sorted_row_lineage(
+    dataset: &Dataset,
+    new_fragments: &mut [Fragment],
+    lineage: SortedLineage,
+) -> Result<()> {
+    let (row_ids, created_at, last_updated_at) = std::mem::take(&mut *lineage.lock().unwrap());
+    let written = new_fragments
+        .iter()
+        .map(|fragment| fragment.physical_rows.unwrap_or(0))
+        .sum::<usize>();
+    if written != row_ids.len()
+        || created_at.len() != row_ids.len()
+        || last_updated_at.len() != row_ids.len()
+    {
+        return Err(Error::internal(format!(
+            "sorted compaction wrote {written} rows but carried lineage for {}",
+            row_ids.len()
+        )));
+    }
+    let mut start = 0;
+    for fragment in new_fragments.iter_mut() {
+        let rows = fragment.physical_rows.ok_or_else(|| {
+            Error::internal(format!(
+                "compaction wrote fragment {} without a physical row count",
+                fragment.id
+            ))
+        })?;
+        let range = start..start + rows;
+        let carried = RowLineage {
+            row_ids: RowIdSequence::from(&row_ids[range.clone()]),
+            created_at: RowDatasetVersionSequence::from_versions(&created_at[range.clone()]),
+            last_updated_at: RowDatasetVersionSequence::from_versions(&last_updated_at[range]),
+        };
+        place_row_lineage(dataset, &carried).await?.apply(fragment);
+        start += rows;
+    }
+    Ok(())
 }
 
 /// Carry the stable row ids and per-row versions of `old_fragments` over to
@@ -4689,6 +4928,158 @@ mod tests {
     /// verification was unavailable), the rewritten files must NOT be deleted:
     /// if the commit landed they are referenced by the new version, and
     /// deleting them would corrupt the table.
+    /// A sorted rewrite orders each output by the key and keeps every row's
+    /// stable row id and version lineage with that row's values.
+    #[tokio::test]
+    async fn test_sorted_compaction_clusters_rows_and_keeps_lineage() {
+        use crate::dataset::ProjectionRequest;
+        use arrow_array::StringArray;
+        use lance_core::{ROW_CREATED_AT_VERSION, ROW_LAST_UPDATED_AT_VERSION};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("session_id", DataType::Utf8, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("payload", DataType::Int64, false),
+        ]));
+        // Sessions arrive interleaved across appends, as in production.
+        let mut dataset: Option<Dataset> = None;
+        for round in 0..4_i64 {
+            let sessions = (0..64_i64)
+                .map(|n| format!("s{:03}", (n * 37 + round * 11) % 64))
+                .collect::<Vec<_>>();
+            let ids = (0..64_i64)
+                .map(|n| format!("r{round}-{n:03}"))
+                .collect::<Vec<_>>();
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(sessions)),
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..64).map(|n| round * 64 + n),
+                    )),
+                ],
+            )
+            .unwrap();
+            let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+            let params = WriteParams {
+                enable_stable_row_ids: true,
+                mode: if dataset.is_some() {
+                    WriteMode::Append
+                } else {
+                    WriteMode::Create
+                },
+                ..Default::default()
+            };
+            dataset = Some(
+                Dataset::write(reader, test_uri, Some(params))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut dataset = dataset.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+
+        async fn rows(dataset: &Dataset) -> Vec<(u64, String, String, i64, u64, u64)> {
+            let mut scan = dataset.scan();
+            scan.project(&[
+                "session_id",
+                "id",
+                "payload",
+                ROW_CREATED_AT_VERSION,
+                ROW_LAST_UPDATED_AT_VERSION,
+            ])
+            .unwrap()
+            .with_row_id();
+            let batch = scan.try_into_batch().await.unwrap();
+            let text = |name: &str| batch[name].as_string::<i32>().clone();
+            let (session, id) = (text("session_id"), text("id"));
+            let payload = batch["payload"].as_primitive::<Int64Type>().clone();
+            let row_id = batch[ROW_ID].as_primitive::<UInt64Type>().clone();
+            let created = batch[ROW_CREATED_AT_VERSION]
+                .as_primitive::<UInt64Type>()
+                .clone();
+            let updated = batch[ROW_LAST_UPDATED_AT_VERSION]
+                .as_primitive::<UInt64Type>()
+                .clone();
+            (0..batch.num_rows())
+                .map(|row| {
+                    (
+                        row_id.value(row),
+                        session.value(row).to_owned(),
+                        id.value(row).to_owned(),
+                        payload.value(row),
+                        created.value(row),
+                        updated.value(row),
+                    )
+                })
+                .collect()
+        }
+        let mut before = rows(&dataset).await;
+        before.sort();
+
+        let options = CompactionOptions {
+            sort_by: vec!["session_id".into(), "id".into()],
+            sort_memory_bytes: Some(64 << 20),
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let after_in_order = rows(&dataset).await;
+        let keys = after_in_order
+            .iter()
+            .map(|row| (row.1.clone(), row.2.clone()))
+            .collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        let mut after = after_in_order;
+        after.sort();
+        assert_eq!(after, before);
+
+        // Stable row ids still resolve to their own rows after the permutation.
+        let probe = [before[0].0, before[100].0, before[255].0];
+        let taken = dataset
+            .take_rows(
+                &probe,
+                ProjectionRequest::from_columns(["id"], dataset.schema()),
+            )
+            .await
+            .unwrap();
+        let taken = taken["id"].as_string::<i32>();
+        for (position, row_id) in probe.iter().enumerate() {
+            let expected = &before.iter().find(|row| row.0 == *row_id).unwrap().2;
+            assert_eq!(taken.value(position), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sorted_compaction_refuses_address_remaps() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.clone())], data.schema());
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 3_000,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let options = CompactionOptions {
+            sort_by: vec!["a".into()],
+            ..Default::default()
+        };
+        let error = compact_files(&mut dataset, options, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stable row ids"), "{error}");
+    }
+
     #[tokio::test]
     async fn test_compaction_retry_after_ambiguous_success_preserves_live_files() {
         use crate::utils::test::{AmbiguousCommitHandler, AmbiguousFailure};
