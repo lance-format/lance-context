@@ -38,7 +38,7 @@ pub mod single_body;
 mod status_filter;
 mod window;
 pub mod wire;
-pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint};
+pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint, PriorRejected, ReceiptSuperseded};
 pub use lookup_observation::{
     BodyLookupObservation, BodyPrefetchObservation, LookupMetricObservation, PrefetchStop,
 };
@@ -546,6 +546,11 @@ impl Service {
                 frames: Mutex::new(mixed::frames::Window::default()),
                 staging,
                 results: Mutex::new(checkpoint::Results {
+                    // Restore each slot's persisted earliest unresolved
+                    // rejection so /applied keeps fencing later receipts.
+                    sticky: (0..outcomes.len())
+                        .map(|slot| snapshot.sticky(slot))
+                        .collect(),
                     base: snapshot,
                     latest: outcomes,
                 }),
@@ -866,6 +871,81 @@ impl Service {
         })
         .await
         .context("annotation apply deadline expired; reconcile the original request")?
+    }
+
+    /// Commit-ack mode: return as soon as the exact request is durably
+    /// committed in the WAL (quorum accepted), before ordered apply/dedup.
+    /// Identity, sequence fencing, exact-retry and first-create semantics are
+    /// the same as `submit`; only the acknowledgement point moves. The applied
+    /// outcome (Applied or Rejected) is fetched later with `wait_applied`.
+    /// Backpressure is unchanged: WAL disk and pending capacity refusals are
+    /// returned here as `AppendFailure::{DiskBudget,PendingCapacity}NotSubmitted`.
+    pub async fn commit(
+        &self,
+        prepared: &PreparedAppend,
+        deadline: Duration,
+    ) -> Result<AcceptedAppend> {
+        ensure!(
+            *prepared.scope == *self.ingress.scope && prepared.meta().bucket == self.bucket(),
+            "prepared annotation belongs to another shard"
+        );
+        let append_phase = match prepared
+            .annotation_kind
+            .context("prepared request is not an annotation write")?
+        {
+            WriteKind::Create => Phase::AnnotationCreateAppend,
+            WriteKind::Patch => Phase::AnnotationPatchAppend,
+        };
+        // No local payload registration: the upload is released when this
+        // returns, so the applier reads the committed record from the WAL.
+        // The uncommitted backlog therefore lives on WAL disk, not in RAM.
+        tokio::time::timeout(
+            deadline,
+            self.shared.phases.measure(
+                Phase::AnnotationAppend,
+                self.shared
+                    .phases
+                    .measure(append_phase, self.append_observed(prepared)),
+            ),
+        )
+        .await
+        .context("annotation commit deadline expired; reconcile the original request")?
+    }
+
+    /// Wait until the applier's Applied cut covers a committed receipt, then
+    /// return its exact outcome. A Rejected outcome is returned as
+    /// `MutationResult::Rejected`; if an earlier request of the same producer
+    /// was rejected, this fails with `PriorRejected` so a later Applied can
+    /// never hide it from a caller that streamed past the rejection. A receipt
+    /// whose producer generation is older than its slot's current generation
+    /// fails with `ReceiptSuperseded`, never Applied.
+    pub async fn wait_applied(
+        &self,
+        accepted: &AcceptedAppend,
+        deadline: Duration,
+    ) -> Result<Completed> {
+        self.ingress.check_receipt(accepted)?;
+        ensure!(
+            accepted.meta.bucket == self.bucket(),
+            "receipt belongs to another shard"
+        );
+        tokio::time::timeout(deadline, async {
+            self.shared
+                .phases
+                .measure(
+                    Phase::AnnotationApplyWait,
+                    self.wait_through(accepted.position.index),
+                )
+                .await?;
+            let slot = slot(&accepted.meta, self.ingress.client.producer_slots())?;
+            self.shared
+                .results
+                .lock()
+                .unwrap()
+                .resolve_streamed(accepted, slot)
+        })
+        .await
+        .context("annotation applied wait deadline expired; wait again")?
     }
 
     pub async fn get(&self, turn: &str, deadline: Duration) -> Result<Option<TurnAnnotation>> {
@@ -1512,11 +1592,15 @@ impl Driver {
                     .lock()
                     .unwrap()
                     .record(pending.index, pending.meta.clone());
-                service.shared.results.lock().unwrap().latest[slot] = Some(Completed {
-                    index: pending.index,
-                    meta: pending.meta,
-                    result,
-                });
+                {
+                    let mut results = service.shared.results.lock().unwrap();
+                    results.record_sticky(slot, pending.index, &pending.meta, &result);
+                    results.latest[slot] = Some(Completed {
+                        index: pending.index,
+                        meta: pending.meta,
+                        result,
+                    });
+                }
                 service.shared.progress.send_replace(Progress {
                     through: pending.index,
                     stopped: false,

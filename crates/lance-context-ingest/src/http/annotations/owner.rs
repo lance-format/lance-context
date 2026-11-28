@@ -39,6 +39,7 @@ impl Owner {
                 post(replace),
             )
             .route("/api/v1/annotations/{table}/update", post(update))
+            .route("/api/v1/annotations/{table}/applied", post(applied))
             .route("/api/v1/annotations/{table}/read", post(read))
             .route("/api/v1/annotations/{table}/read-body", post(read_body))
             .route(
@@ -127,6 +128,11 @@ impl Owner {
         let mut reservation = None;
         let response = if matches!(operation, Operation::Update) {
             let (producer, sequence) = producer(ingress, &self.gate.0.keys, &request)?;
+            let commit_ack = match request.headers().get_all(ACK_MODE).iter().count() {
+                0 => false,
+                1 if request.headers()[ACK_MODE] == ACK_COMMIT => true,
+                _ => return Err(Failure::bad("invalid_ack_mode")),
+            };
             let length = body::length(
                 &request,
                 ingress.scope.contract.max_record_bytes as usize,
@@ -135,7 +141,9 @@ impl Owner {
             // A stalled applier cannot make another proposal immediately
             // visible. Refuse this attempt before receiving or appending it,
             // while keeping reads and control requests available.
-            if self.service.apply_backpressure().is_some() {
+            // Commit-ack requests do not wait for apply, so their backlog is
+            // bounded by the WAL's disk and pending-capacity refusals below.
+            if !commit_ack && self.service.apply_backpressure().is_some() {
                 return Err(Failure::unavailable(
                     "annotation_apply_capacity",
                     "not_submitted",
@@ -184,39 +192,62 @@ impl Owner {
                 .prepare_received(upload, bytes, capacity, &producer, sequence)
                 .await
                 .map_err(|_| Failure::bad("invalid_annotation_ipc"))?;
+            let map_append = |error: anyhow::Error| match error.downcast_ref::<AppendFailure>() {
+                Some(AppendFailure::DiskBudgetNotSubmitted) => {
+                    Failure::unavailable("wal_disk_capacity", "not_submitted")
+                }
+                Some(AppendFailure::PendingCapacityNotSubmitted) => {
+                    Failure::unavailable("request_capacity", "not_submitted")
+                }
+                // This is a committed WAL decision, not a local capacity
+                // guess or an ambiguous transport failure. Exact retained
+                // requests resolve before the WAL checks capacity.
+                Some(AppendFailure::Capacity) => Failure::unavailable("wal_capacity", "rejected"),
+                Some(AppendFailure::Sequence { .. } | AppendFailure::ProducerFenced) => Failure {
+                    status: StatusCode::CONFLICT,
+                    code: "producer_sequence_rejected",
+                    outcome: "rejected",
+                },
+                _ => {
+                    let meta = prepared.meta();
+                    eprintln!(
+                            "annotation mutation outcome unknown: table={} bucket={} producer={} sequence={}: {error:#}",
+                            meta.stream, meta.bucket, meta.producer, meta.sequence
+                        );
+                    Failure::unavailable("annotation_outcome_unknown", "unknown")
+                }
+            };
+            if commit_ack {
+                let accepted = self
+                    .service
+                    .commit(&prepared, options.body_total_timeout)
+                    .await
+                    .map_err(map_append)?;
+                drop(prepared);
+                let receipt = self
+                    .gate
+                    .0
+                    .keys
+                    .encode(&accepted)
+                    .map_err(|_| Failure::unavailable("receipt_unavailable", "unknown"))?;
+                let reply = CommitReply {
+                    receipt,
+                    index: accepted.position().index,
+                    meta: accepted.meta().clone(),
+                };
+                return self
+                    .fenced(
+                        operation,
+                        (StatusCode::ACCEPTED, Json(reply)).into_response(),
+                    )
+                    .await
+                    .map(|response| (response, None));
+            }
             let completion = self
                 .service
                 .submit(&prepared, options.body_total_timeout)
                 .await
-                .map_err(|error| match error.downcast_ref::<AppendFailure>() {
-                    Some(AppendFailure::DiskBudgetNotSubmitted) => {
-                        Failure::unavailable("wal_disk_capacity", "not_submitted")
-                    }
-                    Some(AppendFailure::PendingCapacityNotSubmitted) => {
-                        Failure::unavailable("request_capacity", "not_submitted")
-                    }
-                    // This is a committed WAL decision, not a local capacity
-                    // guess or an ambiguous transport failure. Exact retained
-                    // requests resolve before the WAL checks capacity.
-                    Some(AppendFailure::Capacity) => {
-                        Failure::unavailable("wal_capacity", "rejected")
-                    }
-                    Some(AppendFailure::Sequence { .. } | AppendFailure::ProducerFenced) => {
-                        Failure {
-                            status: StatusCode::CONFLICT,
-                            code: "producer_sequence_rejected",
-                            outcome: "rejected",
-                        }
-                    }
-                    _ => {
-                        let meta = prepared.meta();
-                        eprintln!(
-                            "annotation mutation outcome unknown: table={} bucket={} producer={} sequence={}: {error:#}",
-                            meta.stream, meta.bucket, meta.producer, meta.sequence
-                        );
-                        Failure::unavailable("annotation_outcome_unknown", "unknown")
-                    }
-                })?;
+                .map_err(map_append)?;
             let accepted = AcceptedAppend {
                 scope: ingress.scope.clone(),
                 position: Receipt {
@@ -335,6 +366,51 @@ impl Owner {
                     };
                     Json(reply).into_response()
                 }
+                Operation::Applied => {
+                    let query: AppliedRequest = serde_json::from_slice(&bytes)
+                        .map_err(|_| Failure::bad("invalid_applied_request"))?;
+                    if query.bucket != self.service.bucket() {
+                        return Err(Failure::bad("foreign_applied_shard"));
+                    }
+                    let accepted = ingress
+                        .restore_receipt(&self.gate.0.keys, &query.receipt)
+                        .map_err(|_| Failure::bad("invalid_receipt"))?;
+                    // Bounded per request; the caller simply waits again.
+                    let completion = self
+                        .service
+                        .wait_applied(&accepted, options.body_total_timeout / 2)
+                        .await
+                        .map_err(|error| {
+                            if error.is::<crate::annotations::PriorRejected>() {
+                                Failure {
+                                    status: StatusCode::CONFLICT,
+                                    code: "prior_request_rejected",
+                                    outcome: "rejected",
+                                }
+                            } else if error.is::<crate::annotations::ReceiptSuperseded>() {
+                                Failure {
+                                    status: StatusCode::CONFLICT,
+                                    code: "receipt_superseded",
+                                    outcome: "unknown",
+                                }
+                            } else {
+                                Failure::unavailable("applied_pending", "unknown")
+                            }
+                        })?;
+                    let status = if matches!(completion.result, MutationResult::Applied) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    };
+                    (
+                        status,
+                        Json(MutationReply {
+                            receipt: query.receipt,
+                            completion,
+                        }),
+                    )
+                        .into_response()
+                }
                 Operation::Read => {
                     let point: PointRequest = serde_json::from_slice(&bytes)
                         .map_err(|_| Failure::bad("invalid_point_read"))?;
@@ -418,6 +494,12 @@ impl Owner {
                 Operation::Update => unreachable!(),
             }
         };
+        self.fenced(operation, response)
+            .await
+            .map(|response| (response, reservation))
+    }
+
+    async fn fenced(&self, operation: Operation, response: Response) -> HttpResult<Response> {
         // Reads need one quorum fence after resolving their captured view. A
         // successor cannot restore this owner's epoch, so this rejects both
         // an already stale owner and a takeover during storage IO. Checking
@@ -436,7 +518,7 @@ impl Owner {
                     },
                 )
             })?;
-        Ok((response, reservation))
+        Ok(response)
     }
 }
 
@@ -467,6 +549,13 @@ async fn update(
     request: Request,
 ) -> Response {
     owner.dispatch(table, request, Operation::Update).await
+}
+async fn applied(
+    State(owner): State<Owner>,
+    Path(table): Path<String>,
+    request: Request,
+) -> Response {
+    owner.dispatch(table, request, Operation::Applied).await
 }
 async fn read(State(owner): State<Owner>, Path(table): Path<String>, request: Request) -> Response {
     owner.dispatch(table, request, Operation::Read).await

@@ -100,6 +100,7 @@ impl Forwarder {
                 post(replace),
             )
             .route("/api/v1/annotations/{table}/update", post(update))
+            .route("/api/v1/annotations/{table}/applied", post(applied))
             .route("/api/v1/annotations/{table}/read", post(read))
             .route("/api/v1/annotations/{table}/read-body", post(read_body))
             .route(
@@ -226,6 +227,12 @@ impl Forwarder {
                     return Err(Failure::bad("ambiguous_producer_headers"));
                 }
                 outgoing = outgoing.header(name, request.headers()[name].clone());
+            }
+            // Optional ack mode: forward at most one value unchanged.
+            match request.headers().get_all(ACK_MODE).iter().count() {
+                0 => {}
+                1 => outgoing = outgoing.header(ACK_MODE, request.headers()[ACK_MODE].clone()),
+                _ => return Err(Failure::bad("ambiguous_ack_mode")),
             }
         }
         let idle = options.body_idle_timeout;
@@ -365,6 +372,9 @@ async fn replace(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) 
 }
 async fn update(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Update).await
+}
+async fn applied(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
+    g.dispatch(t, r, Operation::Applied).await
 }
 async fn read(State(g): State<Forwarder>, Path(t): Path<String>, r: Request) -> Response {
     g.dispatch(t, r, Operation::Read).await
