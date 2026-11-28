@@ -3,9 +3,13 @@ use futures::TryStreamExt;
 use lance_context_core::annotation_staging::{ImmutableBodyRead, TurnBodySource};
 
 enum Hold {
-    Staged { _row: mixed::frames::HeldRow },
+    Staged {
+        _row: mixed::frames::HeldRow,
+    },
     /// Owner batch: the staged body was refetched from its WAL record.
-    Refetched { _reservation: MergeReservation },
+    Refetched {
+        _reservation: MergeReservation,
+    },
     Materialized,
 }
 
@@ -25,6 +29,30 @@ impl Body {
 }
 
 impl Service {
+    #[cfg(test)]
+    pub(crate) fn apply_budget_for_test(&self) -> &Arc<MergeMemoryBudget> {
+        &self.apply_budget
+    }
+
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
+    pub(crate) fn pause_body_fetch_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, captured) = tokio::sync::oneshot::channel();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        assert!(self
+            .shared
+            .pause_body_fetch
+            .lock()
+            .unwrap()
+            .replace((entered, wait))
+            .is_none());
+        (captured, resume)
+    }
+
     /// The staged source at `index` was retired from the WAL. Recapture this
     /// owner's installed compatible view and require it to cover `index` for
     /// exactly this table, group and incarnation (the source closure's cut
@@ -53,18 +81,22 @@ impl Service {
             index <= closure.through,
             "unpublished WAL payload unavailable"
         );
-        let materialized = {
+        let covers_index = {
             let _ordered = self.shared.ordered.lock().await;
             self.shared
                 .staging
-                .recapture_immutable_installed(view)
+                .recapture_immutable_installed(view, index)
                 .await?
         };
+        ensure!(
+            covers_index,
+            "installed view does not cover the retired WAL payload"
+        );
         let TurnBodySource::Materialized(base) = view.source() else {
             bail!("installed recapture is not a materialized base")
         };
         ensure!(
-            materialized >= index && base.version().version >= closure.version,
+            base.version().version >= closure.version,
             "installed view does not cover the retired WAL payload"
         );
         Ok(())
@@ -134,17 +166,55 @@ impl Service {
             let mut refetched = None;
             let mut recaptured = false;
             if let Some((source, meta)) = deferred {
+                #[cfg(all(test, feature = "http-client", feature = "service"))]
+                {
+                    let pause = self.shared.pause_body_fetch.lock().unwrap().take();
+                    if let Some((entered, wait)) = pause {
+                        let _ = entered.send(());
+                        wait.await
+                            .context("test released the body fetch gate without resuming")?;
+                    }
+                }
                 // Capture -> Close -> Fetch: publication can retire the WAL
                 // record after the ordered capture. The row is then in the
                 // installed base; recapture it below and read from Lance.
-                match self.refetch_bodies_for_read(source.record_index, meta).await {
-                    Ok(fetched) => refetched = Some((source, fetched)),
-                    Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
-                        self.recapture_retired(&mut view, source.record_index)
-                            .await?;
-                        recaptured = true;
+                let retry_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    match self
+                        .try_refetch_bodies(source.record_index, meta.clone())
+                        .await
+                    {
+                        Ok(Some(fetched)) => {
+                            refetched = Some((source, fetched));
+                            break;
+                        }
+                        Ok(None) => {
+                            // Admission can refuse before the Fetch reaches the
+                            // WAL. Use the already-installed cut when it covers
+                            // the captured record, even if the WAL is unreadable.
+                            if self
+                                .shared
+                                .staging
+                                .recapture_immutable_installed(&mut view, source.record_index)
+                                .await?
+                            {
+                                recaptured = true;
+                                break;
+                            }
+                            ensure!(
+                                tokio::time::Instant::now() < retry_until,
+                                "owner batch body refetch memory unavailable"
+                            );
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
+                            self.recapture_retired(&mut view, source.record_index)
+                                .await?;
+                            recaptured = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
                 }
             }
             let (batch, hold) = if let Some(row) = staged {
@@ -155,8 +225,10 @@ impl Service {
                 let mut found = None;
                 for batch in &bodies {
                     if row < batch.num_rows() {
-                        let original =
-                            RecordBatch::try_new(spec.body_schema().clone(), batch.columns().to_vec())?;
+                        let original = RecordBatch::try_new(
+                            spec.body_schema().clone(),
+                            batch.columns().to_vec(),
+                        )?;
                         ensure!(
                             spec.row_key(&original, row, key.len())? == key,
                             "refetched body row differs from turn origin"

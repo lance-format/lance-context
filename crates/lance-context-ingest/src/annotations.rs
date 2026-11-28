@@ -98,6 +98,13 @@ struct Shared {
     source_generations: Arc<tokio::sync::Semaphore>,
     replay_cut: Mutex<Option<u64>>,
     ordered: tokio::sync::Mutex<()>,
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
+    pause_body_fetch: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// Test-only cap on the full-body key window, in workspace bytes (0: none).
     #[cfg(test)]
     key_window_for_test: std::sync::atomic::AtomicUsize,
@@ -560,6 +567,8 @@ impl Service {
                 source_generations: Arc::new(tokio::sync::Semaphore::new(2)),
                 replay_cut: Mutex::new(None),
                 ordered: tokio::sync::Mutex::new(()),
+                #[cfg(all(test, feature = "http-client", feature = "service"))]
+                pause_body_fetch: Mutex::new(None),
                 #[cfg(test)]
                 key_window_for_test: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
