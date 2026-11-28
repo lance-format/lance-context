@@ -78,7 +78,7 @@ async fn commit_rows(
             continue;
         }
         let keys = match &shared.key_cache {
-            Some(_) => super::key_cache::batch_keys(&part, &shared.key_columns)?,
+            Some(cache) => cache.batch_keys(slot.shard.bucket, &part, &shared.key_columns)?,
             None => Vec::new(),
         };
         commit(shared, slot, encoded, part.num_rows(), keys).await?;

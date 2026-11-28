@@ -241,6 +241,11 @@ impl StreamingProducer {
         for bucket in config.shards.keys() {
             buffer.register(*bucket);
         }
+        if let Some(cache) = &config.key_cache {
+            for (bucket, shard) in &config.shards {
+                cache.check_binding(*bucket, &shard.binding, &config.spec)?;
+            }
+        }
         let key_columns = config.spec.primary_key().to_vec();
         let shared = Arc::new(Shared {
             spec: config.spec,
@@ -305,24 +310,25 @@ impl StreamingProducer {
             batch.schema() == *self.shared.spec.body_schema(),
             "foreign turn body schema"
         );
-        let batch = self.drop_known(batch).await?;
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
         for (bucket, rows) in self.route(&batch)? {
             let part = arrow_select::take::take_record_batch(&batch, &rows)?;
+            let part = self.drop_known(bucket, part).await?;
+            if part.num_rows() == 0 {
+                continue;
+            }
             self.admit(bucket, part).await?;
         }
         Ok(())
     }
 
-    /// Drop rows whose key the applied-key cache already holds, before they
-    /// are routed or buffered. Within-batch duplicates are left to the owner.
-    async fn drop_known(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    /// Drop rows of one routed shard whose scoped key the applied-key cache
+    /// already holds, before they are buffered. Within-batch duplicates are
+    /// left to the owner.
+    async fn drop_known(&self, bucket: u32, batch: RecordBatch) -> Result<RecordBatch> {
         let Some(cache) = self.shared.key_cache.clone() else {
             return Ok(batch);
         };
-        let keys = key_cache::batch_keys(&batch, &self.shared.key_columns)?;
+        let keys = cache.batch_keys(bucket, &batch, &self.shared.key_columns)?;
         let found = tokio::task::spawn_blocking(move || cache.contains_many(&keys)).await??;
         let hits = found.iter().filter(|hit| **hit).count();
         if hits == 0 {
