@@ -35,6 +35,11 @@ impl Service {
     }
 
     #[cfg(all(test, feature = "http-client", feature = "service"))]
+    pub(crate) fn decode_workspace_for_test(&self, bytes: usize) -> Result<usize> {
+        super::super::decode_workspace(&self.ingress.scope.contract, &self.limits, bytes)
+    }
+
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
     pub(crate) fn pause_body_fetch_for_test(
         &self,
     ) -> (
