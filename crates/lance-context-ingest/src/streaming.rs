@@ -423,8 +423,8 @@ impl StreamingProducer {
                 // keys stay in the slot until the outcome is known
             })
             .collect();
-        use futures::StreamExt;
-        let results: Vec<Result<(Arc<LaneSlot>, LaneApplied)>> =
+        use futures::{StreamExt, TryStreamExt};
+        let results: Result<Vec<(Arc<LaneSlot>, LaneApplied)>> =
             futures::stream::iter(touched.into_iter().map(|(slot, latest, records, rows)| {
                 let shared = self.shared.clone();
                 async move {
@@ -447,33 +447,24 @@ impl StreamingProducer {
                 }
             }))
             .buffer_unordered(self.applied_parallelism)
-            .collect()
+            .try_collect()
             .await;
+        let resolved = match results {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // A terminal wait error cancels other read-only waits. Keep
+                // every receipt and poison the producer so a later fence
+                // cannot report success over the unresolved prefix.
+                for slot in &self.lanes {
+                    if let Some(pending) = slot.pending.lock().unwrap().as_mut() {
+                        pending.keys.clear();
+                    }
+                }
+                self.shared.buffer.fail(&error);
+                return Err(error.context("streaming fence: applied wait failed"));
+            }
+        };
         let mut fence = Fence::default();
-        let mut resolved = Vec::new();
-        let mut first_error = None;
-        for result in results {
-            match result {
-                Ok(ok) => resolved.push(ok),
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            // A 409 prior_request_rejected or any wait failure: no key from
-            // this fence's lanes may become a skip. Drop every pending key
-            // (keys are never inserted at commit) but keep the receipts, and
-            // poison the producer so no later fence, empty or not, reports
-            // success over the unresolved prefix.
-            for slot in &self.lanes {
-                if let Some(pending) = slot.pending.lock().unwrap().as_mut() {
-                    pending.keys.clear();
-                }
-            }
-            self.shared.buffer.fail(&error);
-            return Err(error.context("streaming fence: applied wait failed"));
-        }
         let mut cache_updates = Vec::new();
         for (slot, applied) in resolved {
             // Nothing committed after the snapshot: sender lock held.
