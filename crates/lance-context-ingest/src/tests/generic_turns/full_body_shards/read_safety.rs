@@ -437,3 +437,122 @@ async fn publish_and_retire(
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_body_sorted_publication_drains_when_only_one_record_fits() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let input = [body("session", "z", 17)?, body("session", "a", 19)?];
+    let spec = TurnIngestionSpec::new(
+        input[0].schema(),
+        vec!["session_id".into(), "id".into()],
+        "session_id",
+    )?;
+    let shard = Shard::for_session(&layout, &binding(), "session")?;
+    let c = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+    let storage = fixture::storage(root.path(), "sorted-pressure.lance").await?;
+    crate::bootstrap::provision_body_shard(
+        c.client.clone(),
+        layout.clone(),
+        binding(),
+        storage.clone(),
+        Identity {
+            owner: Uuid::new_v4(),
+            acquisition: Uuid::new_v4(),
+            manifest: Uuid::new_v4(),
+        },
+        &fixture::limits(),
+        shard,
+        &spec,
+    )
+    .await?;
+    let physical = Physical {
+        binding: binding(),
+        shard,
+        storage,
+    };
+    let (service, mut runtime) = physical
+        .owner(&c, &layout, &spec, MergeMemoryBudget::new(32 << 20))
+        .await?;
+    let lane = service
+        .open_producer(ProducerOpen {
+            bucket: shard.bucket,
+            slot: 1,
+            expected_generation: 0,
+            operation: Uuid::new_v4(),
+        })
+        .await?;
+
+    let mut cut = 0;
+    let mut wire_bytes = 0;
+    for (offset, batch) in input.iter().enumerate() {
+        let wire = physical.wire(&spec, batch)?;
+        wire_bytes = wire_bytes.max(wire.len());
+        let append = super::super::request(&service, &lane, offset as u64 + 1, wire).await?;
+        let submitted = service.submit(&append, DEADLINE);
+        tokio::pin!(submitted);
+        let receipt = loop {
+            runtime.apply_once_for_test().await?;
+            tokio::select! {
+                result = &mut submitted => break result?,
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+            }
+        };
+        assert_eq!(receipt.result, MutationResult::Applied);
+        cut = receipt.index;
+    }
+    assert_eq!(service.source_observation().records, 2);
+
+    let one = service.decode_workspace_for_test(wire_bytes)?;
+    let headroom = one + one / 2;
+    let budget = service.apply_budget_for_test();
+    let hold = budget
+        .try_reserve(
+            budget
+                .limit()
+                .checked_sub(budget.reserved() + headroom)
+                .context("fixture cannot admit one decoded record")?,
+        )
+        .context("reserve all but one decoded record's workspace")?;
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        publish_and_retire(&c, &physical, &service, &mut runtime, cut, None),
+    )
+    .await
+    .context("sorted publication did not split its over-budget refetch window")??;
+    drop(hold);
+    let (stop, owner) = run_owner(runtime);
+
+    for batch in &input {
+        check(&service, &spec, batch).await?;
+    }
+    let selected = service.selected_full_body(DEADLINE).await?;
+    let handler = p::lance::ManagedManifest::reader(
+        Arc::new(c.client.manifest_catalog()),
+        physical.storage.base.clone(),
+        &layout,
+        selected.table,
+        selected.incarnation,
+    )?;
+    let dataset = lance::dataset::builder::DatasetBuilder::from_uri(&physical.storage.uri)
+        .with_commit_handler(Arc::new(handler))
+        .with_version(selected.manifest.version)
+        .load()
+        .await?;
+    let batch = dataset
+        .scan()
+        .project(&["id"])?
+        .scan_in_order(true)
+        .try_into_batch()
+        .await?;
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(ids.iter().collect::<Vec<_>>(), vec![Some("a"), Some("z")]);
+    let _ = stop.send(());
+    owner.await??;
+    drop(service);
+    c.shutdown().await
+}

@@ -471,7 +471,9 @@ fn uses_index(plan: &dyn ExecutionPlan) -> bool {
     if name.contains("ScalarIndex") || name.contains("MaterializeIndex") {
         return true;
     }
-    plan.children().iter().any(|child| uses_index(child.as_ref()))
+    plan.children()
+        .iter()
+        .any(|child| uses_index(child.as_ref()))
 }
 
 /// Membership needs no row order. Use the native shared task stream so each

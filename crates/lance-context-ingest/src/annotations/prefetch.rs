@@ -138,7 +138,11 @@ pub(super) struct PayloadRetired {
 }
 impl std::fmt::Display for PayloadRetired {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "committed annotation payload {} retired from the WAL", self.index)
+        write!(
+            f,
+            "committed annotation payload {} retired from the WAL",
+            self.index
+        )
     }
 }
 impl std::error::Error for PayloadRetired {}

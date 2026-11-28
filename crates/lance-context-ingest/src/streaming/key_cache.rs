@@ -12,7 +12,10 @@
 //!
 //! Insertion policy (never at send):
 //! - commit ACK: never inserted (a committed record can still be Rejected),
-//! - Applied at a fence: insert every key of the lane's records,
+//! - Applied at a fence: never inserted directly. The lane's keys are staged
+//!   with the Applied WAL index and enter the skip set only through `prove`,
+//!   once a selected full body of the same scope covers that index, i.e. the
+//!   keys are durable in an installed/selected manifest,
 //! - warm: background scan of the canonical Turns table's key columns.
 //! Owner dedup hits are not inserted: the Applied reply does not carry them
 //! and fetching them is not cheap.
@@ -115,6 +118,7 @@ fn batch_keys(scope: &[u8; 16], batch: &RecordBatch, columns: &[String]) -> Resu
 pub enum Reason {
     Commit,
     Applied,
+    Proven,
     Warm,
     OwnerDedup,
 }
@@ -139,6 +143,8 @@ struct Ram {
 
 pub struct AppliedKeyCache {
     capacity: usize,
+    /// Applied keys per shard awaiting a selected-body proof, in WAL order.
+    staged: Mutex<std::collections::BTreeMap<u32, VecDeque<(u64, Vec<Key>)>>>,
     scopes: std::collections::BTreeMap<u32, (Scope, [u8; 16])>,
     ram: Mutex<Ram>,
     #[cfg(feature = "applied-key-cache")]
@@ -150,6 +156,9 @@ pub struct AppliedKeyCache {
 struct CacheMetrics {
     insert_commit: AtomicU64,
     insert_applied: AtomicU64,
+    insert_proven: AtomicU64,
+    staged_keys: AtomicU64,
+    unproven_dropped: AtomicU64,
     insert_warm: AtomicU64,
     insert_owner_dedup: AtomicU64,
     removed_rejected: AtomicU64,
@@ -178,6 +187,12 @@ pub struct WarmProgress {
 pub struct CacheSnapshot {
     pub insert_commit: u64,
     pub insert_applied: u64,
+    /// Keys inserted after a selected-body proof covered their Applied index.
+    pub insert_proven: u64,
+    /// Applied keys currently awaiting a selected-body proof.
+    pub staged_keys: u64,
+    /// Applied keys dropped unproven (staging bound exceeded).
+    pub unproven_dropped: u64,
     pub insert_warm: u64,
     pub insert_owner_dedup: u64,
     pub removed_rejected: u64,
@@ -215,7 +230,11 @@ impl AppliedKeyCache {
         }
         #[cfg(feature = "applied-key-cache")]
         let disk = match &config.disk_dir {
-            Some(dir) => Some(open_disk(dir, &config, &serde_json::to_vec(&config.scopes)?)?),
+            Some(dir) => Some(open_disk(
+                dir,
+                &config,
+                &serde_json::to_vec(&config.scopes)?,
+            )?),
             None => None,
         };
         #[cfg(not(feature = "applied-key-cache"))]
@@ -225,6 +244,7 @@ impl AppliedKeyCache {
         );
         Ok(Self {
             capacity: config.ram_keys,
+            staged: Mutex::default(),
             scopes,
             ram: Mutex::default(),
             #[cfg(feature = "applied-key-cache")]
@@ -240,7 +260,12 @@ impl AppliedKeyCache {
     }
 
     /// Scoped keys of every row of a batch routed to `bucket`.
-    pub fn batch_keys(&self, bucket: u32, batch: &RecordBatch, columns: &[String]) -> Result<Vec<Key>> {
+    pub fn batch_keys(
+        &self,
+        bucket: u32,
+        batch: &RecordBatch,
+        columns: &[String],
+    ) -> Result<Vec<Key>> {
         batch_keys(&self.scope(bucket)?.1, batch, columns)
     }
 
@@ -268,6 +293,7 @@ impl AppliedKeyCache {
         let counter = match reason {
             Reason::Commit => &self.metrics.insert_commit,
             Reason::Applied => &self.metrics.insert_applied,
+            Reason::Proven => &self.metrics.insert_proven,
             Reason::Warm => &self.metrics.insert_warm,
             Reason::OwnerDedup => &self.metrics.insert_owner_dedup,
         };
@@ -281,7 +307,9 @@ impl AppliedKeyCache {
             }
             let mut evicted = 0;
             while ram.map.len() > self.capacity {
-                let Some(old) = ram.order.pop_front() else { break };
+                let Some(old) = ram.order.pop_front() else {
+                    break;
+                };
                 if ram.map.remove(&old).is_some() {
                     evicted += 1;
                 }
@@ -307,9 +335,89 @@ impl AppliedKeyCache {
         Ok(())
     }
 
+    /// Stage keys whose lane outcome at WAL `index` was Applied. They are not
+    /// skips yet: Applied is not durable publication. The staging set is
+    /// bounded by the RAM tier capacity; the oldest unproven keys are dropped
+    /// (owner dedup stays authoritative for them).
+    pub fn stage_applied(&self, shard: u32, index: u64, keys: Vec<Key>) -> Result<()> {
+        self.scope(shard)?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut staged = self.staged.lock().unwrap();
+        let added = keys.len() as u64;
+        staged.entry(shard).or_default().push_back((index, keys));
+        let mut total = self.metrics.staged_keys.fetch_add(added, Relaxed) + added;
+        while total > self.capacity as u64 {
+            let Some(queue) = staged.values_mut().max_by_key(|q| q.len()) else {
+                break;
+            };
+            let Some((_, old)) = queue.pop_front() else {
+                break;
+            };
+            let n = old.len() as u64;
+            total -= n;
+            self.metrics.staged_keys.fetch_sub(n, Relaxed);
+            self.metrics.unproven_dropped.fetch_add(n, Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Insert staged keys of `shard` whose Applied index the verified selected
+    /// full body covers. `selected` must be this shard's scope (table,
+    /// incarnation, bucket); otherwise nothing is inserted. Blocking when the
+    /// disk tier is enabled.
+    pub fn prove(
+        &self,
+        shard: u32,
+        selected: &crate::annotations::single_body::SelectedBody,
+    ) -> Result<u64> {
+        let (scope, _) = self.scope(shard)?;
+        anyhow::ensure!(
+            selected.table == scope.table
+                && selected.incarnation == scope.incarnation
+                && selected.source.shard == shard,
+            "applied-key proof is not this shard's selected identity"
+        );
+        let proven: Vec<Key> = {
+            let mut staged = self.staged.lock().unwrap();
+            let Some(queue) = staged.get_mut(&shard) else {
+                return Ok(0);
+            };
+            let mut keys = Vec::new();
+            while queue
+                .front()
+                .is_some_and(|(index, _)| *index <= selected.through)
+            {
+                keys.extend(queue.pop_front().unwrap().1);
+            }
+            self.metrics
+                .staged_keys
+                .fetch_sub(keys.len() as u64, Relaxed);
+            keys
+        };
+        self.insert(&proven, Reason::Proven)?;
+        Ok(proven.len() as u64)
+    }
+
+    /// Drop staged, unproven keys of the given shards (failed fence).
+    pub fn discard_staged(&self) {
+        let mut staged = self.staged.lock().unwrap();
+        let n: usize = staged
+            .values()
+            .flat_map(|q| q.iter())
+            .map(|(_, k)| k.len())
+            .sum();
+        staged.clear();
+        self.metrics.staged_keys.fetch_sub(n as u64, Relaxed);
+        self.metrics.unproven_dropped.fetch_add(n as u64, Relaxed);
+    }
+
     /// Remove keys of a record later reported Rejected.
     pub fn remove(&self, keys: &[Key]) -> Result<()> {
-        self.metrics.removed_rejected.fetch_add(keys.len() as u64, Relaxed);
+        self.metrics
+            .removed_rejected
+            .fetch_add(keys.len() as u64, Relaxed);
         {
             let mut ram = self.ram.lock().unwrap();
             for key in keys {
@@ -332,7 +440,9 @@ impl AppliedKeyCache {
     pub fn contains_many(&self, keys: &[Key]) -> Result<Vec<bool>> {
         let mut found = {
             let ram = self.ram.lock().unwrap();
-            keys.iter().map(|key| ram.map.contains_key(key)).collect::<Vec<_>>()
+            keys.iter()
+                .map(|key| ram.map.contains_key(key))
+                .collect::<Vec<_>>()
         };
         let ram_hits = found.iter().filter(|hit| **hit).count() as u64;
         self.metrics.ram_hits.fetch_add(ram_hits, Relaxed);
@@ -363,6 +473,9 @@ impl AppliedKeyCache {
         CacheSnapshot {
             insert_commit: m.insert_commit.load(Relaxed),
             insert_applied: m.insert_applied.load(Relaxed),
+            insert_proven: m.insert_proven.load(Relaxed),
+            staged_keys: m.staged_keys.load(Relaxed),
+            unproven_dropped: m.unproven_dropped.load(Relaxed),
             insert_warm: m.insert_warm.load(Relaxed),
             insert_owner_dedup: m.insert_owner_dedup.load(Relaxed),
             removed_rejected: m.removed_rejected.load(Relaxed),

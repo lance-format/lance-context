@@ -202,7 +202,10 @@ impl StreamingProducer {
     /// Reserve every lane's fixed slot, then start one task per lane. Resume
     /// recovered journal intents on the clients before opening.
     pub fn open(config: Config) -> Result<Self> {
-        ensure!(!config.shards.is_empty(), "streaming producer has no shards");
+        ensure!(
+            !config.shards.is_empty(),
+            "streaming producer has no shards"
+        );
         ensure!(config.applied_parallelism > 0, "zero applied parallelism");
         let first = &config.shards.values().next().unwrap().binding;
         let (tenant, table) = (first.tenant.clone(), first.qualified_table.clone());
@@ -328,11 +331,13 @@ impl StreamingProducer {
         let keys = cache.batch_keys(bucket, &batch, &self.shared.key_columns)?;
         let found = tokio::task::spawn_blocking(move || cache.contains_many(&keys)).await??;
         let hits = found.iter().filter(|hit| **hit).count();
+        self.shared.metrics.cache_lookup(hits, found.len() - hits);
         if hits == 0 {
             return Ok(batch);
         }
         self.shared.metrics.dropped_known(hits);
-        let keep = arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
+        let keep =
+            arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
         Ok(arrow_select::filter::filter_record_batch(&batch, &keep)?)
     }
 
@@ -346,9 +351,10 @@ impl StreamingProducer {
             .context("invalid routing column")?;
         let mut groups = BTreeMap::<u32, Vec<u32>>::new();
         for row in 0..batch.num_rows() {
-            let bucket = shared
-                .layout
-                .session_bucket(&shared.tenant, &shared.table, sessions.value(row))?;
+            let bucket =
+                shared
+                    .layout
+                    .session_bucket(&shared.tenant, &shared.table, sessions.value(row))?;
             ensure!(
                 shared.buffer.has_shard(bucket),
                 "turn routed to unconfigured shard {bucket}"
@@ -424,11 +430,11 @@ impl StreamingProducer {
                 let shared = self.shared.clone();
                 async move {
                     let started = std::time::Instant::now();
-                    let reply = lane::retry(&shared, || {
-                        slot.client.wait_applied(slot.key, &latest)
-                    })
-                    .await;
-                    shared.metrics.applied_wait(started.elapsed(), reply.is_ok());
+                    let reply =
+                        lane::retry(&shared, || slot.client.wait_applied(slot.key, &latest)).await;
+                    shared
+                        .metrics
+                        .applied_wait(started.elapsed(), reply.is_ok());
                     let reply = reply?;
                     Ok((
                         slot.clone(),
@@ -472,9 +478,20 @@ impl StreamingProducer {
         let mut cache_updates = Vec::new();
         for (slot, applied) in resolved {
             // Nothing committed after the snapshot: sender lock held.
-            let keys = slot.pending.lock().unwrap().take().map(|p| p.keys).unwrap_or_default();
+            let keys = slot
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .map(|p| p.keys)
+                .unwrap_or_default();
             let applied_ok = applied.reply.completion.result == MutationResult::Applied;
-            cache_updates.push((keys, applied_ok));
+            cache_updates.push((
+                slot.shard.bucket,
+                applied.reply.completion.index,
+                keys,
+                applied_ok,
+            ));
             fence
                 .shards
                 .entry(slot.shard.bucket)
@@ -486,25 +503,22 @@ impl StreamingProducer {
                 .push(applied);
         }
         // The cut is recorded above and is returned regardless. The cache is
-        // best-effort: a failed update cannot lose this fence's cut, but a
-        // missed remove could leave a stale skip, so any failure permanently
-        // fails the producer and no later fence can report success over it.
+        // best-effort: a failed update cannot lose this fence's cut, but any
+        // failure permanently fails the producer and no later fence can
+        // report success over it. Applied keys are only STAGED here; they
+        // become skips via `AppliedKeyCache::prove` once a selected full body
+        // covers their WAL index. A non-Applied outcome stages nothing.
         if let Some(cache) = self.shared.key_cache.clone() {
-            let update = tokio::task::spawn_blocking(move || -> Result<()> {
-                for (keys, applied_ok) in cache_updates {
+            let update = (|| -> Result<()> {
+                for (bucket, index, keys, applied_ok) in cache_updates {
                     if applied_ok {
-                        cache.insert(&keys, key_cache::Reason::Applied)?;
+                        cache.stage_applied(bucket, index, keys)?;
                     } else {
-                        // The latest outcome covers the lane's records since
-                        // the previous fence: drop their commit-time inserts.
-                        cache.remove(&keys)?;
+                        self.shared.metrics.unproven_skipped(keys.len());
                     }
                 }
                 Ok(())
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("key cache update task: {error}"))
-            .and_then(|result| result);
+            })();
             if let Err(error) = update {
                 let error = error.context("streaming fence: key cache update failed");
                 self.shared.buffer.fail(&error);

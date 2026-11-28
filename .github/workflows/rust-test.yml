@@ -418,6 +418,7 @@ jobs:
           cargo clippy -p lance-context-ingest --features service,http-client --all-targets -- -D warnings
           cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_http -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::mixed_annotations -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client --lib tests::generic_turns::full_body_shards::read_safety::full_body_sorted_publication_drains_when_only_one_record_fits -- --exact
           cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::advance -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::close -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_runtime::lost_advance -- --test-threads=1

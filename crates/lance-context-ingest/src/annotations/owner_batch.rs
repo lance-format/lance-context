@@ -13,9 +13,9 @@
 //! 3. **Write** (`WriteBatch` + the publisher): ordered apply records only
 //!    the surviving `(record, row)` ordinals of each committed request. The
 //!    list spills to a caller directory (e.g. a PVC) when large. Publication
-//!    streams it back by refetching bodies from the WAL for survivors only,
-//!    clusters each bounded chunk by `(session_id, id)`, and writes ONE
-//!    fragment per published batch.
+//!    external-sorts survivor keys by `(session_id, id)` across the whole
+//!    frozen batch, refetches bodies from the WAL in key order, and writes
+//!    ONE globally ordered fragment per published batch.
 //!
 //! Exactness is unchanged: ordered apply under the staging mutation gate
 //! still decides first create per shard, and keys staged by earlier,
@@ -48,10 +48,10 @@ pub struct Options {
     /// addition to the publisher's existing source byte/record/wait triggers.
     pub target_rows: u64,
     /// Bound on decoded WAL payload bytes refetched together during
-    /// publication. Each such chunk is clustered independently.
+    /// publication. Output order is global regardless of this bound.
     pub refetch_bytes: u64,
-    /// Cluster a refetched chunk by `(session_id, id)` once it holds at
-    /// least this many rows; smaller chunks keep WAL order.
+    /// Retained for configuration compatibility. Publication now always
+    /// orders the whole frozen batch by `(session_id, id)`.
     pub cluster_rows: usize,
 }
 
@@ -158,7 +158,9 @@ impl WriteBatch {
     pub(super) fn record(&mut self, survivors: Survivors) -> Result<()> {
         self.active.rows += survivors.rows.len() as u64;
         if !survivors.rows.is_empty() {
-            self.active.metas.insert(survivors.index, survivors.meta.clone());
+            self.active
+                .metas
+                .insert(survivors.index, survivors.meta.clone());
         }
         self.active.ram_bytes += survivors.ram_bytes();
         self.active.ram.push(survivors);
@@ -224,12 +226,16 @@ impl WriteBatch {
         self.active
             .metas
             .get(&index)
-            .or_else(|| self.frozen.as_ref().and_then(|f| f.segment.metas.get(&index)))
+            .or_else(|| {
+                self.frozen
+                    .as_ref()
+                    .and_then(|f| f.segment.metas.get(&index))
+            })
             .cloned()
     }
 }
 
-fn spill(dir: &Path, survivors: &[Survivors]) -> Result<SpillFile> {
+fn spill<T: Serialize>(dir: &Path, survivors: &[T]) -> Result<SpillFile> {
     let path = dir.join(format!("{}.jsonl", Uuid::new_v4()));
     let file = std::fs::File::create(&path)
         .with_context(|| format!("create write batch spill {}", path.display()))?;
@@ -438,10 +444,16 @@ impl Service {
         Ok(Some((bodies, pending._reservation)))
     }
 
-    /// Stream exactly the frozen survivors in the stored full-body schema.
-    /// Bodies are refetched from the WAL in bounded chunks; each chunk at or
-    /// above `cluster_rows` is regrouped by `(session_id, id)` before it is
-    /// handed to the single-fragment writer.
+    /// Stream exactly the frozen survivors in the stored full-body schema,
+    /// ordered by `(session_id, id)` across the WHOLE frozen batch.
+    ///
+    /// Pass 1 refetches one committed record at a time, extracts the keys of
+    /// its survivors and releases the body at once. Keys and ordinals form
+    /// sorted runs bounded by `spill_bytes`, spilled to the write batch's spill
+    /// directory. Pass 2 k-way merges the runs and refetches bodies in key
+    /// order, in windows of at most `refetch_bytes` of distinct records. Under
+    /// apply-memory pressure, emit the prefix that fits as a smaller Arrow
+    /// batch and continue with its suffix in the same sorted fragment.
     pub(super) fn survivor_stream(
         &self,
         frozen: Arc<Frozen>,
@@ -453,23 +465,19 @@ impl Service {
             .clone()
             .context("missing body spec")?;
         let schema = single_body::storage_schema(&spec)?;
-        let options = self
-            .shared
-            .write_batch
-            .lock()
-            .unwrap()
-            .as_ref()
-            .context("owner batch pipeline disabled")?
-            .options
-            .clone();
+        let (options, dir) = {
+            let guard = self.shared.write_batch.lock().unwrap();
+            let batch = guard.as_ref().context("owner batch pipeline disabled")?;
+            (batch.options.clone(), batch.dir.clone())
+        };
         let service = self.clone();
         let value_bytes = self.limits.value_bytes;
         let stream_schema = schema.clone();
         let stream = async_stream::try_stream! {
             let schema = stream_schema;
+            // Pass 1: sorted key runs.
+            let mut runs = KeyRuns::new(dir.clone(), options.spill_bytes);
             let mut seen = BTreeMap::<u64, u32>::new();
-            let mut chunk = Vec::<(Survivors, Vec<RecordBatch>, MergeReservation)>::new();
-            let mut chunk_bytes = 0u64;
             let mut files = frozen.segment.spilled.iter();
             let mut ram = Some(&frozen.segment.ram);
             loop {
@@ -485,48 +493,292 @@ impl Service {
                     if survivors.rows.is_empty() {
                         continue;
                     }
-                    // Never wait for apply memory while this chunk holds
-                    // some: flush it first so its reservations are released.
-                    let (bodies, reservation) = loop {
-                        let fetched = service.try_refetch_bodies(survivors.index, survivors.meta.clone())
-                            .await
-                            .map_err(external)?;
-                        if let Some(bodies) = fetched {
-                            break bodies;
-                        }
-                        if chunk.is_empty() {
-                            tokio::time::sleep(Duration::from_millis(5)).await;
-                        } else {
-                            let batch = cluster(&service, &spec, &schema, std::mem::take(&mut chunk), options.cluster_rows, value_bytes).map_err(external)?;
-                            chunk_bytes = 0;
-                            for batch in batch { yield batch; }
-                        }
-                    };
+                    // Holds nothing while waiting, so waiting cannot deadlock.
+                    let (bodies, reservation) =
+                        refetch_waiting(&service, survivors.index, &survivors.meta).await.map_err(external)?;
                     {
                         let mut metrics = service.shared.batch_metrics.lock().unwrap();
                         metrics.observed.refetched_records += 1;
                         metrics.observed.refetched_bytes += survivors.meta.body_bytes;
                     }
-                    *seen.entry(survivors.index).or_default() += survivors.rows.len() as u32;
-                    chunk_bytes += survivors.meta.body_bytes;
-                    chunk.push((survivors, bodies, reservation));
-                    if chunk_bytes >= options.refetch_bytes {
-                        let batch = cluster(&service, &spec, &schema, std::mem::take(&mut chunk), options.cluster_rows, value_bytes).map_err(external)?;
-                        chunk_bytes = 0;
-                        for batch in batch { yield batch; }
+                    let body = spec.body_schema().clone();
+                    let mut locate = Locate::new(&bodies);
+                    for &row in &survivors.rows {
+                        let (b, local) = locate.at(row).map_err(external)?;
+                        let original = RecordBatch::try_new(body.clone(), bodies[b].columns().to_vec())
+                            .map_err(|e| external(e.into()))?;
+                        let id = spec.row_key(&original, local, value_bytes).map_err(external)?;
+                        let routing = spec.routing_key(&id).map_err(external)?;
+                        runs.push(SortKey { routing, id, index: survivors.index, row }).map_err(external)?;
                     }
+                    *seen.entry(survivors.index).or_default() += survivors.rows.len() as u32;
+                    drop(bodies);
+                    drop(reservation);
                 }
             }
-            let batch = cluster(&service, &spec, &schema, chunk, options.cluster_rows, value_bytes).map_err(external)?;
-            for batch in batch { yield batch; }
             if seen != expected {
                 Err::<(), _>(external(anyhow::anyhow!(
                     "owner write batch differs from frozen first-create rows"
                 )))?;
             }
+            // Pass 2: merge runs, refetch bodies in key order.
+            let mut merge = runs.finish().map_err(external)?;
+            let mut pending: Option<SortKey> = None;
+            loop {
+                let mut window = Vec::<(u64, u32)>::new();
+                let mut records = BTreeMap::<u64, BatchMeta>::new();
+                let mut bytes = 0u64;
+                loop {
+                    let next = match pending.take() {
+                        Some(key) => Some(key),
+                        None => merge.next().map_err(external)?,
+                    };
+                    let Some(key) = next else { break };
+                    if !records.contains_key(&key.index) {
+                        let meta = frozen
+                            .segment
+                            .metas
+                            .get(&key.index)
+                            .cloned()
+                            .context("survivor metadata missing")
+                            .map_err(external)?;
+                        if !records.is_empty() && bytes + meta.body_bytes > options.refetch_bytes {
+                            pending = Some(key);
+                            break;
+                        }
+                        bytes += meta.body_bytes;
+                        records.insert(key.index, meta);
+                    }
+                    window.push((key.index, key.row));
+                }
+                if window.is_empty() {
+                    break;
+                }
+                let mut start = 0;
+                while start < window.len() {
+                    let (fetched, admitted) = fetch_window_prefix(&service, &records, &window[start..])
+                        .await
+                        .map_err(external)?;
+                    let end = start + admitted;
+                    let batch = gather(&schema, &fetched, &window[start..end]).map_err(external)?;
+                    service.shared.batch_metrics.lock().unwrap().observed.clustered_chunks += 1;
+                    drop(fetched);
+                    start = end;
+                    yield batch;
+                }
+            }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
+}
+
+/// One survivor's global sort key and source ordinal.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct SortKey {
+    routing: String,
+    id: String,
+    index: u64,
+    row: u32,
+}
+impl SortKey {
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.routing.len() + self.id.len()
+    }
+}
+
+/// Sorted key runs: in RAM up to `limit` bytes, then spilled to `dir`.
+struct KeyRuns {
+    dir: Option<PathBuf>,
+    limit: usize,
+    current: Vec<SortKey>,
+    current_bytes: usize,
+    files: Vec<SpillFile>,
+}
+impl KeyRuns {
+    fn new(dir: Option<PathBuf>, limit: usize) -> Self {
+        Self {
+            dir,
+            limit,
+            current: Vec::new(),
+            current_bytes: 0,
+            files: Vec::new(),
+        }
+    }
+    fn push(&mut self, key: SortKey) -> Result<()> {
+        self.current_bytes += key.bytes();
+        self.current.push(key);
+        if self.current_bytes >= self.limit {
+            if let Some(dir) = &self.dir {
+                let mut run = std::mem::take(&mut self.current);
+                self.current_bytes = 0;
+                run.sort_unstable();
+                self.files.push(spill(dir, &run)?);
+            }
+        }
+        Ok(())
+    }
+    fn finish(mut self) -> Result<KeyMerge> {
+        self.current.sort_unstable();
+        let mut sources = Vec::with_capacity(self.files.len() + 1);
+        for file in &self.files {
+            let reader = std::io::BufReader::new(
+                std::fs::File::open(&file.path)
+                    .with_context(|| format!("open key run {}", file.path.display()))?,
+            );
+            sources.push(RunSource::File(reader.lines()));
+        }
+        sources.push(RunSource::Ram(
+            std::mem::take(&mut self.current).into_iter(),
+        ));
+        let mut merge = KeyMerge {
+            _files: self.files,
+            sources,
+            heap: std::collections::BinaryHeap::new(),
+        };
+        for at in 0..merge.sources.len() {
+            merge.refill(at)?;
+        }
+        Ok(merge)
+    }
+}
+
+enum RunSource {
+    File(std::io::Lines<std::io::BufReader<std::fs::File>>),
+    Ram(std::vec::IntoIter<SortKey>),
+}
+
+/// K-way merge of sorted runs; run files are removed when it drops.
+struct KeyMerge {
+    _files: Vec<SpillFile>,
+    sources: Vec<RunSource>,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(SortKey, usize)>>,
+}
+impl KeyMerge {
+    fn refill(&mut self, at: usize) -> Result<()> {
+        let next = match &mut self.sources[at] {
+            RunSource::File(lines) => match lines.next() {
+                Some(line) => Some(serde_json::from_str(&line?)?),
+                None => None,
+            },
+            RunSource::Ram(keys) => keys.next(),
+        };
+        if let Some(key) = next {
+            self.heap.push(std::cmp::Reverse((key, at)));
+        }
+        Ok(())
+    }
+    fn next(&mut self) -> Result<Option<SortKey>> {
+        let Some(std::cmp::Reverse((key, at))) = self.heap.pop() else {
+            return Ok(None);
+        };
+        self.refill(at)?;
+        Ok(Some(key))
+    }
+}
+
+/// Map a record-level row ordinal to (batch, local row).
+struct Locate {
+    ends: Vec<u32>,
+}
+impl Locate {
+    fn new(bodies: &[RecordBatch]) -> Self {
+        let mut end = 0u32;
+        Self {
+            ends: bodies
+                .iter()
+                .map(|b| {
+                    end += b.num_rows() as u32;
+                    end
+                })
+                .collect(),
+        }
+    }
+    fn at(&mut self, row: u32) -> Result<(usize, usize)> {
+        let b = self.ends.partition_point(|end| *end <= row);
+        ensure!(
+            b < self.ends.len(),
+            "write batch survivor exceeds its source rows"
+        );
+        let start = if b == 0 { 0 } else { self.ends[b - 1] };
+        Ok((b, (row - start) as usize))
+    }
+}
+
+async fn refetch_waiting(
+    service: &Service,
+    index: u64,
+    meta: &BatchMeta,
+) -> Result<(Vec<RecordBatch>, MergeReservation)> {
+    loop {
+        if let Some(fetched) = service.try_refetch_bodies(index, meta.clone()).await? {
+            return Ok(fetched);
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Fetch a contiguous prefix of the sorted rows, keeping the decoded bodies
+/// for that prefix until the caller has formed its output batch. Only the
+/// first record can wait for admission, when the prefix holds no reservation.
+async fn fetch_window_prefix(
+    service: &Service,
+    records: &BTreeMap<u64, BatchMeta>,
+    sorted: &[(u64, u32)],
+) -> Result<(BTreeMap<u64, (Vec<RecordBatch>, MergeReservation)>, usize)> {
+    let mut held = BTreeMap::new();
+    let mut admitted = 0;
+    let mut fetched_bytes = 0;
+    for &(index, _) in sorted {
+        if let std::collections::btree_map::Entry::Vacant(entry) = held.entry(index) {
+            let meta = records
+                .get(&index)
+                .context("sorted source record missing")?;
+            let fetched = if admitted == 0 {
+                refetch_waiting(service, index, meta).await?
+            } else {
+                let Some(fetched) = service.try_refetch_bodies(index, meta.clone()).await? else {
+                    break;
+                };
+                fetched
+            };
+            fetched_bytes += meta.body_bytes;
+            entry.insert(fetched);
+        }
+        admitted += 1;
+    }
+    let mut metrics = service.shared.batch_metrics.lock().unwrap();
+    metrics.observed.refetched_records += held.len() as u64;
+    metrics.observed.refetched_bytes += fetched_bytes;
+    Ok((held, admitted))
+}
+
+/// Copy the window's rows, in key order, into one storage-schema batch.
+fn gather(
+    schema: &SchemaRef,
+    fetched: &BTreeMap<u64, (Vec<RecordBatch>, MergeReservation)>,
+    window: &[(u64, u32)],
+) -> Result<RecordBatch> {
+    let mut batches = Vec::<RecordBatch>::new();
+    let mut base = BTreeMap::<u64, (usize, Locate)>::new();
+    for (&index, (bodies, _)) in fetched {
+        base.insert(index, (batches.len(), Locate::new(bodies)));
+        for batch in bodies {
+            batches.push(RecordBatch::try_new(
+                schema.clone(),
+                batch.columns().to_vec(),
+            )?);
+        }
+    }
+    let order = window
+        .iter()
+        .map(|(index, row)| {
+            let (first, locate) = base.get_mut(index).context("window record missing")?;
+            let (b, local) = locate.at(*row)?;
+            Ok((*first + b, local))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let refs = batches.iter().collect::<Vec<_>>();
+    Ok(interleave_record_batch(&refs, &order)?)
 }
 
 pub(super) enum Stage {
@@ -536,93 +788,4 @@ pub(super) enum Stage {
 
 fn external(error: anyhow::Error) -> DataFusionError {
     DataFusionError::External(error.into())
-}
-
-/// Select survivors from one refetched chunk and, when large enough, group
-/// them by `(session_id, id)`. This is a per-chunk sort, not a global one.
-fn cluster(
-    service: &Service,
-    spec: &crate::turn_ingestion::TurnIngestionSpec,
-    schema: &SchemaRef,
-    chunk: Vec<(Survivors, Vec<RecordBatch>, MergeReservation)>,
-    cluster_rows: usize,
-    value_bytes: usize,
-) -> Result<Vec<RecordBatch>> {
-    let mut selected = Vec::<RecordBatch>::new();
-    for (survivors, bodies, _reservation) in &chunk {
-        let mut remaining = survivors.rows.iter().copied().peekable();
-        let mut offset = 0u32;
-        for batch in bodies {
-            let end = offset + batch.num_rows() as u32;
-            let mut run: Option<(u32, u32)> = None;
-            while let Some(row) = remaining.next_if(|row| *row < end) {
-                match &mut run {
-                    Some((_, last)) if row == *last + 1 => *last = row,
-                    _ => {
-                        if let Some((first, last)) = run.take() {
-                            selected.push(
-                                batch.slice((first - offset) as usize, (last - first + 1) as usize),
-                            );
-                        }
-                        run = Some((row, row));
-                    }
-                }
-            }
-            if let Some((first, last)) = run {
-                selected.push(batch.slice((first - offset) as usize, (last - first + 1) as usize));
-            }
-            offset = end;
-        }
-        ensure!(
-            remaining.next().is_none(),
-            "write batch survivor exceeds its source rows"
-        );
-    }
-    let rows = selected.iter().map(RecordBatch::num_rows).sum::<usize>();
-    if rows == 0 {
-        return Ok(Vec::new());
-    }
-    let selected = selected
-        .into_iter()
-        .map(|batch| Ok(RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?))
-        .collect::<Result<Vec<_>>>()?;
-    if rows < cluster_rows {
-        // No clustering: the survivor runs are already in source order. Hand
-        // the zero-copy slices straight to the fragment writer instead of a
-        // per-row interleave copy.
-        drop(chunk);
-        return Ok(selected);
-    }
-    let mut order = Vec::with_capacity(rows);
-    for (b, batch) in selected.iter().enumerate() {
-        for row in 0..batch.num_rows() {
-            order.push((b, row));
-        }
-    }
-    {
-        let body = spec.body_schema().clone();
-        let mut keyed = order
-            .into_iter()
-            .map(|(b, row)| {
-                let original = RecordBatch::try_new(body.clone(), selected[b].columns().to_vec())?;
-                let id = spec.row_key(&original, row, value_bytes)?;
-                Ok(((spec.routing_key(&id)?, id), (b, row)))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        order = keyed.into_iter().map(|(_, at)| at).collect();
-        service
-            .shared
-            .batch_metrics
-            .lock()
-            .unwrap()
-            .observed
-            .clustered_chunks += 1;
-    }
-    let refs = selected.iter().collect::<Vec<_>>();
-    // Copies only the surviving rows of this chunk; the refetched bodies and
-    // their reservations are released when `chunk` drops below.
-    let batch = interleave_record_batch(&refs, &order)?;
-    drop(chunk);
-    Ok(vec![batch])
 }

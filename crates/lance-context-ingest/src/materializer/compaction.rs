@@ -1,6 +1,7 @@
 //! Rewrite bounded small-file groups through the existing managed publication.
 //! Old files remain available to captured snapshots; this does not run object GC.
 use super::*;
+use datafusion_common::DataFusionError;
 use lance::dataset::{
     optimize::{CompactionMode, CompactionOptions, CompactionTask, RewriteResult, TaskData},
     transaction::{Operation, RewriteGroup, Transaction},
@@ -294,6 +295,35 @@ pub(crate) async fn prepare_task(
     Ok(Some(task))
 }
 
+/// Retry an exhausted sorted rewrite without sorting the same captured inputs.
+/// Both executions precede durable preparation, so only a completed rewrite
+/// can be selected. Existing reclamation handles any files left unselected.
+pub(crate) async fn execute_rewrite(
+    mut task: CompactionTask,
+    dataset: &Dataset,
+) -> Result<RewriteResult> {
+    let error = match task.execute(dataset).await {
+        Ok(result) => return Ok(result),
+        Err(error) => anyhow::Error::from(error),
+    };
+    if task.options.sort_by.is_empty()
+        || !error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<DataFusionError>(),
+                Some(DataFusionError::ResourcesExhausted(_))
+            )
+        })
+    {
+        return Err(error);
+    }
+    task.options.sort_by.clear();
+    task.options.sort_memory_bytes = None;
+    task.options.compaction_mode = Some(CompactionMode::TryBinaryCopy);
+    task.execute(dataset)
+        .await
+        .context("compaction without sorting after sorted rewrite exhausted resources")
+}
+
 pub(super) async fn prepare(
     publisher: &Publisher,
     pending: &p::PendingPlan,
@@ -338,7 +368,7 @@ pub(super) async fn prepare(
         let mut result = phases
             .measure(
                 Phase::BlobWrite,
-                phases.measure(Phase::NativeCompaction, task.execute(&dataset)),
+                phases.measure(Phase::NativeCompaction, execute_rewrite(task, &dataset)),
             )
             .await?;
         // The catalog fixes the read and target versions and fences other
@@ -416,7 +446,7 @@ pub(crate) async fn prepare_body_dataset(
         let mut result = phases
             .measure(
                 Phase::BlobWrite,
-                phases.measure(Phase::NativeBodyCompaction, task.execute(&dataset)),
+                phases.measure(Phase::NativeBodyCompaction, execute_rewrite(task, &dataset)),
             )
             .await?;
         // The catalog fixes the read and target versions and fences other
