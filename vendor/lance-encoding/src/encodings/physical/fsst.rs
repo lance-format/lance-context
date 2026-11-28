@@ -196,6 +196,7 @@ impl PerValueCompressor for FsstPerValueEncoder {
 
 #[derive(Debug)]
 pub struct FsstPerValueDecompressor {
+    native_memory: lance_core::memory::NativeMemory,
     symbol_table: LanceBuffer,
     inner_decompressor: Box<dyn VariablePerValueDecompressor>,
 }
@@ -206,9 +207,15 @@ impl FsstPerValueDecompressor {
         inner_decompressor: Box<dyn VariablePerValueDecompressor>,
     ) -> Self {
         Self {
+            native_memory: None,
             symbol_table,
             inner_decompressor,
         }
+    }
+
+    pub fn with_native_memory(mut self, memory: lance_core::memory::NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
     }
 }
 
@@ -229,13 +236,23 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
             32 => {
                 let offsets = compressed_variable_data
                     .offsets
-                    .borrow_to_typed_slice::<i32>();
+                    .borrow_to_typed_slice_with_native_memory::<i32>(&self.native_memory)?;
                 let offsets = offsets.as_ref();
                 let num_values = compressed_variable_data.num_values;
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
+                let values_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    bytes.len() * 8,
+                )?;
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let offsets_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    offsets.len() * std::mem::size_of::<i32>(),
+                )?;
                 let mut decompress_offset_buf = vec![0i32; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,
@@ -250,8 +267,10 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data: LanceBuffer::from(decompress_bytes_buf),
-                    offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
+                    data: LanceBuffer::from(decompress_bytes_buf)
+                        .with_reservation(values_reservation),
+                    offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf)
+                        .with_reservation(offsets_reservation),
                     bits_per_offset: 32,
                     num_values,
                     block_info: BlockInfo::new(),
@@ -260,13 +279,23 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
             64 => {
                 let offsets = compressed_variable_data
                     .offsets
-                    .borrow_to_typed_slice::<i64>();
+                    .borrow_to_typed_slice_with_native_memory::<i64>(&self.native_memory)?;
                 let offsets = offsets.as_ref();
                 let num_values = compressed_variable_data.num_values;
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
+                let values_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    bytes.len() * 8,
+                )?;
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let offsets_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    offsets.len() * std::mem::size_of::<i64>(),
+                )?;
                 let mut decompress_offset_buf = vec![0i64; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,
@@ -281,8 +310,10 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 Ok(DataBlock::VariableWidth(VariableWidthBlock {
-                    data: LanceBuffer::from(decompress_bytes_buf),
-                    offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf),
+                    data: LanceBuffer::from(decompress_bytes_buf)
+                        .with_reservation(values_reservation),
+                    offsets: LanceBuffer::reinterpret_vec(decompress_offset_buf)
+                        .with_reservation(offsets_reservation),
                     bits_per_offset: 64,
                     num_values,
                     block_info: BlockInfo::new(),
@@ -298,6 +329,7 @@ impl VariablePerValueDecompressor for FsstPerValueDecompressor {
 
 #[derive(Debug)]
 pub struct FsstMiniBlockDecompressor {
+    native_memory: lance_core::memory::NativeMemory,
     symbol_table: LanceBuffer,
     inner_decompressor: Box<dyn MiniBlockDecompressor>,
 }
@@ -308,9 +340,15 @@ impl FsstMiniBlockDecompressor {
         inner_decompressor: Box<dyn MiniBlockDecompressor>,
     ) -> Self {
         Self {
+            native_memory: None,
             symbol_table: LanceBuffer::from_bytes(description.symbol_table.clone(), 1),
             inner_decompressor,
         }
+    }
+
+    pub fn with_native_memory(mut self, memory: lance_core::memory::NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
     }
 }
 
@@ -331,12 +369,24 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
         let bytes = &compressed_data_block.data;
         let (decompress_bytes_buf, decompress_offset_buf) =
             if compressed_data_block.bits_per_offset == 64 {
-                let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i64>();
+                let offsets = compressed_data_block
+                    .offsets
+                    .borrow_to_typed_slice_with_native_memory::<i64>(&self.native_memory)?;
                 let offsets = offsets.as_ref();
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
+                let values_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    bytes.len() * 8,
+                )?;
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let offsets_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    offsets.len() * std::mem::size_of::<i64>(),
+                )?;
                 let mut decompress_offset_buf = vec![0i64; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,
@@ -351,16 +401,29 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 (
-                    decompress_bytes_buf,
-                    LanceBuffer::reinterpret_vec(decompress_offset_buf),
+                    LanceBuffer::from(decompress_bytes_buf).with_reservation(values_reservation),
+                    LanceBuffer::reinterpret_vec(decompress_offset_buf)
+                        .with_reservation(offsets_reservation),
                 )
             } else {
-                let offsets = compressed_data_block.offsets.borrow_to_typed_slice::<i32>();
+                let offsets = compressed_data_block
+                    .offsets
+                    .borrow_to_typed_slice_with_native_memory::<i32>(&self.native_memory)?;
                 let offsets = offsets.as_ref();
 
                 // The data will expand at most 8 times
                 // The offsets will be the same size because we have the same # of strings
+                let values_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    bytes.len() * 8,
+                )?;
                 let mut decompress_bytes_buf = vec![0u8; bytes.len() * 8];
+                let offsets_reservation = lance_core::memory::try_reserve(
+                    &self.native_memory,
+                    lance_core::memory::NativeMemoryKind::Decode,
+                    offsets.len() * std::mem::size_of::<i32>(),
+                )?;
                 let mut decompress_offset_buf = vec![0i32; offsets.len()];
                 fsst::fsst::decompress(
                     &self.symbol_table,
@@ -375,13 +438,14 @@ impl MiniBlockDecompressor for FsstMiniBlockDecompressor {
                 decompress_offset_buf.truncate((num_values + 1) as usize);
 
                 (
-                    decompress_bytes_buf,
-                    LanceBuffer::reinterpret_vec(decompress_offset_buf),
+                    LanceBuffer::from(decompress_bytes_buf).with_reservation(values_reservation),
+                    LanceBuffer::reinterpret_vec(decompress_offset_buf)
+                        .with_reservation(offsets_reservation),
                 )
             };
 
         Ok(DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::from(decompress_bytes_buf),
+            data: decompress_bytes_buf,
             offsets: decompress_offset_buf,
             bits_per_offset: compressed_data_block.bits_per_offset,
             num_values,

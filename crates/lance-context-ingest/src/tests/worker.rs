@@ -4,7 +4,7 @@ use crate::{
     worker::{Assignment, Claims, Options, Worker},
 };
 use futures::TryStreamExt;
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
 async fn fixture() -> Result<(etcd_client::Client, Claims, String)> {
     let endpoints = std::env::var("ETCD_TEST_ENDPOINTS").context("ETCD_TEST_ENDPOINTS required")?;
@@ -27,7 +27,7 @@ async fn storage(path: &Path) -> Result<Storage> {
     Ok(Storage {
         uri: path.to_str().unwrap().into(),
         base: object_store::path::Path::parse(base)?,
-        options: HashMap::new(),
+        params: Default::default(),
         session: Arc::new(lance::session::Session::default()),
     })
 }

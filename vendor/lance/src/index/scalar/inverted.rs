@@ -3,6 +3,9 @@
 
 #![allow(clippy::redundant_pub_crate)]
 
+mod query_metadata;
+pub use query_metadata::{PreparedQueryIndex, prepare_query_index, query_index_metadata_ready};
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow_array::cast::AsArray;

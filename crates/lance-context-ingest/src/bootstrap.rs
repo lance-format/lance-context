@@ -36,14 +36,24 @@ impl Storage {
         options: HashMap<String, String>,
         session: Arc<lance::session::Session>,
     ) -> Result<Self> {
+        Self::resolve_with_params(uri, parameters(&options), session).await
+    }
+
+    /// Preserve the application's authorized object-store configuration through
+    /// bootstrap, publication and recovery. Dynamic credential accessors and
+    /// wrappers remain shared; credentials are never serialized into the WAL.
+    pub async fn resolve_with_params(
+        uri: String,
+        params: ObjectStoreParams,
+        session: Arc<lance::session::Session>,
+    ) -> Result<Self> {
         ensure!(!uri.is_empty() && uri.len() <= 8192, "invalid dataset URI");
         let (_, base) =
-            ObjectStore::from_uri_and_params(session.store_registry(), &uri, &parameters(&options))
-                .await?;
+            ObjectStore::from_uri_and_params(session.store_registry(), &uri, &params).await?;
         Ok(Self {
             uri,
             base,
-            options,
+            params,
             session,
         })
     }
@@ -199,7 +209,7 @@ async fn provision_schema(
             scope.incarnation,
         )?;
         let dataset = DatasetBuilder::from_uri(&storage.uri)
-            .with_storage_options(storage.options.clone())
+            .with_read_params(storage.read_params(Default::default()))
             .with_session(storage.session.clone())
             .with_commit_handler(Arc::new(reader))
             .load()
@@ -280,7 +290,7 @@ async fn genesis_with_schema(
         // Keep row identities across future indexed compaction. Reopening an
         // existing genesis below preserves its original row-ID setting.
         enable_stable_row_ids: true,
-        store_params: Some(parameters(&storage.options)),
+        store_params: Some(storage.params.clone()),
         session: Some(storage.session.clone()),
         commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
         transaction_properties: Some(Arc::new(HashMap::from([(
@@ -302,7 +312,7 @@ async fn genesis_with_schema(
         Err(lance::Error::DatasetAlreadyExists { .. }) => {
             DatasetBuilder::from_uri(&storage.uri)
                 .with_version(1)
-                .with_storage_options(storage.options.clone())
+                .with_read_params(storage.read_params(Default::default()))
                 .with_session(storage.session.clone())
                 .with_commit_handler(Arc::new(ConditionalPutCommitHandler))
                 .load()

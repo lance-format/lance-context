@@ -675,6 +675,7 @@ mod tests {
                     ..Default::default()
                 },
                 batch_size_bytes: None,
+                read_memory_retry: None,
             });
         }
         dataset

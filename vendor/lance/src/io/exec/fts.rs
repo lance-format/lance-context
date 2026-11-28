@@ -3125,10 +3125,13 @@ impl ExecutionPlan for MatchQueryExec {
         let schema = self.schema.clone();
         let metrics_set = self.metrics.clone();
         let metrics = Arc::new(FtsIndexMetrics::new(&self.metrics, partition));
-        let column = query.column.ok_or(DataFusionError::Execution(format!(
-            "column not set for MatchQuery {}",
-            query.terms
-        )))?;
+        let column = query
+            .column
+            .clone()
+            .ok_or(DataFusionError::Execution(format!(
+                "column not set for MatchQuery {}",
+                query.terms
+            )))?;
         let stream = stream::once(async move {
             let _timer = metrics.baseline_metrics.elapsed_compute().timer();
             let segments = segment_selection
@@ -3149,8 +3152,15 @@ impl ExecutionPlan for MatchQueryExec {
             } else {
                 true
             };
-            let indices =
-                open_fts_segments(&ds, &column, &segments, &metrics.index_metrics).await?;
+            let indices = open_literal_fts_segments(
+                &ds,
+                &column,
+                &segments,
+                &query,
+                &params,
+                &metrics.index_metrics,
+            )
+            .await?;
 
             let mut pre_filter = build_prefilter(
                 context.clone(),
@@ -8250,4 +8260,28 @@ mod tests {
             .expect("RepartitionExec should wrap a UnionExec");
         assert_eq!(inner.children().len(), 2);
     }
+}
+/// Prepare exact Match terms before opening dictionaries. Fuzzy expansion keeps
+/// the upstream complete-vocabulary path.
+async fn open_literal_fts_segments(
+    dataset: &Dataset,
+    column: &str,
+    segments: &[IndexMetadata],
+    query: &MatchQuery,
+    params: &FtsSearchParams,
+    metrics: &IndexMetrics,
+) -> Result<Vec<Arc<InvertedIndex>>> {
+    if uses_fuzzy_expansion(params.fuzziness) {
+        return open_fts_segments(dataset, column, segments, metrics).await;
+    }
+    try_join_all(segments.iter().map(|segment| async move {
+        let mut tokenizer = crate::index::scalar::load_segment_params(dataset, segment)
+            .await?
+            .build()?;
+        let tokens = try_collect_query_tokens(&query.terms, &mut tokenizer)?;
+        let terms: Vec<_> = (&tokens).into_iter().cloned().collect();
+        crate::index::scalar::open_query_index(dataset, column, segment, Some(&terms), metrics)
+            .await
+    }))
+    .await
 }

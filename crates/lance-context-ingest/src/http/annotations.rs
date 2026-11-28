@@ -33,6 +33,27 @@ pub struct SelectedBodyRequest {
     pub bucket: u32,
 }
 
+/// Persist this exact control intent before submitting it. The credential
+/// identifies the predecessor, never whichever producer currently owns a slot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplaceProducerRequest {
+    pub producer: String,
+    pub operation: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReplaceProducerReply {
+    WaitingForRetirement {
+        last: Option<producer::Last>,
+    },
+    Opened {
+        open: ProducerOpen,
+        credential: Opened,
+    },
+}
+
 /// One physical shard, selected from trusted deployment routes. Callers may
 /// query different buckets concurrently; positions are never combined globally.
 #[derive(Serialize, Deserialize)]
@@ -46,6 +67,7 @@ pub struct StatusRequest {
 #[derive(Clone, Copy)]
 enum Operation {
     Open,
+    Replace,
     Update,
     Read,
     ReadBody,
@@ -58,6 +80,7 @@ impl Operation {
     fn suffix(self) -> &'static str {
         match self {
             Self::Open => "producer",
+            Self::Replace => "replace-producer",
             Self::Update => "update",
             Self::Read => "read",
             Self::ReadBody => "read-body",

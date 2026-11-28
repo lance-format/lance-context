@@ -1655,7 +1655,7 @@ mod tests {
         #[allow(deprecated)]
         let eager = StructuralPrimitiveFieldScheduler::try_new(
             &column_info,
-            &DefaultDecompressionStrategy {},
+            &DefaultDecompressionStrategy::default(),
             false,
             &field,
         )
@@ -1665,7 +1665,7 @@ mod tests {
 
         let mut scheduler = StructuralPrimitiveFieldScheduler::try_new_lazy(
             column_info,
-            Arc::new(DefaultDecompressionStrategy {}),
+            Arc::new(DefaultDecompressionStrategy::default()),
             false,
             &field,
         )

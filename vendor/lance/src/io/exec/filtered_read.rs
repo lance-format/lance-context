@@ -31,7 +31,7 @@ use datafusion_physical_expr::projection::project_ordering;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::Statistics;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::metrics::{BaselineMetrics, Count, MetricsSet, Time};
+use datafusion_physical_plan::metrics::{BaselineMetrics, Count, Gauge, MetricsSet, Time};
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, future};
 use lance_arrow::{DataTypeExt, RecordBatchExt};
@@ -326,6 +326,8 @@ pub struct FilteredReadGlobalMetrics {
     fragments_scanned: Count,
     ranges_scanned: Count,
     rows_scanned: Count,
+    parallel_fragment_streams: AtomicUsize,
+    parallel_fragment_streams_peak: Gauge,
     io_metrics: IoMetrics,
 }
 
@@ -335,8 +337,33 @@ impl FilteredReadGlobalMetrics {
             fragments_scanned: metrics.new_count(FRAGMENTS_SCANNED_METRIC, 0),
             ranges_scanned: metrics.new_count(RANGES_SCANNED_METRIC, 0),
             rows_scanned: metrics.new_count(ROWS_SCANNED_METRIC, 0),
+            parallel_fragment_streams: AtomicUsize::new(0),
+            parallel_fragment_streams_peak: metrics.new_gauge("parallel_fragment_streams_peak", 0),
             io_metrics: IoMetrics::new(metrics, 0),
         }
+    }
+}
+
+// Counts owned fragment task producers, from open through stream exhaustion or
+// cancellation. This is not a count of physical I/O or already-issued decodes.
+struct FragmentStreamActivity(Arc<FilteredReadGlobalMetrics>);
+
+impl FragmentStreamActivity {
+    fn start(metrics: Arc<FilteredReadGlobalMetrics>) -> Self {
+        let active = metrics
+            .parallel_fragment_streams
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        metrics.parallel_fragment_streams_peak.set_max(active);
+        Self(metrics)
+    }
+}
+
+impl Drop for FragmentStreamActivity {
+    fn drop(&mut self) {
+        self.0
+            .parallel_fragment_streams
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -603,8 +630,10 @@ impl FilteredReadStream {
     ) -> Result<Self> {
         let scan_scheduler =
             scan_scheduler.unwrap_or_else(|| Self::make_scan_scheduler(&dataset, &options));
-        let base_schedulers =
-            base_schedulers.unwrap_or_else(|| Self::make_base_schedulers(&options));
+        let base_schedulers = base_schedulers.unwrap_or_else(|| {
+            Self::make_base_schedulers(&options)
+                .with_native_memory(dataset.session().native_memory())
+        });
         let threading_mode = options.threading_mode;
 
         let io_parallelism = dataset.object_store.io_parallelism();
@@ -652,30 +681,52 @@ impl FilteredReadStream {
 
         let global_metrics_clone = global_metrics.clone();
 
-        let fragment_streams = futures::stream::iter(scoped_fragments)
-            .map({
-                let scan_range_after_filter = scan_range_after_filter.clone();
-                move |scoped_fragment| {
-                    let metrics = global_metrics_clone.clone();
-                    let limit = scan_range_after_filter.as_ref().map(|r| r.end);
-                    let dataset = dataset.clone();
-                    let materialization_context = materialization_context.clone();
-                    SpawnedTask::spawn(lance_core::utils::tokio::scope_task(
-                        Self::read_fragment(
-                            dataset,
-                            scoped_fragment,
-                            metrics,
-                            limit,
-                            materialization_context,
-                            materialize_blob_v2_binary,
+        let fragment_streams = futures::stream::iter(scoped_fragments).map({
+            let scan_range_after_filter = scan_range_after_filter.clone();
+            move |scoped_fragment| {
+                let metrics = global_metrics_clone.clone();
+                let limit = scan_range_after_filter.as_ref().map(|r| r.end);
+                let dataset = dataset.clone();
+                let materialization_context = materialization_context.clone();
+                SpawnedTask::spawn(lance_core::utils::tokio::scope_task(
+                    Self::read_fragment(
+                        dataset,
+                        scoped_fragment,
+                        metrics,
+                        limit,
+                        materialization_context,
+                        materialize_blob_v2_binary,
+                    )
+                    .in_current_span(),
+                ))
+                .map(|thread_result| thread_result.unwrap())
+            }
+        });
+        let task_stream = match threading_mode {
+            FilteredReadThreadingMode::OnePartitionMultipleThreads(_) => fragment_streams
+                .buffered(fragment_readahead)
+                .try_flatten()
+                .boxed(),
+            FilteredReadThreadingMode::MultiplePartitions(_) => fragment_streams
+                // Include opening and reading in the same bounded inner stream.
+                // A slow fragment must not prevent other fragments from supplying
+                // tasks. Each scoped fragment is still visited exactly once and
+                // every partition consumes the same shared scheduler/task stream.
+                .map({
+                    let metrics = global_metrics.clone();
+                    move |open| {
+                        let activity = FragmentStreamActivity::start(metrics.clone());
+                        Ok::<_, Error>(
+                            futures::stream::once(open)
+                                .try_flatten()
+                                .finally(move || drop(activity))
+                                .boxed(),
                         )
-                        .in_current_span(),
-                    ))
-                    .map(|thread_result| thread_result.unwrap())
-                }
-            })
-            .buffered(fragment_readahead);
-        let task_stream = fragment_streams.try_flatten().boxed();
+                    }
+                })
+                .try_flatten_unordered(fragment_readahead)
+                .boxed(),
+        };
 
         // A batch never spans fragments, so a plan touching many fragments
         // with few rows each emits one tiny batch per fragment. Fragments
@@ -756,7 +807,11 @@ impl FilteredReadStream {
         } else {
             SchedulerConfig::max_bandwidth(obj_store.as_ref())
         };
-        ScanScheduler::new(obj_store, scheduler_config)
+        ScanScheduler::new_with_native_memory(
+            obj_store,
+            scheduler_config,
+            dataset.session().native_memory(),
+        )
     }
 
     /// Create the per-base scheduler cache for a read, sized like the scan
@@ -3117,7 +3172,8 @@ impl RowStreamRead {
     ) -> Self {
         let scan_scheduler =
             FilteredReadStream::make_scan_scheduler(&dataset, &source.read_options);
-        let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options);
+        let base_schedulers = FilteredReadStream::make_base_schedulers(&source.read_options)
+            .with_native_memory(dataset.session().native_memory());
         Self {
             dataset,
             source,

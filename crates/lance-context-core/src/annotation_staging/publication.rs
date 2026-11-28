@@ -154,12 +154,21 @@ impl AnnotationStaging {
         // valid. Warming fences cold-read promotion before replacing keys, so
         // a delayed old read cannot replace a newer published value. Neither
         // cache owns staging permits or base handles.
-        if !self.immutable_body {
+        let lineage = state.immutable_publications.clone();
+        drop(state);
+        if self.immutable_body {
+            let warming = self.published_values.begin_publication_warming();
+            for key in generation.values.keys() {
+                self.published_values
+                    .remember_immutable(key, &lineage, generation.through)
+                    .await;
+            }
+            warming.complete();
+        } else {
             self.published_values
                 .remember(&generation.values, generation.through)
                 .await?;
         }
-        drop(state);
         let mut state = self.state.write().await;
         // Preserve the immutable publication lineage: these rows came only
         // from the verified frozen generation, through generation.through.

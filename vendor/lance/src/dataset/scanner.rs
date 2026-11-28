@@ -3035,11 +3035,7 @@ impl Scanner {
 
             Ok(DatasetRecordBatchStream::new(execute_plan(
                 plan,
-                LanceExecutionOptions {
-                    batch_size: self.batch_size,
-                    execution_stats_callback: self.scan_stats_callback.clone(),
-                    ..Default::default()
-                },
+                self.execution_options(),
             )?))
         }
         .boxed()
@@ -3055,12 +3051,16 @@ impl Scanner {
         if options.execution_stats_callback.is_none() {
             options.execution_stats_callback = self.scan_stats_callback.clone();
         }
+        if options.runtime_env.is_none() {
+            options.runtime_env = self.dataset.session.runtime_env();
+        }
 
         execute_plan(plan, options)
     }
 
     pub(crate) fn execution_options(&self) -> LanceExecutionOptions {
         LanceExecutionOptions {
+            runtime_env: self.dataset.session.runtime_env(),
             batch_size: self.batch_size,
             execution_stats_callback: self.scan_stats_callback.clone(),
             ..Default::default()
@@ -3086,7 +3086,13 @@ impl Scanner {
             scanner.aggregate(AggregateExpr::builder().count_star().build())?;
 
             let plan = scanner.create_plan().await?;
-            let mut stream = execute_plan(plan, LanceExecutionOptions::default())?;
+            let mut stream = execute_plan(
+                plan,
+                LanceExecutionOptions {
+                    runtime_env: self.dataset.session.runtime_env(),
+                    ..Default::default()
+                },
+            )?;
 
             // A count plan will always return a single batch with a single row.
             if let Some(first_batch) = stream.next().await {

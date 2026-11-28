@@ -4,6 +4,9 @@ use lance::cache::{CacheKey, LanceCache};
 use lance_core::deepsize::{Context, DeepSizeOf};
 use std::borrow::Cow;
 
+mod membership;
+pub use membership::{MembershipObservation, MembershipWarmObservation};
+
 #[derive(Clone)]
 pub(super) struct PublishedValues {
     cache: Option<LanceCache>,
@@ -11,6 +14,8 @@ pub(super) struct PublishedValues {
     // retaining a staging view or holding a lock during native reads.
     current_cut: Arc<Mutex<u64>>,
     cold: cold_points::ColdPoints,
+    memory: lance_core::memory::NativeMemory,
+    membership: Arc<membership::Counters>,
 }
 
 pub(super) struct Cached {
@@ -83,6 +88,8 @@ impl PublishedValues {
             cache,
             current_cut: Arc::new(Mutex::new(materialized)),
             cold: cold_points::ColdPoints::new(readers),
+            memory: session.native_memory(),
+            membership: Arc::default(),
         }
     }
 
