@@ -350,6 +350,9 @@ impl Owner {
                         })?;
                     let reply = match replaced {
                         ProducerReplacement::WaitingForRetirement { last } => {
+                            // The closed tail retires only through a signed
+                            // source closure; do not let batching delay it.
+                            self.service.demand_retirement();
                             ReplaceProducerReply::WaitingForRetirement { last }
                         }
                         ProducerReplacement::Opened(next) => ReplaceProducerReply::Opened {

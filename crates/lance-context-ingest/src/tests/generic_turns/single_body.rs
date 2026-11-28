@@ -23,7 +23,7 @@ pub(super) async fn owner(
     owner_with_wait(c, storage, spec, Duration::from_millis(20)).await
 }
 
-async fn owner_with_wait(
+pub(super) async fn owner_with_wait(
     c: &network::Cluster,
     storage: &Storage,
     spec: &TurnIngestionSpec,

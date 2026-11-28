@@ -208,3 +208,94 @@ async fn full_body_http_reconciles_across_ingresses_and_replaces_producer() -> R
     task.await??;
     c.shutdown().await
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_flushes_the_predecessor_tail_before_batch_deadline() -> Result<()> {
+    let input = bodies()?.remove(0);
+    let spec = TurnIngestionSpec::new(
+        input.schema(),
+        vec!["session_id".into(), "id".into()],
+        "session_id",
+    )?;
+    let root = tempfile::tempdir()?;
+    let layout = annotation_publication::one_shard();
+    let c = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+    let storage = fixture::storage(root.path(), "full-body.lance").await?;
+    let shard = Shard { bucket: 0 };
+    crate::bootstrap::provision_body_shard(
+        c.client.clone(),
+        layout.clone(),
+        binding(),
+        storage.clone(),
+        Identity {
+            owner: Uuid::new_v4(),
+            acquisition: Uuid::new_v4(),
+            manifest: Uuid::new_v4(),
+        },
+        &fixture::limits(),
+        shard,
+        &spec,
+    )
+    .await?;
+    let (service, runtime) =
+        super::super::single_body::owner_with_wait(&c, &storage, &spec, Duration::from_secs(60))
+            .await?;
+    let owner = Owner::new(&runtime, keys()?, Default::default())?;
+    let server = Server::start(owner.router()).await?;
+    let (stop, task) = annotation_runtime::run_owner(runtime);
+    let original = ProducerOpen {
+        bucket: 0,
+        slot: 1,
+        expected_generation: 0,
+        operation: Uuid::new_v4(),
+    };
+    let writer = full_client(root.path(), server.base.clone(), &spec, original.clone()).await?;
+    let payload = fixture::encoded(single_body::batch(
+        &spec,
+        &fixture::limits(),
+        shard,
+        &input,
+    )?)?;
+    let appended = writer.append(0, payload).await?.completion;
+    assert_eq!(appended.result, MutationResult::Applied);
+    assert_eq!(service.source_observation().records, 1);
+    writer.shutdown().await?;
+
+    let control = ProducerControlClient::new_full_body(
+        server.base.clone(),
+        reqwest::Client::builder()
+            .retry(reqwest::retry::never())
+            .build()?,
+        DEADLINE,
+        &layout,
+        &binding(),
+        &spec,
+        &fixture::limits(),
+        shard,
+    )?;
+    let intent = control
+        .prepare_replacement(&original, Uuid::new_v4())
+        .await?;
+    let ReplaceProducerReply::WaitingForRetirement { last: Some(last) } =
+        control.execute(&intent).await?
+    else {
+        bail!("an applied predecessor must wait for signed source retirement");
+    };
+    assert_eq!(last.index, appended.index);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        annotation_runtime::drained(&c, &service, last.index),
+    )
+    .await
+    .context("replacement did not trigger publication before the batch deadline")??;
+    let ReplaceProducerReply::Opened { open, .. } = control.execute(&intent).await? else {
+        bail!("the signed closure must allow the same replacement to open");
+    };
+    assert_eq!(open.expected_generation, 1);
+
+    owner.shutdown().await;
+    server.shutdown().await?;
+    let _ = stop.send(());
+    task.await??;
+    c.shutdown().await
+}

@@ -96,6 +96,9 @@ struct Shared {
     results: Mutex<checkpoint::Results>,
     window: Mutex<window::Window>,
     source_generations: Arc<tokio::sync::Semaphore>,
+    /// A producer replacement waits on a closed predecessor's tail. Only the
+    /// next signed source closure retires it, so flush the window promptly.
+    retirement_demand: std::sync::atomic::AtomicBool,
     replay_cut: Mutex<Option<u64>>,
     ordered: tokio::sync::Mutex<()>,
     #[cfg(all(test, feature = "http-client", feature = "service"))]
@@ -567,6 +570,7 @@ impl Service {
                 }),
                 window: Mutex::new(window),
                 source_generations: Arc::new(tokio::sync::Semaphore::new(2)),
+                retirement_demand: std::sync::atomic::AtomicBool::new(false),
                 replay_cut: Mutex::new(None),
                 ordered: tokio::sync::Mutex::new(()),
                 #[cfg(all(test, feature = "http-client", feature = "service"))]
@@ -1094,6 +1098,27 @@ impl Service {
         &self,
     ) -> Result<lance_context_core::annotation_staging::IndexInspection> {
         Ok(self.shared.staging.inspect_installed_indices().await?)
+    }
+
+    /// Ask the publisher to freeze the current source window without waiting
+    /// for its batching thresholds. Publication exactness is unchanged.
+    #[cfg(feature = "http")]
+    pub(crate) fn demand_retirement(&self) {
+        self.shared
+            .retirement_demand
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn retirement_demanded(&self) -> bool {
+        self.shared
+            .retirement_demand
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn clear_retirement_demand(&self) {
+        self.shared
+            .retirement_demand
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Returns the last gate that blocked apply, cleared by successful progress.
