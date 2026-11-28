@@ -18,6 +18,7 @@ use std::{
     time::Instant,
 };
 
+const ADMITTED_SCAN_READAHEAD: usize = 8;
 const MAX_KEY_BYTES: usize = 64 << 10;
 const SCAN_BATCH_ROWS: usize = 2048;
 #[cfg(test)]
@@ -310,6 +311,14 @@ impl TurnIngestionSpec {
                 .collect::<Vec<_>>(),
         )?;
         scan.filter(&predicate)?;
+        let readahead = if base.session().native_memory().is_some() {
+            // These are scanner targets, not a replacement for admission of
+            // actual native pages. Keep the caller's pool and shared runtime.
+            scan.batch_size_bytes(1 << 20).io_buffer_size(8 << 20);
+            ADMITTED_SCAN_READAHEAD
+        } else {
+            1
+        };
         scan.batch_size(SCAN_BATCH_ROWS)
             .batch_readahead(readahead)
             .fragment_readahead(readahead);
@@ -336,6 +345,7 @@ impl TurnIngestionSpec {
         let mut stream = DatasetRecordBatchStream::new(execute_plan(
             plan.clone(),
             LanceExecutionOptions {
+                runtime_env: base.session().runtime_env(),
                 batch_size: Some(SCAN_BATCH_ROWS),
                 ..Default::default()
             },

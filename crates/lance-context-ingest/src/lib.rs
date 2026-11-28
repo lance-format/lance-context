@@ -47,6 +47,8 @@ pub mod materializer;
 mod payload_memory;
 #[cfg(feature = "service")]
 pub mod preparation;
+mod producer_replacement;
+pub use producer_replacement::{ProducerReplacement, ProducerReplacementFenced};
 #[cfg(feature = "materializer")]
 pub mod reader;
 pub mod receipt;
