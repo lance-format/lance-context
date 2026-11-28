@@ -700,9 +700,12 @@ impl Publisher {
                 && source.records < self.options.max_records
                 && self.service.shared.progress.borrow().backpressure.is_none()
                 && started.elapsed() < self.options.max_batch_wait
+                && !self.service.retirement_demanded()
             {
                 return Ok(());
             }
+            // Clear before freezing: a later demand targets a later tail.
+            self.service.clear_retirement_demand();
             self.catalog.retire_history(&view).await?;
             let frozen = self
                 .service
