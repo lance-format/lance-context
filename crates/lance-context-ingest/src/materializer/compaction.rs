@@ -139,7 +139,8 @@ impl SmallFileCompaction {
 
     /// Native rewrite options for one admitted task of `rows` source rows.
     /// A sorted rewrite re-encodes, and its sort pool is part of the same
-    /// admitted workspace: twice the target file size, spilling beyond it.
+    /// admitted workspace: the larger of twice the target file size and
+    /// eight maximum records, so one batch always fits; it spills beyond it.
     pub(crate) fn native_options(
         &self,
         rows: usize,
@@ -161,7 +162,8 @@ impl SmallFileCompaction {
             }),
             binary_copy_read_batch_bytes: Some(record_bytes),
             sort_by,
-            sort_memory_bytes: sorted.then_some(2 * self.target_file_bytes as u64),
+            sort_memory_bytes: sorted
+                .then(|| (2 * self.target_file_bytes as u64).max(8 * record_bytes as u64)),
             ..Default::default()
         }
     }
@@ -293,6 +295,29 @@ pub(crate) async fn prepare_task(
         ),
     };
     Ok(Some(task))
+}
+
+/// Redacted classification of a maintenance failure: a fixed label derived
+/// from typed causes only, never the message text (which can carry URIs).
+pub(crate) fn failure_kind(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(df) = cause.downcast_ref::<DataFusionError>() {
+            return match df {
+                DataFusionError::ResourcesExhausted(_) => "resources_exhausted",
+                _ => "datafusion",
+            };
+        }
+        if cause.downcast_ref::<lance::Error>().is_some() {
+            return "lance";
+        }
+        if cause.downcast_ref::<std::io::Error>().is_some() {
+            return "io";
+        }
+        if cause.downcast_ref::<tokio::task::JoinError>().is_some() {
+            return "join";
+        }
+    }
+    "other"
 }
 
 /// Retry an exhausted sorted rewrite without sorting the same captured inputs.

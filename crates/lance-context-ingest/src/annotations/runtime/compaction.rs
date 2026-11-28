@@ -60,7 +60,12 @@ impl Publisher {
                     // outputs are unselected (collectable) files; a failed
                     // rewrite must never stop the owner's publisher, or the
                     // predecessor's tail never retires and takeover blocks.
-                    eprintln!("background compaction failed; continuing publication: {error:#}");
+                    // The error chain can carry storage URIs; log only a
+                    // fixed message and a redacted classification.
+                    eprintln!(
+                        "background compaction failed; continuing publication (kind={})",
+                        materializer::compaction::failure_kind(&error)
+                    );
                     self.compaction_retry_serial = true;
                     return Ok(false);
                 }
