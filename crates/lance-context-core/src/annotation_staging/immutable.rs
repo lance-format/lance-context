@@ -342,20 +342,19 @@ impl AnnotationStaging {
         })
     }
 
-    /// Capture the installed compatible base (never a staged source) with
-    /// the WAL cut it materializes through. Used when a captured staged
-    /// source was retired by publication before its body was fetched.
-    pub async fn capture_immutable_installed(&self) -> Result<(ImmutableBodyRead, u64)> {
+    /// Recapture `read` onto the installed compatible base (never a staged
+    /// source) and return the WAL cut it materializes through. Used when a
+    /// captured staged source was retired by publication before its body was
+    /// fetched. The read keeps its existing reader permit, so this never
+    /// reserves a second one while the original view is held.
+    pub async fn recapture_immutable_installed(&self, read: &mut ImmutableBodyRead) -> Result<u64> {
         self.require_immutable()?;
-        let reader = reserve(&self.readers, 1)?;
+        if !Arc::ptr_eq(&self.readers, read._reader.semaphore()) {
+            return Err(invalid("body read belongs to another staging instance"));
+        }
         let state = self.state.read().await;
-        Ok((
-            ImmutableBodyRead {
-                source: body::CapturedBody::Base(state.base.clone()),
-                _reader: reader,
-            },
-            state.materialized,
-        ))
+        read.source = body::CapturedBody::Base(state.base.clone());
+        Ok(state.materialized)
     }
 
     fn require_immutable(&self) -> Result<()> {

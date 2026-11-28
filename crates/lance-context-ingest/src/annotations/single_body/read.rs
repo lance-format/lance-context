@@ -29,7 +29,7 @@ impl Service {
     /// owner's installed compatible view and require it to cover `index` for
     /// exactly this table, group and incarnation (the source closure's cut
     /// and version). Uncovered or foreign metadata stays an error.
-    async fn recapture_retired(&self, index: u64) -> Result<ImmutableBodyRead> {
+    async fn recapture_retired(&self, view: &mut ImmutableBodyRead, index: u64) -> Result<()> {
         let (_, value) = crate::reader::observe(
             &self.ingress,
             self.group()?,
@@ -53,9 +53,12 @@ impl Service {
             index <= closure.through,
             "unpublished WAL payload unavailable"
         );
-        let (view, materialized) = {
+        let materialized = {
             let _ordered = self.shared.ordered.lock().await;
-            self.shared.staging.capture_immutable_installed().await?
+            self.shared
+                .staging
+                .recapture_immutable_installed(view)
+                .await?
         };
         let TurnBodySource::Materialized(base) = view.source() else {
             bail!("installed recapture is not a materialized base")
@@ -64,7 +67,7 @@ impl Service {
             materialized >= index && base.version().version >= closure.version,
             "installed view does not cover the retired WAL payload"
         );
-        Ok(view)
+        Ok(())
     }
 
     /// Quorum barrier then local applied view. This read never scans WAL data
@@ -129,6 +132,7 @@ impl Service {
                 (view, staged, deferred)
             };
             let mut refetched = None;
+            let mut recaptured = false;
             if let Some((source, meta)) = deferred {
                 // Capture -> Close -> Fetch: publication can retire the WAL
                 // record after the ordered capture. The row is then in the
@@ -136,7 +140,9 @@ impl Service {
                 match self.refetch_bodies(source.record_index, meta).await {
                     Ok(fetched) => refetched = Some((source, fetched)),
                     Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
-                        view = self.recapture_retired(source.record_index).await?;
+                        self.recapture_retired(&mut view, source.record_index)
+                            .await?;
+                        recaptured = true;
                     }
                     Err(error) => return Err(error),
                 }
@@ -208,7 +214,15 @@ impl Service {
                     );
                     found = Some(batch);
                 }
-                let Some(batch) = found else { return Ok(None) };
+                let Some(batch) = found else {
+                    // A recaptured base was proven to cover the retired WAL
+                    // record that staged this key; absence is corruption.
+                    ensure!(
+                        !recaptured,
+                        "installed base covers the retired WAL payload but lacks its body"
+                    );
+                    return Ok(None);
+                };
                 (batch, Hold::Materialized)
             };
             // Return the user's exact original schema, sharing all columns.
