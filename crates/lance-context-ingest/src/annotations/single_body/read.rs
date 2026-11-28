@@ -270,9 +270,12 @@ impl Service {
                     .join(" AND ");
                 let mut scan = base.scan();
                 scan.filter(&filter)?.limit(Some(2), None)?;
+                // Point lookups return at most one row, so fragments can be
+                // read in parallel without preserving their physical order.
                 scan.batch_size(128)
                     .batch_readahead(1)
-                    .fragment_readahead(1)
+                    .fragment_readahead(4)
+                    .scan_in_order(false)
                     .io_buffer_size(self.ingress.scope.contract.max_record_bytes as u64);
                 let mut stream = scan.try_into_stream().await?;
                 let mut found = None;
