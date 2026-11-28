@@ -473,22 +473,12 @@ impl StreamingProducer {
             self.shared.buffer.fail(&error);
             return Err(error.context("streaming fence: applied wait failed"));
         }
+        let mut cache_updates = Vec::new();
         for (slot, applied) in resolved {
             // Nothing committed after the snapshot: sender lock held.
             let keys = slot.pending.lock().unwrap().take().map(|p| p.keys).unwrap_or_default();
-            if let Some(cache) = self.shared.key_cache.clone() {
-                let applied_ok = applied.reply.completion.result == MutationResult::Applied;
-                tokio::task::spawn_blocking(move || {
-                    if applied_ok {
-                        cache.insert(&keys, key_cache::Reason::Applied)
-                    } else {
-                        // The latest outcome covers the lane's records since
-                        // the previous fence: drop their commit-time inserts.
-                        cache.remove(&keys)
-                    }
-                })
-                .await??;
-            }
+            let applied_ok = applied.reply.completion.result == MutationResult::Applied;
+            cache_updates.push((keys, applied_ok));
             fence
                 .shards
                 .entry(slot.shard.bucket)
@@ -498,6 +488,31 @@ impl StreamingProducer {
                 })
                 .lanes
                 .push(applied);
+        }
+        // The cut is recorded above and is returned regardless. The cache is
+        // best-effort: a failed update cannot lose this fence's cut, but a
+        // missed remove could leave a stale skip, so any failure permanently
+        // fails the producer and no later fence can report success over it.
+        if let Some(cache) = self.shared.key_cache.clone() {
+            let update = tokio::task::spawn_blocking(move || -> Result<()> {
+                for (keys, applied_ok) in cache_updates {
+                    if applied_ok {
+                        cache.insert(&keys, key_cache::Reason::Applied)?;
+                    } else {
+                        // The latest outcome covers the lane's records since
+                        // the previous fence: drop their commit-time inserts.
+                        cache.remove(&keys)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("key cache update task: {error}"))
+            .and_then(|result| result);
+            if let Err(error) = update {
+                let error = error.context("streaming fence: key cache update failed");
+                self.shared.buffer.fail(&error);
+            }
         }
         for cut in fence.shards.values_mut() {
             cut.lanes.sort_by_key(|lane| lane.lane);
