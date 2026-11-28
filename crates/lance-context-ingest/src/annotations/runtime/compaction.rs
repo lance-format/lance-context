@@ -47,13 +47,25 @@ impl Publisher {
             )
             .await?;
             let version = current.version_id();
-            let Some(ready) = self
+            let finished = self
                 .compaction_preparation
                 .take()
                 .unwrap()
                 .finish(current)
-                .await?
-            else {
+                .await;
+            let finished = match finished {
+                Ok(finished) => finished,
+                Err(error) => {
+                    // Background compaction is optional maintenance. Its
+                    // outputs are unselected (collectable) files; a failed
+                    // rewrite must never stop the owner's publisher, or the
+                    // predecessor's tail never retires and takeover blocks.
+                    eprintln!("background compaction failed; continuing publication: {error:#}");
+                    self.compaction_retry_serial = true;
+                    return Ok(false);
+                }
+            };
+            let Some(ready) = finished else {
                 // A field update changed a source fragment. Do not publish the
                 // stale rewrite. The next eligible rewrite uses the existing
                 // serial path so continuous updates cannot starve compaction.

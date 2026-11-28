@@ -390,13 +390,13 @@ impl Runtime {
     }
 
     /// Turns default to both dedup-lookup indexes: a Bloom filter on `id`
-    /// (prunes regardless of layout) plus write-time clustering, i.e.
-    /// compaction sorted by (routing column, key) with a routing ZoneMap.
+    /// (prunes regardless of layout) plus a routing ZoneMap. Sorted
+    /// compaction stays opt-in via `SmallFileCompaction::sort_by`.
     /// Applied only to options the caller left unset, and only when the
     /// publication budget covers the shared index workspace.
     fn turn_defaults(
         configuration: &mut Configuration,
-        spec: &crate::turn_ingestion::TurnIngestionSpec,
+        _spec: &crate::turn_ingestion::TurnIngestionSpec,
     ) {
         let publication = &mut configuration.publication;
         if publication.turn_id_index.is_none()
@@ -409,20 +409,11 @@ impl Runtime {
                 ..Default::default()
             });
         }
-        if let Some(compaction) = publication.compaction.as_mut() {
-            if compaction.sort_by.is_empty() {
-                let routing = spec.routing_column().to_owned();
-                compaction.sort_by = std::iter::once(routing.clone())
-                    .chain(
-                        spec.primary_key()
-                            .iter()
-                            .filter(|c| **c != routing)
-                            .cloned(),
-                    )
-                    .take(4)
-                    .collect();
-            }
-        }
+        // Sorted (session-clustered) compaction is opt-in only. Its SortExec
+        // runs under a private FairSpillPool of 2x target_file_bytes; large
+        // single-body records exhausted that pool (DataFusion
+        // ResourcesExhausted surfacing through the Lance writer's chunker),
+        // failing the owner's publisher and blocking producer takeover.
     }
 
     #[allow(clippy::too_many_arguments)] // Explicit routing augments the existing owned connection.
