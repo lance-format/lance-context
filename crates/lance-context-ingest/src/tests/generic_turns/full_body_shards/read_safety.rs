@@ -3,6 +3,9 @@ use super::*;
 use crate::http::annotations::PointRequest;
 use lance_context_core::MergeReservation;
 
+#[cfg(feature = "streaming-producer")]
+mod cache_warm;
+
 pub(super) async fn idle_budget(budget: &Arc<MergeMemoryBudget>) -> Result<MergeReservation> {
     tokio::time::timeout(DEADLINE, budget.reserve(budget.limit()))
         .await

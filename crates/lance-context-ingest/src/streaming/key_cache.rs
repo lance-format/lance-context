@@ -612,8 +612,18 @@ impl AppliedKeyCache {
         anyhow::ensure!(
             selected.table == scope.table
                 && selected.incarnation == scope.incarnation
+                && selected.source.shard == shard
+                && dataset.uri() == selected.uri
                 && dataset.version().version == selected.manifest.version,
             "applied-key warm source is not this shard's selected identity"
+        );
+        let transaction = dataset
+            .read_transaction()
+            .await?
+            .context("applied-key warm source has no transaction")?;
+        anyhow::ensure!(
+            Uuid::parse_str(&transaction.uuid)? == selected.manifest.transaction,
+            "applied-key warm source transaction differs from selection"
         );
         let resume = self.warmed_through(shard)?;
         let mut fragments: Vec<_> = dataset
