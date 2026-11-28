@@ -77,12 +77,22 @@ async fn commit_rows(
             parts.push(part.slice(0, half));
             continue;
         }
-        commit(shared, slot, encoded, part.num_rows()).await?;
+        let keys = match &shared.key_cache {
+            Some(cache) => cache.batch_keys(slot.shard.bucket, &part, &shared.key_columns)?,
+            None => Vec::new(),
+        };
+        commit(shared, slot, encoded, part.num_rows(), keys).await?;
     }
     Ok(())
 }
 
-async fn commit(shared: &Shared, slot: &LaneSlot, body: bytes::Bytes, rows: usize) -> Result<()> {
+async fn commit(
+    shared: &Shared,
+    slot: &LaneSlot,
+    body: bytes::Bytes,
+    rows: usize,
+    keys: Vec<super::key_cache::Key>,
+) -> Result<()> {
     let bytes = body.len();
     let started = Instant::now();
     let mut body = Some(body);
@@ -102,6 +112,8 @@ async fn commit(shared: &Shared, slot: &LaneSlot, body: bytes::Bytes, rows: usiz
     })
     .await?;
     shared.metrics.committed(started.elapsed(), bytes, rows);
+    // Commit-only keys never enter the skip cache: a committed record can
+    // still be Rejected. Keys are cached only after an Applied outcome.
     let mut pending = slot.pending.lock().unwrap();
     match pending.as_mut() {
         Some(p) => {
@@ -109,12 +121,14 @@ async fn commit(shared: &Shared, slot: &LaneSlot, body: bytes::Bytes, rows: usiz
             p.latest = reply;
             p.records += 1;
             p.rows += rows;
+            p.keys.extend(keys);
         }
         None => {
             *pending = Some(Pending {
                 latest: reply,
                 records: 1,
                 rows,
+                keys,
             })
         }
     }

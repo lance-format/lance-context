@@ -144,7 +144,6 @@ impl Metrics {
             .fetch_add(u64::from(!ok), Relaxed);
         self.applied_wait_nanos.fetch_add(nanos(d), Relaxed);
     }
-    #[allow(dead_code)]
     pub(super) fn dropped_known(&self, rows: usize) {
         self.dropped_known.fetch_add(rows as u64, Relaxed);
     }

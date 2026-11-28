@@ -51,10 +51,12 @@ use crate::{
 };
 
 mod buffer;
+pub mod key_cache;
 mod lane;
 mod metrics;
 
 use buffer::Buffer;
+pub use key_cache::AppliedKeyCache;
 pub use metrics::{Metrics, MetricsSnapshot};
 
 /// One canonical producer lane of a physical shard.
@@ -90,6 +92,8 @@ pub struct Config {
     /// Concurrent `/applied` waits at a fence.
     pub applied_parallelism: usize,
     pub transient: Transient,
+    /// Optional applied-key cache consulted while splitting turns.
+    pub key_cache: Option<Arc<AppliedKeyCache>>,
 }
 
 /// Applied outcome of one lane's latest record at a fence. Records on one lane
@@ -157,6 +161,8 @@ struct Pending {
     latest: CommitReply,
     records: u64,
     rows: usize,
+    // Keys committed since the last fence; resolved to Applied/Rejected there.
+    keys: Vec<key_cache::Key>,
 }
 
 struct LaneSlot {
@@ -179,6 +185,8 @@ struct Shared {
     metrics: Arc<Metrics>,
     transient: Transient,
     stop: AtomicBool,
+    key_cache: Option<Arc<AppliedKeyCache>>,
+    key_columns: Vec<String>,
 }
 
 pub struct StreamingProducer {
@@ -233,6 +241,12 @@ impl StreamingProducer {
         for bucket in config.shards.keys() {
             buffer.register(*bucket);
         }
+        if let Some(cache) = &config.key_cache {
+            for (bucket, shard) in &config.shards {
+                cache.check_binding(*bucket, &shard.binding, &config.spec)?;
+            }
+        }
+        let key_columns = config.spec.primary_key().to_vec();
         let shared = Arc::new(Shared {
             spec: config.spec,
             limits: config.limits,
@@ -245,6 +259,8 @@ impl StreamingProducer {
             metrics,
             transient: config.transient,
             stop: AtomicBool::new(false),
+            key_cache: config.key_cache,
+            key_columns,
         });
         let mut lanes = Vec::new();
         let mut tasks = Vec::new();
@@ -296,9 +312,32 @@ impl StreamingProducer {
         );
         for (bucket, rows) in self.route(&batch)? {
             let part = arrow_select::take::take_record_batch(&batch, &rows)?;
+            let part = self.drop_known(bucket, part).await?;
+            if part.num_rows() == 0 {
+                continue;
+            }
             self.admit(bucket, part).await?;
         }
         Ok(())
+    }
+
+    /// Drop rows of one routed shard whose scoped key the applied-key cache
+    /// already holds, before they are buffered. Within-batch duplicates are
+    /// left to the owner.
+    async fn drop_known(&self, bucket: u32, batch: RecordBatch) -> Result<RecordBatch> {
+        let Some(cache) = self.shared.key_cache.clone() else {
+            return Ok(batch);
+        };
+        let keys = cache.batch_keys(bucket, &batch, &self.shared.key_columns)?;
+        let found = tokio::task::spawn_blocking(move || cache.contains_many(&keys)).await??;
+        let hits = found.iter().filter(|hit| **hit).count();
+        if hits == 0 {
+            return Ok(batch);
+        }
+        self.shared.metrics.dropped_known(hits);
+        let keep =
+            arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
+        Ok(arrow_select::filter::filter_record_batch(&batch, &keep)?)
     }
 
     fn route(&self, batch: &RecordBatch) -> Result<BTreeMap<u32, UInt32Array>> {
@@ -366,7 +405,13 @@ impl StreamingProducer {
     /// decides. Pending state is cleared only for lanes that resolved.
     pub async fn fence(&self) -> Result<Fence> {
         let _order = self.sender.lock().await;
+        // Fails if any lane failed a commit (the failure is sticky), so an
+        // empty fence never hides failed or uncommitted records.
         self.shared.buffer.drained().await?;
+        anyhow::ensure!(
+            self.tasks.iter().all(|task| !task.is_finished()),
+            "streaming fence: a lane stopped with records possibly uncommitted"
+        );
         let touched: Vec<_> = self
             .lanes
             .iter()
@@ -375,10 +420,11 @@ impl StreamingProducer {
                 pending
                     .as_ref()
                     .map(|p| (slot.clone(), p.latest.clone(), p.records, p.rows))
+                // keys stay in the slot until the outcome is known
             })
             .collect();
-        use futures::StreamExt;
-        let results: Vec<Result<(Arc<LaneSlot>, LaneApplied)>> =
+        use futures::{StreamExt, TryStreamExt};
+        let results: Result<Vec<(Arc<LaneSlot>, LaneApplied)>> =
             futures::stream::iter(touched.into_iter().map(|(slot, latest, records, rows)| {
                 let shared = self.shared.clone();
                 async move {
@@ -401,16 +447,36 @@ impl StreamingProducer {
                 }
             }))
             .buffer_unordered(self.applied_parallelism)
-            .collect()
+            .try_collect()
             .await;
-        let mut fence = Fence::default();
-        for result in results {
-            let (slot, applied) = result?;
-            {
-                let mut pending = slot.pending.lock().unwrap();
-                // Nothing committed after the snapshot: sender lock held.
-                *pending = None;
+        let resolved = match results {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                // A terminal wait error cancels other read-only waits. Keep
+                // every receipt and poison the producer so a later fence
+                // cannot report success over the unresolved prefix.
+                for slot in &self.lanes {
+                    if let Some(pending) = slot.pending.lock().unwrap().as_mut() {
+                        pending.keys.clear();
+                    }
+                }
+                self.shared.buffer.fail(&error);
+                return Err(error.context("streaming fence: applied wait failed"));
             }
+        };
+        let mut fence = Fence::default();
+        let mut cache_updates = Vec::new();
+        for (slot, applied) in resolved {
+            // Nothing committed after the snapshot: sender lock held.
+            let keys = slot
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .map(|p| p.keys)
+                .unwrap_or_default();
+            let applied_ok = applied.reply.completion.result == MutationResult::Applied;
+            cache_updates.push((keys, applied_ok));
             fence
                 .shards
                 .entry(slot.shard.bucket)
@@ -420,6 +486,31 @@ impl StreamingProducer {
                 })
                 .lanes
                 .push(applied);
+        }
+        // The cut is recorded above and is returned regardless. The cache is
+        // best-effort: a failed update cannot lose this fence's cut, but a
+        // missed remove could leave a stale skip, so any failure permanently
+        // fails the producer and no later fence can report success over it.
+        if let Some(cache) = self.shared.key_cache.clone() {
+            let update = tokio::task::spawn_blocking(move || -> Result<()> {
+                for (keys, applied_ok) in cache_updates {
+                    if applied_ok {
+                        cache.insert(&keys, key_cache::Reason::Applied)?;
+                    } else {
+                        // The latest outcome covers the lane's records since
+                        // the previous fence: drop their commit-time inserts.
+                        cache.remove(&keys)?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("key cache update task: {error}"))
+            .and_then(|result| result);
+            if let Err(error) = update {
+                let error = error.context("streaming fence: key cache update failed");
+                self.shared.buffer.fail(&error);
+            }
         }
         for cut in fence.shards.values_mut() {
             cut.lanes.sort_by_key(|lane| lane.lane);
