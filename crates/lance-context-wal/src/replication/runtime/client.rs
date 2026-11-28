@@ -962,7 +962,19 @@ impl Client {
             let mut visited = BTreeSet::new();
             loop {
                 visited.insert(node);
-                let response = match self.exchange(node, request.clone(), &mut progress).await {
+                let exchange = async {
+                    let response = self.exchange(node, request.clone(), &mut progress).await?;
+                    if let Request::Fetch { group, index } = &request {
+                        if matches!(response.reply, Reply::Record(None)) {
+                            drop(response);
+                            return self
+                                .check_fetch_miss(node, *group, *index, &mut progress)
+                                .await;
+                        }
+                    }
+                    Ok(response)
+                };
+                let response = match exchange.await {
                     Ok(response) => response,
                     Err(error) => {
                         let next = voters[(voters.iter().position(|id| *id == node).unwrap() + 1)
@@ -1059,6 +1071,33 @@ impl Client {
         })
         .await
         .with_context(|| format!("routed exchange timed out; {progress}; outcome unknown"))?
+    }
+
+    async fn check_fetch_miss(
+        &self,
+        node: u64,
+        group: u64,
+        index: u64,
+        progress: &mut ExchangeProgress,
+    ) -> Result<Response> {
+        // A legacy voter reports an empty local read even before it applies
+        // the index. Use its applied position only to qualify another read on
+        // that same voter. It may have caught up since the original miss.
+        let mut response = self
+            .exchange(node, Request::Status { group }, progress)
+            .await?;
+        let Reply::Status(status) = &response.reply else {
+            anyhow::bail!("fetch replica status unavailable");
+        };
+        if status.applied < index {
+            response.reply = Reply::Redirect {
+                leader: status.leader,
+            };
+            return Ok(response);
+        }
+        drop(response);
+        self.exchange(node, Request::Fetch { group, index }, progress)
+            .await
     }
     async fn exchange(
         &self,
