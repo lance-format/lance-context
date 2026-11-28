@@ -1,8 +1,8 @@
-# Lance 14.0.2 compatibility patches
+# Lance 14.0.3 compatibility patches
 
-This directory starts from the official published `lance-core 14.0.2` crate.
-Archive SHA256: `874fd0494c0b3357a258c0614bbaff3d1654382613ba4cf76a758c399eed7f15`.
-Upstream commit: `40f15ed1b71b66950961b175829fdf17a763f108`.
+This directory starts from the official published `lance-core 14.0.3` crate.
+Archive SHA256: `3ddcb680ecedb6b6d89d84ba1d272d0b43f64392b693f37d8bf49f25d130bd3d`.
+Upstream commit: `c7dc014f1e722ad7dcc9a731991e4f33bb8852bb`.
 The original Cargo manifest, VCS provenance, and Apache 2.0 license are retained.
 
 Cargo.toml uses sibling paths for the patched crates and excludes Cargo's reserved

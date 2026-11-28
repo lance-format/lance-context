@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.94.0"
 name = "lance"
-version = "14.0.2"
+version = "14.0.3"
 authors = ["Lance Devs <dev@lance.org>"]
 build = "build.rs"
 autolib = false
@@ -447,47 +447,47 @@ version = "2.2.0"
 version = "0.14"
 
 [dependencies.lance-arrow]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-bitpacking]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-core]
 path = "../lance-core"
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-datafusion]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-encoding]
 path = "../lance-encoding"
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-file]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-index]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-io]
 path = "../lance-io"
-version = "=14.0.2"
+version = "=14.0.3"
 default-features = false
 
 [dependencies.lance-linalg]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-namespace]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-select]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-table]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-tokenizer]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.log]
 version = "0.4"
@@ -638,27 +638,27 @@ version = "=58.0.0"
 version = "=58.0.0"
 
 [dev-dependencies.lance-datafusion]
-version = "=14.0.2"
+version = "=14.0.3"
 features = ["datagen"]
 
 [dev-dependencies.lance-datagen]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dev-dependencies.lance-index]
-version = "=14.0.2"
+version = "=14.0.3"
 features = ["test-oracle"]
 
 [dev-dependencies.lance-io]
 path = "../lance-io"
-version = "=14.0.2"
+version = "=14.0.3"
 features = ["test-util"]
 default-features = false
 
 [dev-dependencies.lance-test-macros]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dev-dependencies.lance-testing]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dev-dependencies.libc]
 version = "0.2.176"

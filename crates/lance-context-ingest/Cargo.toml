@@ -21,12 +21,12 @@ etcd-client = { version = "0.19", features = ["tls"], optional = true }
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "http1", "http2", "tokio"] }
 http-body-util = { version = "0.1", optional = true }
 reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
-lance = { version = "14.0.2", optional = true }
-lance-table = { version = "14.0.2", optional = true }
-lance-io = { version = "14.0.2", optional = true }
-lance-index = { version = "14.0.2", optional = true }
-lance-file = { version = "14.0.2", optional = true }
-lance-datafusion = { version = "14.0.2", optional = true }
+lance = { version = "14.0.3", optional = true }
+lance-table = { version = "14.0.3", optional = true }
+lance-io = { version = "14.0.3", optional = true }
+lance-index = { version = "14.0.3", optional = true }
+lance-file = { version = "14.0.3", optional = true }
+lance-datafusion = { version = "14.0.3", optional = true }
 datafusion-common = { version = "54", optional = true, default-features = false }
 datafusion-physical-plan = { version = "54", optional = true }
 prost = { version = "0.14", optional = true }
@@ -57,8 +57,8 @@ url = "2"
 async-trait = "0.1.92"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 arrow-ipc = "58"
-lance = "14.0.2"
-lance-table = "14.0.2"
+lance = "14.0.3"
+lance-table = "14.0.3"
 rcgen = "0.14"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
