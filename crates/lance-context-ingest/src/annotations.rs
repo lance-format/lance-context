@@ -22,6 +22,7 @@ use tokio::sync::watch;
 mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
+pub mod owner_batch;
 pub mod lookup_capture;
 mod lookup_observation;
 #[cfg(feature = "service")]
@@ -105,6 +106,9 @@ struct Shared {
     body_lookups: Mutex<BodyLookupObservation>,
     lookup_capture: Arc<lookup_capture::State>,
     phases: Arc<crate::materializer::observation::Counters>,
+    /// Opt-in owner batch pipeline: keys-only survivors deferred to the WAL.
+    write_batch: Mutex<Option<owner_batch::WriteBatch>>,
+    batch_metrics: Mutex<owner_batch::Metrics>,
 }
 
 /// Multiple independently connected ingresses may keep their own bounded view.
@@ -565,6 +569,8 @@ impl Service {
                 body_lookups: Mutex::new(Default::default()),
                 lookup_capture: Arc::default(),
                 phases: Arc::default(),
+                write_batch: Mutex::new(None),
+                batch_metrics: Mutex::new(Default::default()),
             }),
         };
         service.barrier().await?;
@@ -1150,8 +1156,16 @@ impl Driver {
         if replay_cut.is_some_and(|cut| after >= cut) {
             return Ok(());
         }
+        let owner_batch = service.owner_batch();
         if self.pending.is_none() {
-            if let Some(stub) = self.lookahead.front().filter(|p| p.keys_only) {
+            // Owner batch mode applies keys-only records directly: their
+            // bodies are refetched from the WAL only for survivors, at
+            // publication. Other modes rehydrate the ordered head.
+            if let Some(stub) = self
+                .lookahead
+                .front()
+                .filter(|p| p.keys_only && !owner_batch)
+            {
                 // Rehydrate before popping: cancellation or admission pressure
                 // leaves the keys-only record (and its lookup coverage) intact.
                 let (index, meta) = (stub.index, stub.meta.clone());
@@ -1249,6 +1263,10 @@ impl Driver {
                     return Ok(());
                 };
                 self.pending = Some(pending);
+                if owner_batch {
+                    // Collect stage: keep keys only; the body stays in the WAL.
+                    self.pending.as_mut().unwrap().drop_body();
+                }
                 // Keep the entry until fetch/decode succeeds. Cancellation or
                 // admission pressure must not skip the next committed record.
                 self.source_page.as_mut().unwrap().entries.remove(0);
@@ -1286,6 +1304,7 @@ impl Driver {
         }
         let pending = self.pending.as_ref().unwrap();
         if let Some(deadline) = self.body_batch_deadline {
+            let collect = std::time::Instant::now();
             self.lookup = prefetch::coalesce(
                 service,
                 pending,
@@ -1296,6 +1315,9 @@ impl Driver {
             )
             .await?;
             self.body_batch_deadline = None;
+            if owner_batch {
+                service.record_stage(owner_batch::Stage::Collect, collect);
+            }
         }
         let missing_body_lookup = service.is_single_body()
             && match &pending.decoded {
@@ -1408,6 +1430,7 @@ impl Driver {
             .apply_attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut full_body_inserted_rows = None;
+        let decide = std::time::Instant::now();
         let applied = if service.is_single_body() {
             match service
                 .shared
@@ -1426,6 +1449,9 @@ impl Driver {
                 .await?
             {
                 Some((applied, inserted)) => {
+                    if owner_batch {
+                        service.record_stage(owner_batch::Stage::Decide, decide);
+                    }
                     full_body_inserted_rows = Some(inserted);
                     applied
                 }
@@ -1550,7 +1576,35 @@ impl Driver {
                     // Release decoded narrow rows before returning transient decode
                     // credit. The retained body frame keeps every shared IPC allocation.
                     drop(rows);
-                    if result == MutationResult::Applied {
+                    if owner_batch {
+                        // Write stage input: only surviving ordinals. A spill
+                        // failure stops the driver before progress advances.
+                        drop(bodies);
+                        let rows = if result == MutationResult::Applied {
+                            full_body_inserted_rows.take().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        if rows.is_empty() && result == MutationResult::Applied {
+                            let mut observed = service.shared.body_lookups.lock().unwrap();
+                            observed.all_duplicate_batches =
+                                observed.all_duplicate_batches.saturating_add(1);
+                            observed.all_duplicate_rows =
+                                observed.all_duplicate_rows.saturating_add(input_rows);
+                        }
+                        service
+                            .shared
+                            .write_batch
+                            .lock()
+                            .unwrap()
+                            .as_mut()
+                            .context("owner batch pipeline disabled")?
+                            .record(owner_batch::Survivors {
+                                index: pending.index,
+                                meta: pending.meta.clone(),
+                                rows,
+                            })?;
+                    } else if result == MutationResult::Applied {
                         let retained = service.shared.frames.lock().unwrap().record_with_spec(
                             pending.index,
                             bodies,
@@ -1559,7 +1613,7 @@ impl Driver {
                             pending.input_allocation,
                             ingress.turn_spec.clone(),
                         );
-                        if full_body_inserted_rows == Some(0) {
+                        if full_body_inserted_rows.as_ref().is_some_and(Vec::is_empty) {
                             let mut observed = service.shared.body_lookups.lock().unwrap();
                             observed.all_duplicate_batches =
                                 observed.all_duplicate_batches.saturating_add(1);

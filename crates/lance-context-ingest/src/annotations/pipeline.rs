@@ -75,6 +75,14 @@ impl Query {
         }
         if let Poll::Ready(result) = future.as_mut().poll(cx) {
             if let Ok(Some(lookup)) = &result {
+                if self.service.owner_batch() {
+                    let value = lookup.keys.observation();
+                    self.service.shared.batch_metrics.lock().unwrap().lookup(
+                        value.requested_keys,
+                        value.elapsed_us,
+                        value.index_used || value.indexed_key_columns > 0,
+                    );
+                }
                 let mut observed = self.service.shared.body_lookups.lock().unwrap();
                 observed.record_window(lookup.keys.observation(), self.requests, self.bytes);
                 if self.speculative {
@@ -170,9 +178,12 @@ impl Ahead {
                 return Ok(Loaded::Gap(page));
             };
             ensure!(index > after, "unordered speculative source window");
-            let Some(head) = prefetch::fetch(&service, index, meta).await? else {
+            let Some(mut head) = prefetch::fetch(&service, index, meta).await? else {
                 return Ok(Loaded::Unavailable);
             };
+            if service.owner_batch() {
+                head.drop_body();
+            }
             if prefetch::exceeds_key_window(&service, &head)? {
                 // Symmetric with the foreground: an oversize head may need the
                 // whole lookup budget, so it is never speculated beside one.
