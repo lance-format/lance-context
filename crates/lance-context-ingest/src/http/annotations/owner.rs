@@ -388,6 +388,12 @@ impl Owner {
                                     code: "prior_request_rejected",
                                     outcome: "rejected",
                                 }
+                            } else if error.is::<crate::annotations::ReceiptSuperseded>() {
+                                Failure {
+                                    status: StatusCode::CONFLICT,
+                                    code: "receipt_superseded",
+                                    outcome: "unknown",
+                                }
                             } else {
                                 Failure::unavailable("applied_pending", "unknown")
                             }

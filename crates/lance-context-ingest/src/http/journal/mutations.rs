@@ -121,6 +121,8 @@ impl DurableMutationClient {
     /// an earlier rejected request of this producer returns HTTP 409
     /// `prior_request_rejected` as an `AppendResponseError`. A 503
     /// `applied_pending` means the applier has not reached the index yet.
+    /// HTTP 409 `receipt_superseded` (slot reused by a newer generation) is
+    /// returned as a `ReceiptSuperseded` failure, never Applied.
     pub async fn wait_applied(&self, key: usize, commit: &CommitReply) -> Result<MutationReply> {
         let open = self.inner.opens.get(key).context("client lane out of range")?;
         validate_commit(commit, &self.inner.scope, open)?;
@@ -138,7 +140,21 @@ impl DurableMutationClient {
         let status = response.status();
         if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::UNPROCESSABLE_ENTITY
         {
-            return Err(super::unresolved_append(response).await);
+            let error = super::unresolved_append(response).await;
+            // The slot was reused by a newer producer generation: this
+            // receipt can never resolve. Typed so no caller retries it or
+            // treats it as Applied.
+            if status == reqwest::StatusCode::CONFLICT
+                && error
+                    .downcast_ref::<AppendResponseError>()
+                    .is_some_and(|e| e.code == "receipt_superseded")
+            {
+                return Err(error.context(crate::annotations::ReceiptSuperseded {
+                    receipt_generation: commit.meta.producer.as_u128() as u64,
+                    slot_generation: 0,
+                }));
+            }
+            return Err(error);
         }
         let result: MutationReply = super::bounded_json(response).await?;
         validate(&result, &self.inner.scope, open)?;

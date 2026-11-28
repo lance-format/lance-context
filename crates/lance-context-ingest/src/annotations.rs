@@ -38,7 +38,7 @@ pub mod single_body;
 mod status_filter;
 mod window;
 pub mod wire;
-pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint, PriorRejected};
+pub use checkpoint::{FrozenCheckpoint, PreparedCheckpoint, PriorRejected, ReceiptSuperseded};
 pub use lookup_observation::{
     BodyLookupObservation, BodyPrefetchObservation, LookupMetricObservation, PrefetchStop,
 };
@@ -914,7 +914,9 @@ impl Service {
     /// return its exact outcome. A Rejected outcome is returned as
     /// `MutationResult::Rejected`; if an earlier request of the same producer
     /// was rejected, this fails with `PriorRejected` so a later Applied can
-    /// never hide it from a caller that streamed past the rejection.
+    /// never hide it from a caller that streamed past the rejection. A receipt
+    /// whose producer generation is older than its slot's current generation
+    /// fails with `ReceiptSuperseded`, never Applied.
     pub async fn wait_applied(
         &self,
         accepted: &AcceptedAppend,
