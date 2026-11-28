@@ -93,6 +93,47 @@ async fn fetch_moves_past_a_refused_initial_or_cached_voter() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_fetch_skips_a_replica_behind_the_payload_index() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut c = RpcCluster::open(dir.path(), Options::default()).await?;
+    let leader = c.leader().await?;
+    let lagging = (1..=3).find(|voter| *voter != leader).unwrap();
+    let follower = c.net.nodes.remove(&lagging).context("missing follower")?;
+    // Keep its client RPC server and owner worker alive while pausing peer
+    // replication. The remaining two voters can still commit the append.
+    follower.network.shutdown().await?;
+    let original = batch(1);
+    let response = c
+        .client
+        .request(
+            leader,
+            Request::Append {
+                group: 10,
+                batch: original.clone(),
+            },
+        )
+        .await?;
+    let index = accepted(&response);
+    drop(response);
+    assert!(follower.handle.observation(10)?.status.applied < index);
+    c.client.leaders.lock().unwrap().insert(10, lagging);
+    let fetched = c
+        .client
+        .request_routed(Request::Fetch { group: 10, index })
+        .await;
+    c.shutdown().await?;
+    follower.runtime.shutdown().await?;
+    let fetched = fetched?;
+    assert!(
+        matches!(&fetched.reply, Reply::Record(Some(meta)) if meta == &original.meta),
+        "lagging replica returned {:?}",
+        fetched.reply
+    );
+    assert_eq!(fetched.body, original.body);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_voters_share_the_original_fetch_deadline() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let c = RpcCluster::open(dir.path(), Options::default()).await?;
