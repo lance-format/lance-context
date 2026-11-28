@@ -1087,6 +1087,7 @@ impl Service {
 
     /// Ask the publisher to freeze the current source window without waiting
     /// for its batching thresholds. Publication exactness is unchanged.
+    #[cfg(feature = "http")]
     pub(crate) fn demand_retirement(&self) {
         self.shared
             .retirement_demand
