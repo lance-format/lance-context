@@ -468,7 +468,9 @@ impl Service {
             .clone();
         let service = self.clone();
         let value_bytes = self.limits.value_bytes;
+        let stream_schema = schema.clone();
         let stream = async_stream::try_stream! {
+            let schema = stream_schema;
             let mut seen = BTreeMap::<u64, u32>::new();
             let mut chunk = Vec::<(Survivors, Vec<RecordBatch>, MergeReservation)>::new();
             let mut chunk_bytes = 0u64;
