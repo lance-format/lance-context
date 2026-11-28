@@ -197,7 +197,10 @@ impl Session {
 
     /// Share native read, decoder and index admission with the caller.
     /// Reservations remain attached to borrowed buffers after cache eviction.
-    pub fn with_native_memory(mut self, memory: Arc<dyn lance_core::memory::NativeMemoryPool>) -> Self {
+    pub fn with_native_memory(
+        mut self,
+        memory: Arc<dyn lance_core::memory::NativeMemoryPool>,
+    ) -> Self {
         self.native_memory = Some(memory);
         self
     }

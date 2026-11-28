@@ -755,7 +755,11 @@ impl ExecutionPlan for TakeExec {
             let obj_store = dataset.object_store.clone();
             let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
             // unwrap is safe since SchedulerConfig::max_bandwidth is always valid
-            let scan_scheduler = ScanScheduler::new_with_native_memory(obj_store, scheduler_config, dataset.session().native_memory());
+            let scan_scheduler = ScanScheduler::new_with_native_memory(
+                obj_store,
+                scheduler_config,
+                dataset.session().native_memory(),
+            );
 
             let take_stream = Arc::new(TakeStream::new(
                 dataset,
