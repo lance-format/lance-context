@@ -92,7 +92,9 @@ pub(super) struct Backpressure<'a>(&'a Metrics, Instant);
 
 impl Drop for Backpressure<'_> {
     fn drop(&mut self) {
-        self.0.backpressure_nanos.fetch_add(nanos(self.1.elapsed()), Relaxed);
+        self.0
+            .backpressure_nanos
+            .fetch_add(nanos(self.1.elapsed()), Relaxed);
     }
 }
 
@@ -138,7 +140,8 @@ impl Metrics {
     }
     pub(super) fn applied_wait(&self, d: Duration, ok: bool) {
         self.applied_waits.fetch_add(1, Relaxed);
-        self.applied_wait_failures.fetch_add(u64::from(!ok), Relaxed);
+        self.applied_wait_failures
+            .fetch_add(u64::from(!ok), Relaxed);
         self.applied_wait_nanos.fetch_add(nanos(d), Relaxed);
     }
     #[allow(dead_code)]
@@ -149,7 +152,13 @@ impl Metrics {
     pub fn snapshot(&self) -> MetricsSnapshot {
         let secs = |a: &AtomicU64| a.load(Relaxed) as f64 / 1e9;
         let records = self.records.load(Relaxed);
-        let per = |a: &AtomicU64| if records == 0 { 0.0 } else { a.load(Relaxed) as f64 / records as f64 };
+        let per = |a: &AtomicU64| {
+            if records == 0 {
+                0.0
+            } else {
+                a.load(Relaxed) as f64 / records as f64
+            }
+        };
         let elapsed = self.opened.elapsed().as_secs_f64().max(1e-9);
         MetricsSnapshot {
             buffer_ram_bytes: self.buffer_ram_bytes.load(Relaxed),

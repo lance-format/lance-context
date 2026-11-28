@@ -128,10 +128,17 @@ impl Buffer {
                         charge.set_backed_bytes(bytes);
                         state.ram_bytes += bytes;
                         state.turns += rows;
-                        state.queues.get_mut(&bucket).context("unregistered shard")?.push_back(
-                            Entry::Ram { batch, bytes, _charge: charge },
-                        );
-                        self.metrics.buffered(state.ram_bytes, state.spill_bytes, state.turns);
+                        state
+                            .queues
+                            .get_mut(&bucket)
+                            .context("unregistered shard")?
+                            .push_back(Entry::Ram {
+                                batch,
+                                bytes,
+                                _charge: charge,
+                            });
+                        self.metrics
+                            .buffered(state.ram_bytes, state.spill_bytes, state.turns);
                         drop(state);
                         self.pushed.notify_waiters();
                         return Ok(());
@@ -160,11 +167,19 @@ impl Buffer {
                 // Settle the reservation to the actual file size.
                 state.spill_bytes = state.spill_bytes - bytes as u64 + file_bytes;
                 state.turns += rows;
-                state.queues.get_mut(&bucket).context("unregistered shard")?.push_back(
-                    Entry::Spilled { path, rows, bytes, file_bytes },
-                );
+                state
+                    .queues
+                    .get_mut(&bucket)
+                    .context("unregistered shard")?
+                    .push_back(Entry::Spilled {
+                        path,
+                        rows,
+                        bytes,
+                        file_bytes,
+                    });
                 self.metrics.spilled(file_bytes);
-                self.metrics.buffered(state.ram_bytes, state.spill_bytes, state.turns);
+                self.metrics
+                    .buffered(state.ram_bytes, state.spill_bytes, state.turns);
                 drop(state);
                 self.pushed.notify_waiters();
                 return Ok(());
@@ -193,7 +208,10 @@ impl Buffer {
                 if state.closed {
                     return Ok(None);
                 }
-                let queue = state.queues.get_mut(&bucket).context("unregistered shard")?;
+                let queue = state
+                    .queues
+                    .get_mut(&bucket)
+                    .context("unregistered shard")?;
                 let mut taken = Vec::new();
                 let (mut rows, mut bytes) = (0usize, 0usize);
                 while let Some(next) = queue.front() {
@@ -222,14 +240,24 @@ impl Buffer {
             for entry in taken {
                 rows += entry.rows();
                 match entry {
-                    Entry::Ram { batch, bytes, _charge } => {
+                    Entry::Ram {
+                        batch,
+                        bytes,
+                        _charge,
+                    } => {
                         // The lane slot now covers these bytes.
                         self.state.lock().unwrap().ram_bytes -= bytes;
                         drop(_charge);
                         batches.push(batch);
                     }
-                    Entry::Spilled { path, file_bytes, .. } => {
-                        let read = if error.is_none() { Some(read_spill(path.clone()).await) } else { None };
+                    Entry::Spilled {
+                        path, file_bytes, ..
+                    } => {
+                        let read = if error.is_none() {
+                            Some(read_spill(path.clone()).await)
+                        } else {
+                            None
+                        };
                         let _ = std::fs::remove_file(&path);
                         self.state.lock().unwrap().spill_bytes -= file_bytes;
                         match read {
@@ -242,7 +270,8 @@ impl Buffer {
             }
             {
                 let state = self.state.lock().unwrap();
-                self.metrics.buffered(state.ram_bytes, state.spill_bytes, state.turns);
+                self.metrics
+                    .buffered(state.ram_bytes, state.spill_bytes, state.turns);
             }
             self.freed.notify_waiters();
             if let Some(error) = error {
@@ -324,7 +353,10 @@ async fn write_spill(path: PathBuf, batch: RecordBatch) -> Result<u64> {
         writer.write(&batch)?;
         writer.finish()?;
         // A cache of uncommitted input: no fsync, a restart replays source.
-        let file = writer.into_inner()?.into_inner().map_err(|e| e.into_error())?;
+        let file = writer
+            .into_inner()?
+            .into_inner()
+            .map_err(|e| e.into_error())?;
         Ok(file.metadata()?.len())
     })
     .await?
@@ -332,8 +364,8 @@ async fn write_spill(path: PathBuf, batch: RecordBatch) -> Result<u64> {
 
 async fn read_spill(path: PathBuf) -> Result<Vec<RecordBatch>> {
     tokio::task::spawn_blocking(move || -> Result<Vec<RecordBatch>> {
-        let file = std::fs::File::open(&path)
-            .with_context(|| format!("open spill {}", path.display()))?;
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("open spill {}", path.display()))?;
         let reader = arrow_ipc::reader::FileReader::try_new(std::io::BufReader::new(file), None)?;
         Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?)
     })

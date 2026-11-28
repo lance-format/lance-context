@@ -194,7 +194,10 @@ impl StreamingProducer {
     /// Reserve every lane's fixed slot, then start one task per lane. Resume
     /// recovered journal intents on the clients before opening.
     pub fn open(config: Config) -> Result<Self> {
-        ensure!(!config.shards.is_empty(), "streaming producer has no shards");
+        ensure!(
+            !config.shards.is_empty(),
+            "streaming producer has no shards"
+        );
         ensure!(config.applied_parallelism > 0, "zero applied parallelism");
         let first = &config.shards.values().next().unwrap().binding;
         let (tenant, table) = (first.tenant.clone(), first.qualified_table.clone());
@@ -308,9 +311,10 @@ impl StreamingProducer {
             .context("invalid routing column")?;
         let mut groups = BTreeMap::<u32, Vec<u32>>::new();
         for row in 0..batch.num_rows() {
-            let bucket = shared
-                .layout
-                .session_bucket(&shared.tenant, &shared.table, sessions.value(row))?;
+            let bucket =
+                shared
+                    .layout
+                    .session_bucket(&shared.tenant, &shared.table, sessions.value(row))?;
             ensure!(
                 shared.buffer.has_shard(bucket),
                 "turn routed to unconfigured shard {bucket}"
@@ -379,11 +383,11 @@ impl StreamingProducer {
                 let shared = self.shared.clone();
                 async move {
                     let started = std::time::Instant::now();
-                    let reply = lane::retry(&shared, || {
-                        slot.client.wait_applied(slot.key, &latest)
-                    })
-                    .await;
-                    shared.metrics.applied_wait(started.elapsed(), reply.is_ok());
+                    let reply =
+                        lane::retry(&shared, || slot.client.wait_applied(slot.key, &latest)).await;
+                    shared
+                        .metrics
+                        .applied_wait(started.elapsed(), reply.is_ok());
                     let reply = reply?;
                     Ok((
                         slot.clone(),
