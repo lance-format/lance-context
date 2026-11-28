@@ -548,7 +548,9 @@ impl Service {
                 results: Mutex::new(checkpoint::Results {
                     // Restore each slot's persisted earliest unresolved
                     // rejection so /applied keeps fencing later receipts.
-                    sticky: (0..outcomes.len()).map(|slot| snapshot.sticky(slot)).collect(),
+                    sticky: (0..outcomes.len())
+                        .map(|slot| snapshot.sticky(slot))
+                        .collect(),
                     base: snapshot,
                     latest: outcomes,
                 }),
@@ -936,7 +938,11 @@ impl Service {
                 )
                 .await?;
             let slot = slot(&accepted.meta, self.ingress.client.producer_slots())?;
-            self.shared.results.lock().unwrap().resolve_streamed(accepted, slot)
+            self.shared
+                .results
+                .lock()
+                .unwrap()
+                .resolve_streamed(accepted, slot)
         })
         .await
         .context("annotation applied wait deadline expired; wait again")?
