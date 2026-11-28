@@ -246,6 +246,7 @@ pub(crate) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Optio
 pub(crate) async fn prepare_task(
     publisher: &Publisher,
     dataset: &Dataset,
+    resume_existing_plan: bool,
 ) -> Result<Option<CompactionTask>> {
     let options = publisher
         .options
@@ -253,15 +254,18 @@ pub(crate) async fn prepare_task(
         .as_ref()
         .context("compaction options missing")?;
     let indices = supported_indices(dataset).await?;
-    let fragments = options.fragments(
-        dataset,
-        &indices,
-        publisher
-            .options
-            .turn_id_index
-            .as_ref()
-            .map(|_| turn_id_index::MAX_BUILD_ROWS),
-    );
+    let index = publisher.options.turn_id_index.as_ref();
+    let row_limit = index.map(|_| turn_id_index::MAX_BUILD_ROWS);
+    let mut fragments = options.fragments(dataset, &indices, row_limit);
+    // An already recorded plan may predate the skipping index's row limit.
+    // Finish it under the original byte and fragment bounds. Reads still
+    // scan any output fragment that the skipping index cannot cover.
+    if fragments.is_none()
+        && resume_existing_plan
+        && index.is_some_and(|index| index.index_type != TurnIdIndexType::Btree)
+    {
+        fragments = options.fragments(dataset, &indices, None);
+    }
     let Some(fragments) = fragments else {
         return Ok(None);
     };
@@ -304,7 +308,7 @@ pub(super) async fn prepare(
         .as_ref()
         .context("pending compaction needs configured limits")?;
     let dataset = read_compaction_base(publisher, pending.plan.read_version).await?;
-    let task = prepare_task(publisher, &dataset)
+    let task = prepare_task(publisher, &dataset, true)
         .await?
         .context("pending compaction has no eligible fragments under configured limits")?;
     let record_bytes = publisher.ingress.scope.contract.max_record_bytes as usize;
