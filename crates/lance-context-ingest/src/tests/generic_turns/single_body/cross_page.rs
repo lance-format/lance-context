@@ -142,12 +142,13 @@ async fn exercise(cancel: bool) -> Result<()> {
     let observed = service.body_lookup_observation();
     assert_eq!(observed.completed_lookups, 1);
     // The window is no longer capped at eight requests: it spans the whole
-    // committed backlog, bounded by key workspace. Only the first eight keep
-    // decoded bodies resident; the rest are keys-only until re-read from WAL.
+    // committed backlog, bounded by key workspace. The default owner batch
+    // pipeline retains no successor bodies: only the window head keeps its
+    // decoded body; the other eleven are keys-only until refetched from WAL.
     assert_eq!(observed.last_lookup_requests, 12);
     assert_eq!(observed.prefetch.request_bound, 0);
     assert_eq!(observed.prefetch.page_exhausted, 1);
-    assert_eq!(observed.prefetch.keys_only_records, 4);
+    assert_eq!(observed.prefetch.keys_only_records, 11);
     assert_eq!(observed.prefetch.body_refetches, 0);
     assert_eq!(observed.scans_started, 1);
     assert_eq!(
