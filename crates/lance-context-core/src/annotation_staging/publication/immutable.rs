@@ -1,7 +1,7 @@
 //! Publish original full-body Arrow slices in the same transaction as the
 //! processed WAL cut and bounded request results. No auxiliary annotation file.
 use super::*;
-use datafusion::physical_plan::{RecordBatchStream, SendableRecordBatchStream};
+use datafusion::physical_plan::SendableRecordBatchStream;
 
 /// Rows per streamed write group when writing one owner-batch fragment.
 const STREAM_ROWS_PER_GROUP: usize = 8192;

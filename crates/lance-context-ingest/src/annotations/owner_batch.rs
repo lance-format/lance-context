@@ -507,7 +507,7 @@ impl Service {
                         } else {
                             let batch = cluster(&service, &spec, &schema, std::mem::take(&mut chunk), options.cluster_rows, value_bytes).map_err(external)?;
                             chunk_bytes = 0;
-                            if let Some(batch) = batch { yield batch; }
+                            for batch in batch { yield batch; }
                         }
                     };
                     {
@@ -521,12 +521,12 @@ impl Service {
                     if chunk_bytes >= options.refetch_bytes {
                         let batch = cluster(&service, &spec, &schema, std::mem::take(&mut chunk), options.cluster_rows, value_bytes).map_err(external)?;
                         chunk_bytes = 0;
-                        if let Some(batch) = batch { yield batch; }
+                        for batch in batch { yield batch; }
                     }
                 }
             }
             let batch = cluster(&service, &spec, &schema, chunk, options.cluster_rows, value_bytes).map_err(external)?;
-            if let Some(batch) = batch { yield batch; }
+            for batch in batch { yield batch; }
             if seen != expected {
                 Err::<(), _>(external(anyhow::anyhow!(
                     "owner write batch differs from frozen first-create rows"
@@ -555,7 +555,7 @@ fn cluster(
     chunk: Vec<(Survivors, Vec<RecordBatch>, MergeReservation)>,
     cluster_rows: usize,
     value_bytes: usize,
-) -> Result<Option<RecordBatch>> {
+) -> Result<Vec<RecordBatch>> {
     let mut selected = Vec::<RecordBatch>::new();
     for (survivors, bodies, _reservation) in &chunk {
         let mut remaining = survivors.rows.iter().copied().peekable();
@@ -588,20 +588,26 @@ fn cluster(
     }
     let rows = selected.iter().map(RecordBatch::num_rows).sum::<usize>();
     if rows == 0 {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let selected = selected
         .into_iter()
         .map(|batch| Ok(RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?))
         .collect::<Result<Vec<_>>>()?;
+    if rows < cluster_rows {
+        // No clustering: the survivor runs are already in source order. Hand
+        // the zero-copy slices straight to the fragment writer instead of a
+        // per-row interleave copy.
+        drop(chunk);
+        return Ok(selected);
+    }
     let mut order = Vec::with_capacity(rows);
     for (b, batch) in selected.iter().enumerate() {
         for row in 0..batch.num_rows() {
             order.push((b, row));
         }
     }
-    let clustered = rows >= cluster_rows;
-    if clustered {
+    {
         let body = spec.body_schema().clone();
         let mut keyed = order
             .into_iter()
@@ -626,5 +632,5 @@ fn cluster(
     // their reservations are released when `chunk` drops below.
     let batch = interleave_record_batch(&refs, &order)?;
     drop(chunk);
-    Ok(Some(batch))
+    Ok(vec![batch])
 }
