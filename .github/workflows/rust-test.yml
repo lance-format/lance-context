@@ -417,6 +417,7 @@ jobs:
           cargo build -p lance-context-ingest --features service,http-client --bin lance-context-ingest
           cargo clippy -p lance-context-ingest --features service,http-client --all-targets -- -D warnings
           cargo test -p lance-context-ingest --features service,http-client --lib tests::annotation_http -- --test-threads=2
+          cargo test -p lance-context-ingest --features service,http-client,streaming-producer --lib tests::generic_turns::full_body_shards::streaming -- --test-threads=1
           cargo test -p lance-context-ingest --features service,http-client --lib tests::mixed_annotations -- --test-threads=2
           cargo test -p lance-context-ingest --features service,http-client --lib tests::generic_turns::http::full_body::replacement_flushes_the_predecessor_tail_before_batch_deadline -- --exact
           cargo test -p lance-context-ingest --features service,http-client --lib tests::materializer::advance -- --test-threads=2

@@ -12,6 +12,7 @@ worker = ["materializer", "dep:etcd-client"]
 http = ["dep:axum", "dep:http-body-util", "dep:arrow-ipc"]
 http-client = ["http", "dep:reqwest", "lance-context-wal/client-journal"]
 lance-io-metrics = ["lance-context-core/lance-io-metrics", "dep:lance-context-metrics"]
+streaming-producer = ["http-client", "materializer", "dep:arrow-select"]
 materializer = ["lance-context-wal/lance-integration", "dep:lance", "dep:lance-table", "dep:lance-io", "dep:lance-index", "dep:lance-file", "dep:lance-datafusion", "dep:datafusion-common", "dep:datafusion-physical-plan", "dep:prost", "dep:prost-types", "dep:object_store", "dep:futures", "dep:async-stream", "dep:async-trait"]
 
 [dependencies]
@@ -38,6 +39,7 @@ anyhow = "1"
 arrow-array = "58"
 arrow-schema = "58"
 arrow-ipc = { version = "58", optional = true }
+arrow-select = { version = "58", optional = true }
 base64 = "0.22"
 bytes = "1"
 lance-context-core = { version = "0.6.7", path = "../lance-context-core" }

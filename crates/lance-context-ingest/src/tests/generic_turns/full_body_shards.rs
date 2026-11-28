@@ -17,6 +17,8 @@ use crate::{
 };
 
 mod read_safety;
+#[cfg(feature = "streaming-producer")]
+mod streaming;
 
 struct Physical {
     binding: TableBinding,
