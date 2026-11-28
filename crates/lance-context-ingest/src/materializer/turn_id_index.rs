@@ -194,19 +194,18 @@ impl TurnIdIndex {
             // withdrew. Bounded by the same row/fragment limits as BTree.
             let ready = !selected.is_empty()
                 && (rows >= self.min_rows || selected.len() == 128 || !empty_sources.is_empty());
-            return Ok(ready.then(|| {
-                if bloom {
-                    Action::BuildBloomFilter {
-                        fragments: selected,
-                        empty_sources,
-                    }
-                } else {
-                    Action::BuildZoneMap {
-                        fragments: selected,
-                        empty_sources,
-                    }
+            let action = if bloom {
+                Action::BuildBloomFilter {
+                    fragments: selected,
+                    empty_sources,
                 }
-            }));
+            } else {
+                Action::BuildZoneMap {
+                    fragments: selected,
+                    empty_sources,
+                }
+            };
+            return Ok(ready.then_some(action));
         }
         Ok((rows >= self.min_rows || selected.len() == 128).then_some(Action::Build(selected)))
     }
