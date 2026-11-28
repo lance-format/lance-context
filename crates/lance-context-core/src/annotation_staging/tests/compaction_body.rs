@@ -168,7 +168,7 @@ async fn body_compaction_keeps_active_updates_old_readers_and_later_publication(
         .await?;
     let mut before = before;
     before.installed_base.version = selected.version_id();
-    assert_eq!(staging.observation().await, before);
+    assert_eq!(stable(staging.observation().await), stable(before));
     assert_eq!(selected.manifest().fragments, base.manifest().fragments);
     assert_eq!(read_all(&selected).await?, read_all(&base).await?);
     assert_eq!(
@@ -299,7 +299,7 @@ async fn body_compaction_rejects_changed_recovery_metadata_and_foreign_snapshots
                 .is_err(),
             "case {invalid}"
         );
-        assert_eq!(staging.observation().await, before);
+        assert_eq!(stable(staging.observation().await), stable(before));
         assert_eq!(current(&staging, "turn-000000").await?, expected);
         let held = staging.capture_turn("turn-000000").await?;
         let TurnBodySource::Materialized(unchanged) = held.body_source() else {

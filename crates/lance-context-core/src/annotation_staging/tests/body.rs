@@ -525,7 +525,7 @@ async fn narrow_compaction_must_preserve_the_selected_body_reference() -> Result
         } else {
             assert!(result.is_err());
         }
-        assert_eq!(staging.observation().await, before);
+        assert_eq!(stable(staging.observation().await), stable(before));
         assert_eq!(current(&staging, "turn-000000").await?.score, Some(0.9));
         assert_eq!(held.resolve().await?.unwrap().score, None);
     }
