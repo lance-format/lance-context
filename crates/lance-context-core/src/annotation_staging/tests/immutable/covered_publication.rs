@@ -26,6 +26,54 @@ async fn install(
 }
 
 #[tokio::test]
+async fn retired_body_can_recapture_installed_base_with_one_reader_permit() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let base = empty(&root.path().join("body.lance")).await?;
+    let staging = AnnotationStaging::new_immutable_body(
+        base,
+        scope(),
+        0,
+        Limits {
+            readers: 1,
+            ..Limits::default()
+        },
+    )?;
+    let lookup = staging.capture_immutable_base().await?;
+    assert_eq!(
+        staging
+            .register_immutable_committed(0, 1, &request(&["a"]), &lookup)
+            .await?,
+        Some(ApplyOutcome::Applied)
+    );
+    drop(lookup);
+    let mut staged = staging.capture_immutable_body("a").await?;
+    let record_index = origin(&staged).record_index;
+    assert_eq!(record_index, 1);
+    assert!(
+        !staging
+            .recapture_immutable_installed(&mut staged, record_index)
+            .await?
+    );
+    assert_eq!(origin(&staged).record_index, record_index);
+    let selected = publish(&staging, &["a"]).await?;
+
+    assert!(
+        staging
+            .recapture_immutable_installed(&mut staged, record_index)
+            .await?
+    );
+    assert_eq!(staging.observation().await.readers, 1);
+    let TurnBodySource::Materialized(base) = staged.source() else {
+        panic!("retired body must recapture the installed dataset");
+    };
+    assert_eq!(base.version_id(), selected.version_id());
+    assert_eq!(base.count_rows(Some("id = 'a'".into())).await?, 1);
+    drop(staged);
+    assert_eq!(staging.observation().await.readers, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn covered_lookup_survives_two_publications_and_rechecks_later_active_rows() -> Result<()> {
     let root = tempfile::tempdir()?;
     let base = empty(&root.path().join("body.lance")).await?;
