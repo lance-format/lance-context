@@ -141,13 +141,12 @@ async fn exercise(cancel: bool) -> Result<()> {
     runtime.apply_once_for_test().await?;
     let observed = service.body_lookup_observation();
     assert_eq!(observed.completed_lookups, 1);
-    // The window is no longer capped at eight requests: it spans the whole
-    // committed backlog, bounded by key workspace. Only the first eight keep
-    // decoded bodies resident; the rest are keys-only until re-read from WAL.
+    // One window spans the committed backlog. The owner batch keeps the
+    // eleven lookahead records as keys until publication refetches survivors.
     assert_eq!(observed.last_lookup_requests, 12);
     assert_eq!(observed.prefetch.request_bound, 0);
     assert_eq!(observed.prefetch.page_exhausted, 1);
-    assert_eq!(observed.prefetch.keys_only_records, 4);
+    assert_eq!(observed.prefetch.keys_only_records, 11);
     assert_eq!(observed.prefetch.body_refetches, 0);
     assert_eq!(observed.scans_started, 1);
     assert_eq!(
@@ -183,12 +182,12 @@ async fn exercise(cancel: bool) -> Result<()> {
             runtime.apply_once_for_test().await?;
             assert_eq!(service.observation().await.0.applied, *index);
         }
-        // One history scan covered all twelve requests; keys-only records
-        // were re-read from the durable WAL instead of held in memory.
+        // One history scan covered all twelve requests, and apply consumed
+        // the retained keys without refetching their bodies.
         let observed = service.body_lookup_observation();
         assert_eq!(observed.completed_lookups, 1);
         assert_eq!(observed.scans_started, 1);
-        assert_eq!(observed.prefetch.body_refetches, 4);
+        assert_eq!(observed.prefetch.body_refetches, 0);
         finish(&c, &storage, &spec, &input, service, runtime, backlog).await?;
     }
     c.shutdown().await
