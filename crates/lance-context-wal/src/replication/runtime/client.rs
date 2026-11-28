@@ -185,6 +185,7 @@ impl WireRequest {
                 query: query::Query::PublisherBinding { .. },
                 ..
             } => MAX_BINDING_META,
+            Self::ReadSource { request, .. } => request.reply_metadata_limit(),
             _ => MAX_META,
         }
     }
