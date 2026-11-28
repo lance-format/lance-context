@@ -574,13 +574,13 @@ impl Handle {
     ) -> Result<Pending<source_read::Observation>> {
         let route = self.route(group)?;
         ensure!(
-            (1..=128).contains(&request.limit),
+            (1..=source_read::MAX_PAGE_RECORDS).contains(&request.limit),
             "invalid committed source bounds"
         );
         let credit = self
             .shared
             .control
-            .reserve(256 * request.limit + 1024 + source::MAX_CLOSED_BYTES)?;
+            .reserve(request.reply_metadata_limit())?;
         let (reply, receive) = oneshot::channel();
         self.enqueue(
             route,

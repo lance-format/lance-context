@@ -7,6 +7,8 @@
 //! Deploy support on WAL servers before enabling this RPC in their consumers.
 use super::*;
 
+pub(super) const MAX_PAGE_RECORDS: usize = 128;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Request {
     pub table: Uuid,
@@ -16,12 +18,18 @@ pub struct Request {
 }
 
 impl Request {
+    /// Bounds the serialized page, optional closure and RPC response envelope.
+    /// Only valid pages reach execution; the cap also bounds invalid requests.
+    pub(super) fn reply_metadata_limit(&self) -> usize {
+        256 * self.limit.min(MAX_PAGE_RECORDS) + 1024 + source::MAX_CLOSED_BYTES
+    }
+
     pub(super) fn validate(&self, layout: &Layout, group: u64) -> Result<()> {
         ensure!(
             !self.table.is_nil()
                 && layout.group_for_bucket(self.bucket)? == group
                 && self.after < u64::MAX
-                && (1..=128).contains(&self.limit),
+                && (1..=MAX_PAGE_RECORDS).contains(&self.limit),
             "invalid committed source request"
         );
         Ok(())
