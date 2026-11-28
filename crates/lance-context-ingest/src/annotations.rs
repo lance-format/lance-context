@@ -239,7 +239,7 @@ impl Service {
         &self.shared.phases
     }
 
-    #[cfg(feature = "http")]
+    #[cfg(any(feature = "http", test))]
     pub(crate) fn ingress(&self) -> &Ingress {
         &self.ingress
     }
