@@ -25,12 +25,12 @@ mod local_payload;
 pub mod lookup_capture;
 mod lookup_observation;
 #[cfg(feature = "service")]
-pub(crate) mod metadata_upload;
+pub mod metadata_upload;
 pub mod mixed;
 mod pipeline;
 mod prefetch;
 #[cfg(all(feature = "service", feature = "lance-io-metrics"))]
-pub(crate) mod read_io;
+pub mod read_io;
 pub mod runtime;
 mod shard;
 pub mod single_body;
