@@ -231,6 +231,23 @@ impl TurnIngestionSpec {
         self.business_key(&values, maximum)
     }
 
+    #[cfg(feature = "materializer")]
+    pub(crate) fn row_identity<'a>(
+        &self,
+        body: &'a RecordBatch,
+        row: usize,
+        maximum: usize,
+    ) -> Result<(String, &'a str)> {
+        let key = self.row_key(body, row, maximum)?;
+        // row_key has already validated the routing column as part of the tuple.
+        let routing = body
+            .column(self.routing_index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("invalid routing column")?;
+        Ok((key, routing.value(row)))
+    }
+
     /// Includes the actual body schema and its metadata, ordered key columns,
     /// and routing rule. It is not a rollout/mixed wire-schema fingerprint.
     pub fn fingerprint(&self) -> Result<[u8; 32]> {
