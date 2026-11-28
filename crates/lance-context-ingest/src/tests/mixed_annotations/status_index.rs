@@ -52,6 +52,7 @@ async fn owner_with_indexes(
                 compaction: compact.then_some(crate::materializer::SmallFileCompaction {
                     target_file_bytes: 64 << 10,
                     min_fragments: 2,
+                    ..Default::default()
                 }),
                 ..Default::default()
             },

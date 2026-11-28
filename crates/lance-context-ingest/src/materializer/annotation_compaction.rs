@@ -56,8 +56,7 @@ impl Preparation {
             let first = covered.next().context("empty background compaction")?;
             // A covered turn-ID ZoneMap is withdrawn by the Rewrite commit and
             // rebuilt later; it needs no remap. Other address indexes still do.
-            let withdrawn =
-                lance_context_core::native_compaction::rewrite_withdraws_coverage(&current, index);
+            let withdrawn = lance_context_core::native_compaction::withdraws_coverage(index);
             if covered.any(|value| value != first)
                 || lance_index::is_system_index(index)
                 || (first
@@ -152,7 +151,7 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
         // path; concurrent object-store writes must all register their outputs.
         return Ok(None);
     }
-    let Some(task) = compaction::prepare_task(publisher, &source).await? else {
+    let Some(task) = compaction::prepare_task(publisher, &source, false).await? else {
         return Ok(None);
     };
     if task.task.fragments.iter().any(|f| !f.overlays.is_empty()) {

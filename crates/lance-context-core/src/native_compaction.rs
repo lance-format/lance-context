@@ -27,35 +27,29 @@ pub fn withdraws_zone_map_coverage(index: &lance_table::format::IndexMetadata) -
         })
 }
 
-/// Name of the managed annotation turn-ID index. Only its ZoneMap segments may
-/// be withdrawn, rather than remapped, by a stable-row-ID rewrite.
-pub const TURN_ID_INDEX_NAME: &str = "lance_context_turn_id";
-
-/// Whether a covered address-domain index may be left out of a rewrite's
-/// remaps. On a stable-row-ID table, Lance's Rewrite commit withdraws the
-/// rewritten fragments from such an index's coverage, so reads of them fall
-/// back to an exact scan until the owner rebuilds that coverage. This is only
-/// accepted for the managed turn-ID ZoneMap: other address indexes, unknown
-/// detail types and system indexes still require an eager remap. Prepare and
-/// recovery validation must both use this one predicate.
-pub fn rewrite_withdraws_coverage(
-    base: &Dataset,
-    index: &lance_table::format::IndexMetadata,
-) -> bool {
-    base.manifest().uses_stable_row_ids()
-        && !lance_index::is_system_index(index)
-        && index.name == TURN_ID_INDEX_NAME
-        && index.results_are_row_addrs()
-        && !index.supports_eager_remap()
+/// Bloom-filter counterpart of [`withdraws_zone_map_coverage`]: typed
+/// `BloomFilterIndexDetails`, format version 0, never remapped. A rewrite
+/// withdraws coverage of moved fragments exactly as for a ZoneMap.
+pub fn withdraws_bloom_filter_coverage(index: &lance_table::format::IndexMetadata) -> bool {
+    index.index_version == 0
         && index.index_details.as_ref().is_some_and(|details| {
-            // Lance writes ZoneMap details as `lance.table.ZoneMapIndexDetails`
-            // (index_old.proto), not under the `lance.index.pb` package.
             details
-                .type_url
-                .rsplit_once('/')
-                .is_some_and(|(_, name)| name == "lance.table.ZoneMapIndexDetails")
+                .to_msg::<lance_index::pb::BloomFilterIndexDetails>()
+                .is_ok()
         })
 }
+
+/// A covered segment that a native rewrite withdraws rather than remaps.
+pub fn withdraws_coverage(index: &lance_table::format::IndexMetadata) -> bool {
+    withdraws_zone_map_coverage(index) || withdraws_bloom_filter_coverage(index)
+}
+
+/// Name of the managed annotation turn-ID index.
+pub const TURN_ID_INDEX_NAME: &str = "lance_context_turn_id";
+
+/// Name of the managed ZoneMap on a turn table's routing column (for example
+/// `session_id`). A rewrite withdraws its coverage via [`withdraws_zone_map_coverage`].
+pub const TURN_ROUTING_INDEX_NAME: &str = "lance_context_turn_routing";
 
 /// Prepare one bounded, append-only rewrite against its exact source snapshot.
 /// The caller assigns final fragment IDs under its publication fence, retains
@@ -149,12 +143,8 @@ pub async fn prepare_rewrite(
             return Err(invalid("compaction mixes index coverage"));
         }
         if covered && index.results_are_row_addrs() {
-            if rewrite_withdraws_coverage(base, index) {
-                // The commit withdraws this coverage; nothing to remap.
-                continue;
-            }
             if !index.supports_eager_remap() {
-                if withdraws_zone_map_coverage(index) {
+                if withdraws_coverage(index) {
                     continue;
                 }
                 return Err(invalid("compaction cannot preserve this address index"));
@@ -264,13 +254,8 @@ pub async fn validate_index_remaps(base: &Dataset, operation: &Operation) -> Res
             return Err(invalid("prepared compaction mixes index coverage"));
         }
         if covered && index.results_are_row_addrs() {
-            // Same predicate as `prepare_rewrite`: a rewrite prepared before a
-            // restart must validate identically afterwards.
-            if rewrite_withdraws_coverage(base, index) {
-                continue;
-            }
             if !index.supports_eager_remap() {
-                if withdraws_zone_map_coverage(index) {
+                if withdraws_coverage(index) {
                     continue;
                 }
                 return Err(invalid(

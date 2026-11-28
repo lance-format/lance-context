@@ -35,10 +35,7 @@ use anyhow::{ensure, Context, Result};
 use arrow_array::{RecordBatch, StringArray, UInt32Array};
 use bytes::Bytes;
 use lance_context_core::annotation_staging::Limits;
-use lance_context_wal::{
-    placement::Layout,
-    replication::runtime::client::payload_memory::{Pool, Reservation},
-};
+use lance_context_wal::{placement::Layout, replication::runtime::client::payload_memory::Pool};
 
 use crate::{
     annotations::{MutationResult, Shard},
@@ -363,7 +360,8 @@ impl StreamingProducer {
     /// Wait until every buffered turn is committed, then wait `/applied` on
     /// every lane touched since the previous fence. Returns the per-shard
     /// Applied cuts; a Rejected outcome is returned, not raised, so the caller
-    /// decides. Pending state is cleared only for lanes that resolved.
+    /// decides. A terminal wait error retains every pending receipt and
+    /// stops the producer before any source can advance past that fence.
     pub async fn fence(&self) -> Result<Fence> {
         let _order = self.sender.lock().await;
         self.shared.buffer.drained().await?;
@@ -377,8 +375,8 @@ impl StreamingProducer {
                     .map(|p| (slot.clone(), p.latest.clone(), p.records, p.rows))
             })
             .collect();
-        use futures::StreamExt;
-        let results: Vec<Result<(Arc<LaneSlot>, LaneApplied)>> =
+        use futures::{StreamExt, TryStreamExt};
+        let results: Result<Vec<(Arc<LaneSlot>, LaneApplied)>> =
             futures::stream::iter(touched.into_iter().map(|(slot, latest, records, rows)| {
                 let shared = self.shared.clone();
                 async move {
@@ -401,11 +399,17 @@ impl StreamingProducer {
                 }
             }))
             .buffer_unordered(self.applied_parallelism)
-            .collect()
+            .try_collect()
             .await;
+        let resolved = match results {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.shared.buffer.fail(&error);
+                return Err(error.context("streaming fence: applied wait failed"));
+            }
+        };
         let mut fence = Fence::default();
-        for result in results {
-            let (slot, applied) = result?;
+        for (slot, applied) in resolved {
             {
                 let mut pending = slot.pending.lock().unwrap();
                 // Nothing committed after the snapshot: sender lock held.

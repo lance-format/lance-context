@@ -18,8 +18,8 @@ impl Preparation {
     pub(crate) async fn finish(self, current: &Dataset) -> Result<Option<p::Descriptors>> {
         let descriptors = self.job.await??;
         match self.key {
-            Key::Turn => Ok(Some(
-                session_index::rebase_turn(&self.source, current, &descriptors).await?,
+            Key::Turn | Key::Routing => Ok(Some(
+                session_index::rebase_key(&self.source, current, &descriptors, self.key).await?,
             )),
             Key::Status => session_index::rebase_status(&self.source, current, &descriptors).await,
             Key::Session => unreachable!("annotation preparation selects only turn or status"),
@@ -54,7 +54,7 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
     }
     if selected.is_none() {
         if let Some(options) = &publisher.options.turn_id_index {
-            selected = options.action(&source).await?.map(|a| (a, Key::Turn));
+            selected = options.action(&source).await?;
         }
     }
     if selected.is_none() && !status_first {

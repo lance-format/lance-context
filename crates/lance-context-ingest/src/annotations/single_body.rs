@@ -141,20 +141,20 @@ pub(super) fn decode(
                 "null required body field"
             );
         }
-        let original = RecordBatch::try_new(spec.body_schema().clone(), batch.columns().to_vec())?;
-        for row in 0..batch.num_rows() {
-            let turn = spec.row_key(&original, row, key_bytes)?;
-            let rollout_id = spec.routing_key(&turn)?;
+        let (_, columns, _) = batch.into_parts();
+        // The wire and original fields compare equal but come from separate
+        // schemas. Using the original schema avoids comparing them per row.
+        let original = RecordBatch::try_new(spec.body_schema().clone(), columns)?;
+        for row in 0..original.num_rows() {
+            let (turn, routing) = spec.row_identity(&original, row, key_bytes)?;
             rows.push(mixed::Created {
                 turn,
-                rollout_id,
+                rollout_id: routing.to_owned(),
                 annotation: TurnAnnotation::default(),
             });
         }
-        bodies.push(RecordBatch::try_new(
-            stored.clone(),
-            batch.columns().to_vec(),
-        )?);
+        let (_, columns, _) = original.into_parts();
+        bodies.push(RecordBatch::try_new(stored.clone(), columns)?);
     }
     Ok(mixed::Decoded::Creates { rows, bodies })
 }
