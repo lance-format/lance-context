@@ -154,30 +154,6 @@ async fn client_with_open(
     open_client(root, base, spec, open, false).await
 }
 
-pub(super) fn journal(root: &std::path::Path, base: reqwest::Url, open: ProducerOpen) -> Config {
-    Config {
-        directory: root.join("client-journal"),
-        opens: vec![open],
-        base,
-        request_timeout: DEADLINE,
-        journal: Settings {
-            state_bytes: 16 << 20,
-            queue_bytes: 8 << 20,
-            batch_bytes: 2 << 20,
-            file_bytes: 64 << 10,
-            log_bytes: 96 << 20,
-            ..Default::default()
-        },
-    }
-}
-
-pub(super) fn transport() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .retry(reqwest::retry::never())
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
-}
-
 pub(super) async fn open_client(
     root: &std::path::Path,
     base: reqwest::Url,
