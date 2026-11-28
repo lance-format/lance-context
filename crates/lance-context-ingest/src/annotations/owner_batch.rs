@@ -431,12 +431,35 @@ impl Service {
         index: u64,
         meta: BatchMeta,
     ) -> Result<(Vec<RecordBatch>, MergeReservation)> {
+        self.refetch_bodies_bounded(index, meta, None).await
+    }
+
+    /// Point reads must not wait indefinitely for apply memory held by the
+    /// publisher: bound the wait and surface a retryable error instead.
+    pub(super) async fn refetch_bodies_for_read(
+        &self,
+        index: u64,
+        meta: BatchMeta,
+    ) -> Result<(Vec<RecordBatch>, MergeReservation)> {
+        self.refetch_bodies_bounded(index, meta, Some(Duration::from_secs(2))).await
+    }
+
+    async fn refetch_bodies_bounded(
+        &self,
+        index: u64,
+        meta: BatchMeta,
+        wait: Option<Duration>,
+    ) -> Result<(Vec<RecordBatch>, MergeReservation)> {
+        let deadline = wait.map(|wait| tokio::time::Instant::now() + wait);
         loop {
             if let Some(pending) = prefetch::fetch(self, index, meta.clone()).await? {
                 let mixed::Decoded::Creates { bodies, .. } = pending.decoded else {
                     bail!("immutable body cannot contain patches")
                 };
                 return Ok((bodies, pending._reservation));
+            }
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                bail!("owner batch body refetch memory unavailable");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

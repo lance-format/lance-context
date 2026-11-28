@@ -137,7 +137,7 @@ impl Service {
                 // Capture -> Close -> Fetch: publication can retire the WAL
                 // record after the ordered capture. The row is then in the
                 // installed base; recapture it below and read from Lance.
-                match self.refetch_bodies(source.record_index, meta).await {
+                match self.refetch_bodies_for_read(source.record_index, meta).await {
                     Ok(fetched) => refetched = Some((source, fetched)),
                     Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
                         self.recapture_retired(&mut view, source.record_index)

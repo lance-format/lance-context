@@ -332,9 +332,14 @@ impl AnnotationStaging {
             .active
             .get(key)
             .or_else(|| state.frozen.as_ref().and_then(|f| f.values.get(key)));
+        // A staged entry whose WAL record is already covered by the installed
+        // base (frozen but not yet retired) reads from Lance: its body is
+        // durable there, and its WAL payload may be retired or unadmittable.
         let source = match staged.and_then(|value| value.pending_turn.as_ref()) {
-            Some(pending) => body::CapturedBody::Staged(pending.source()),
-            None => body::CapturedBody::Base(state.base.clone()),
+            Some(pending) if pending.source().record_index > state.materialized => {
+                body::CapturedBody::Staged(pending.source())
+            }
+            _ => body::CapturedBody::Base(state.base.clone()),
         };
         Ok(ImmutableBodyRead {
             source,
