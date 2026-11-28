@@ -16,7 +16,14 @@ fn request(after: u64) -> Request {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn committed_source_routes_over_tls_and_holds_bounded_reply_credit() -> Result<()> {
     let directory = tempfile::tempdir()?;
-    let c = RpcCluster::open(directory.path(), Options::default()).await?;
+    let c = RpcCluster::open(
+        directory.path(),
+        Options {
+            control_bytes: 8 << 20,
+            ..Options::default()
+        },
+    )
+    .await?;
     let leader = c.leader().await?;
     let original = batch(1);
     let response = c
@@ -74,6 +81,25 @@ async fn committed_source_routes_over_tls_and_holds_bounded_reply_credit() -> Re
         })
     ));
     drop(response);
+    assert_eq!(c.client.budgets.control.available_permits(), available);
+    // Keep completed source pages alive while issuing another control read.
+    // Two generic 4 MiB reservations would exhaust this client's budget.
+    let replies = timeout(Duration::from_secs(5), async {
+        let mut replies = Vec::new();
+        for _ in 0..16 {
+            let reply = c.client.request(leader, request(0)).await?;
+            assert!(matches!(reply.reply, Reply::Source(_)));
+            assert!(reply._credit.num_permits() < 16 << 10);
+            replies.push(reply);
+        }
+        c.client
+            .request(leader, Request::Status { group: 10 })
+            .await?;
+        Ok::<_, anyhow::Error>(replies)
+    })
+    .await
+    .context("retained source pages exhausted control reply credit")??;
+    drop(replies);
     assert_eq!(c.client.budgets.control.available_permits(), available);
     c.shutdown().await
 }
