@@ -1,8 +1,11 @@
 //! Applied-key cache: 128-bit identities of turns already durably committed or
 //! Applied, so the producer can drop resent turns before they reach the buffer.
 //!
-//! Key = xxh3-128 of the primary-key values joined with `\0` (for the generic
-//! Trace spec: `session_id \0 id`). Tier 1 is a fixed-capacity RAM map with
+//! Key = xxh3-128 of the shard's scope digest followed by the length-prefixed
+//! primary-key values (for the generic Trace spec: `session_id`, `id`). The
+//! scope is the exact table identity (table id, incarnation, relation, shard
+//! bucket, spec fingerprint); it is stored in the disk tier and a DB whose
+//! stored scope differs is wiped on open, so keys never cross identities. Tier 1 is a fixed-capacity RAM map with
 //! FIFO eviction; tier 2 (feature `applied-key-cache`) is RocksDB on the PVC
 //! with a bloom filter and a fixed LRU block cache. Writes go through to both
 //! tiers; lookups check RAM, then RocksDB.
@@ -28,12 +31,53 @@ use std::{
 
 use anyhow::{Context, Result};
 use arrow_array::{RecordBatch, StringArray};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub type Key = u128;
 
-pub fn key(values: &[&str]) -> Key {
+/// Exact table identity of one cached shard. Keys of different scopes never
+/// alias: the scope digest is mixed into every key hash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scope {
+    pub table: Uuid,
+    pub incarnation: Uuid,
+    pub relation: String,
+    pub bucket: u32,
+    pub spec_fingerprint: [u8; 32],
+}
+
+impl Scope {
+    pub fn new(
+        relation: &str,
+        bucket: u32,
+        binding: &crate::TableBinding,
+        spec: &crate::turn_ingestion::TurnIngestionSpec,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            !binding.table.is_nil() && !binding.incarnation.is_nil() && !relation.is_empty(),
+            "applied-key scope requires a bound table identity"
+        );
+        Ok(Self {
+            table: binding.table,
+            incarnation: binding.incarnation,
+            relation: relation.to_owned(),
+            bucket,
+            spec_fingerprint: spec.fingerprint()?,
+        })
+    }
+
+    fn digest(&self) -> Result<[u8; 16]> {
+        let bytes = serde_json::to_vec(self)?;
+        Ok(xxhash_rust::xxh3::xxh3_128(&bytes).to_le_bytes())
+    }
+}
+
+/// Key of one row's primary-key values within a scope digest.
+pub fn key(scope: &[u8; 16], values: &[&str]) -> Key {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    hasher.update(scope);
     // Length-prefix each value: separator joins are ambiguous
     // (["a\0b","c"] vs ["a","b\0c"]).
     hasher.update(&(values.len() as u64).to_le_bytes());
@@ -45,7 +89,7 @@ pub fn key(values: &[&str]) -> Key {
 }
 
 /// Keys of every row, from the named UTF8 key columns in order.
-pub fn batch_keys(batch: &RecordBatch, columns: &[String]) -> Result<Vec<Key>> {
+fn batch_keys(scope: &[u8; 16], batch: &RecordBatch, columns: &[String]) -> Result<Vec<Key>> {
     let arrays = columns
         .iter()
         .map(|name| {
@@ -62,7 +106,7 @@ pub fn batch_keys(batch: &RecordBatch, columns: &[String]) -> Result<Vec<Key>> {
         .map(|row| {
             values.clear();
             values.extend(arrays.iter().map(|array| array.value(row)));
-            key(&values)
+            key(scope, &values)
         })
         .collect())
 }
@@ -76,6 +120,8 @@ pub enum Reason {
 }
 
 pub struct Config {
+    /// Exact identity of every cached shard, by bucket. Required.
+    pub scopes: Vec<Scope>,
     /// RAM tier capacity in keys (~48 bytes each with map overhead).
     pub ram_keys: usize,
     /// RocksDB directory on the PVC; `None` keeps the cache RAM-only.
@@ -93,6 +139,7 @@ struct Ram {
 
 pub struct AppliedKeyCache {
     capacity: usize,
+    scopes: std::collections::BTreeMap<u32, (Scope, [u8; 16])>,
     ram: Mutex<Ram>,
     #[cfg(feature = "applied-key-cache")]
     disk: Option<rocksdb::DB>,
@@ -149,13 +196,26 @@ pub struct CacheSnapshot {
 
 #[cfg(feature = "applied-key-cache")]
 const WARM_PREFIX: &[u8] = b"\xffwarm/";
+#[cfg(feature = "applied-key-cache")]
+const SCOPE_KEY: &[u8] = b"\xffscope";
 
 impl AppliedKeyCache {
     pub fn open(config: Config) -> Result<Self> {
         anyhow::ensure!(config.ram_keys > 0, "empty applied-key RAM tier");
+        anyhow::ensure!(!config.scopes.is_empty(), "applied-key cache has no scope");
+        let mut scopes = std::collections::BTreeMap::new();
+        for scope in &config.scopes {
+            anyhow::ensure!(
+                scopes
+                    .insert(scope.bucket, (scope.clone(), scope.digest()?))
+                    .is_none(),
+                "duplicate applied-key scope for shard {}",
+                scope.bucket
+            );
+        }
         #[cfg(feature = "applied-key-cache")]
         let disk = match &config.disk_dir {
-            Some(dir) => Some(open_disk(dir, &config)?),
+            Some(dir) => Some(open_disk(dir, &config, &serde_json::to_vec(&config.scopes)?)?),
             None => None,
         };
         #[cfg(not(feature = "applied-key-cache"))]
@@ -165,11 +225,40 @@ impl AppliedKeyCache {
         );
         Ok(Self {
             capacity: config.ram_keys,
+            scopes,
             ram: Mutex::default(),
             #[cfg(feature = "applied-key-cache")]
             disk,
             metrics: CacheMetrics::default(),
         })
+    }
+
+    fn scope(&self, bucket: u32) -> Result<&(Scope, [u8; 16])> {
+        self.scopes
+            .get(&bucket)
+            .with_context(|| format!("applied-key cache has no scope for shard {bucket}"))
+    }
+
+    /// Scoped keys of every row of a batch routed to `bucket`.
+    pub fn batch_keys(&self, bucket: u32, batch: &RecordBatch, columns: &[String]) -> Result<Vec<Key>> {
+        batch_keys(&self.scope(bucket)?.1, batch, columns)
+    }
+
+    /// Refuse a producer shard whose binding or spec is not this cache's scope.
+    pub fn check_binding(
+        &self,
+        bucket: u32,
+        binding: &crate::TableBinding,
+        spec: &crate::turn_ingestion::TurnIngestionSpec,
+    ) -> Result<()> {
+        let (scope, _) = self.scope(bucket)?;
+        anyhow::ensure!(
+            scope.table == binding.table
+                && scope.incarnation == binding.incarnation
+                && scope.spec_fingerprint == spec.fingerprint()?,
+            "applied-key cache scope differs from shard {bucket} binding"
+        );
+        Ok(())
     }
 
     pub fn insert(&self, keys: &[Key], reason: Reason) -> Result<()> {
@@ -338,8 +427,31 @@ fn warm_key(shard: u32) -> Vec<u8> {
 }
 
 #[cfg(feature = "applied-key-cache")]
-fn open_disk(dir: &std::path::Path, config: &Config) -> Result<rocksdb::DB> {
+fn open_disk(dir: &std::path::Path, config: &Config, scope: &[u8]) -> Result<rocksdb::DB> {
     std::fs::create_dir_all(dir)?;
+    let db = open_db(dir, config)?;
+    match db.get(SCOPE_KEY)? {
+        Some(stored) if stored == scope => return Ok(db),
+        None if db.iterator(rocksdb::IteratorMode::Start).next().is_none() => {
+            db.put(SCOPE_KEY, scope)?;
+            db.flush()?;
+            return Ok(db);
+        }
+        // Another (or no recorded) table identity: its keys and warm
+        // cursors must never answer for this scope. Wipe and start empty.
+        _ => {}
+    }
+    drop(db);
+    rocksdb::DB::destroy(&rocksdb::Options::default(), dir)?;
+    std::fs::create_dir_all(dir)?;
+    let db = open_db(dir, config)?;
+    db.put(SCOPE_KEY, scope)?;
+    db.flush()?;
+    Ok(db)
+}
+
+#[cfg(feature = "applied-key-cache")]
+fn open_db(dir: &std::path::Path, config: &Config) -> Result<rocksdb::DB> {
     let mut table = rocksdb::BlockBasedOptions::default();
     table.set_bloom_filter(config.bloom_bits_per_key, false);
     table.set_block_cache(&rocksdb::Cache::new_lru_cache(config.block_cache_bytes));
@@ -369,15 +481,27 @@ impl AppliedKeyCache {
     /// fragment. Fragments are read one at a time with a single readahead
     /// batch and a byte-rate limit. Run it as a background task; it stops at
     /// the end of the snapshot it opened.
+    ///
+    /// `selected` is the owner's verified selected full body for `shard` and
+    /// `dataset` must be opened at exactly its manifest version; both must
+    /// match this cache's scope for the shard, or nothing is warmed.
     pub async fn warm(
         &self,
         shard: u32,
+        selected: &crate::annotations::single_body::SelectedBody,
         dataset: &lance::Dataset,
         key_columns: &[String],
         limits: WarmLimits,
         stop: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         use futures::TryStreamExt;
+        let (scope, digest) = self.scope(shard)?.clone();
+        anyhow::ensure!(
+            selected.table == scope.table
+                && selected.incarnation == scope.incarnation
+                && dataset.version().version == selected.manifest.version,
+            "applied-key warm source is not this shard's selected identity"
+        );
         let resume = self.warmed_through(shard)?;
         let mut fragments: Vec<_> = dataset
             .get_fragments()
@@ -419,7 +543,7 @@ impl AppliedKeyCache {
                     return Ok(());
                 }
                 let bytes = batch.get_array_memory_size() as u64;
-                let keys = batch_keys(&batch, key_columns)?;
+                let keys = batch_keys(&digest, &batch, key_columns)?;
                 self.insert(&keys, Reason::Warm)?;
                 rows += keys.len() as u64;
                 read_bytes += bytes;
