@@ -12,6 +12,7 @@ pub(super) fn options(enabled: bool) -> Options {
         compaction: enabled.then_some(SmallFileCompaction {
             target_file_bytes: 256 << 10,
             min_fragments: 4,
+            ..Default::default()
         }),
         ..Options::default()
     }
@@ -288,6 +289,7 @@ async fn compaction_and_appends_progress_with_backlog_across_takeover() -> Resul
         compaction: Some(SmallFileCompaction {
             target_file_bytes: 64 << 10,
             min_fragments: 2,
+            ..Default::default()
         }),
         ..options(true)
     };

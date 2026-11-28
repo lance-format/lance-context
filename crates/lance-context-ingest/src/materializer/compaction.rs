@@ -16,12 +16,20 @@ use std::collections::BTreeSet;
 pub struct SmallFileCompaction {
     pub target_file_bytes: usize,
     pub min_fragments: usize,
+    /// Rewrite each task's rows ordered by these top-level columns, e.g.
+    /// `["session_id", "id"]`, so per-fragment and per-zone min/max ranges are
+    /// narrow and a ZoneMap on the leading column can prune. Empty keeps source
+    /// order (binary copy when possible). A sorted rewrite always re-encodes,
+    /// sorts within the admitted workspace (spilling beyond it), and refuses
+    /// tables whose covered indices need an address remap (e.g. BTree turn IDs).
+    pub sort_by: Vec<String>,
 }
 impl Default for SmallFileCompaction {
     fn default() -> Self {
         Self {
             target_file_bytes: 128 << 20,
             min_fragments: 4,
+            sort_by: Vec::new(),
         }
     }
 }
@@ -44,6 +52,12 @@ impl SmallFileCompaction {
             (64 << 10..=1 << 30).contains(&self.target_file_bytes)
                 && (2..=64).contains(&self.min_fragments),
             "invalid small-file compaction bounds"
+        );
+        ensure!(
+            self.sort_by.len() <= 4
+                && self.sort_by.iter().all(|c| !c.is_empty())
+                && self.sort_by.iter().collect::<BTreeSet<_>>().len() == self.sort_by.len(),
+            "invalid compaction sort key"
         );
         ensure!(
             self.workspace(record_bytes)? <= budget,
@@ -100,6 +114,55 @@ impl SmallFileCompaction {
             .into_values()
             .map(|(fragments, _, _)| fragments)
             .find(|fragments| fragments.len() >= self.min_fragments)
+    }
+
+    /// The sort key this dataset's rewrite can use: `sort_by` when the table
+    /// has stable row IDs, holds every key column, has no blob columns, and no
+    /// index needs an address remap (a sorted rewrite reorders rows). Shared
+    /// options also reach narrow annotation tables; those keep source order.
+    pub(crate) fn sort_for(&self, dataset: &Dataset, indices: &[IndexMetadata]) -> Vec<String> {
+        let schema = dataset.schema();
+        let usable = !self.sort_by.is_empty()
+            && dataset.manifest().uses_stable_row_ids()
+            && self.sort_by.iter().all(|c| schema.field(c).is_some())
+            && !schema.fields_pre_order().any(|f| f.is_blob())
+            && indices
+                .iter()
+                .all(|i| !lance_index::is_system_index(i) && !i.supports_eager_remap());
+        if usable {
+            self.sort_by.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Native rewrite options for one admitted task of `rows` source rows.
+    /// A sorted rewrite re-encodes, and its sort pool is part of the same
+    /// admitted workspace: twice the target file size, spilling beyond it.
+    pub(crate) fn native_options(
+        &self,
+        rows: usize,
+        record_bytes: usize,
+        single_row: bool,
+        sort_by: Vec<String>,
+    ) -> CompactionOptions {
+        let sorted = !sort_by.is_empty();
+        CompactionOptions {
+            target_rows_per_fragment: rows,
+            max_bytes_per_file: Some(self.target_file_bytes),
+            num_threads: Some(1),
+            batch_size: single_row.then_some(1),
+            io_buffer_size: Some(record_bytes as u64),
+            compaction_mode: Some(if sorted {
+                CompactionMode::Reencode
+            } else {
+                CompactionMode::TryBinaryCopy
+            }),
+            binary_copy_read_batch_bytes: Some(record_bytes),
+            sort_by,
+            sort_memory_bytes: sorted.then_some(2 * self.target_file_bytes as u64),
+            ..Default::default()
+        }
     }
 }
 
@@ -183,6 +246,7 @@ pub(crate) async fn plan(publisher: &Publisher, view: &p::Table) -> Result<Optio
 pub(crate) async fn prepare_task(
     publisher: &Publisher,
     dataset: &Dataset,
+    resume_existing_plan: bool,
 ) -> Result<Option<CompactionTask>> {
     let options = publisher
         .options
@@ -190,15 +254,18 @@ pub(crate) async fn prepare_task(
         .as_ref()
         .context("compaction options missing")?;
     let indices = supported_indices(dataset).await?;
-    let fragments = options.fragments(
-        dataset,
-        &indices,
-        publisher
-            .options
-            .turn_id_index
-            .as_ref()
-            .map(|_| turn_id_index::MAX_BUILD_ROWS),
-    );
+    let index = publisher.options.turn_id_index.as_ref();
+    let row_limit = index.map(|_| turn_id_index::MAX_BUILD_ROWS);
+    let mut fragments = options.fragments(dataset, &indices, row_limit);
+    // An already recorded plan may predate the skipping index's row limit.
+    // Finish it under the original byte and fragment bounds. Reads still
+    // scan any output fragment that the skipping index cannot cover.
+    if fragments.is_none()
+        && resume_existing_plan
+        && index.is_some_and(|index| index.index_type != TurnIdIndexType::Btree)
+    {
+        fragments = options.fragments(dataset, &indices, None);
+    }
     let Some(fragments) = fragments else {
         return Ok(None);
     };
@@ -221,16 +288,12 @@ pub(crate) async fn prepare_task(
     let task = CompactionTask {
         task: TaskData { fragments },
         read_version: dataset.version_id(),
-        options: CompactionOptions {
-            target_rows_per_fragment: rows,
-            max_bytes_per_file: Some(options.target_file_bytes),
-            num_threads: Some(1),
-            batch_size: single_row.then_some(1),
-            io_buffer_size: Some(record_bytes as u64),
-            compaction_mode: Some(CompactionMode::TryBinaryCopy),
-            binary_copy_read_batch_bytes: Some(record_bytes),
-            ..Default::default()
-        },
+        options: options.native_options(
+            rows,
+            record_bytes,
+            single_row,
+            options.sort_for(dataset, &indices),
+        ),
     };
     Ok(Some(task))
 }
@@ -245,7 +308,7 @@ pub(super) async fn prepare(
         .as_ref()
         .context("pending compaction needs configured limits")?;
     let dataset = read_compaction_base(publisher, pending.plan.read_version).await?;
-    let task = prepare_task(publisher, &dataset)
+    let task = prepare_task(publisher, &dataset, true)
         .await?
         .context("pending compaction has no eligible fragments under configured limits")?;
     let record_bytes = publisher.ingress.scope.contract.max_record_bytes as usize;
@@ -339,16 +402,12 @@ pub(crate) async fn prepare_body_dataset(
     let task = CompactionTask {
         task: TaskData { fragments },
         read_version: dataset.version_id(),
-        options: CompactionOptions {
-            target_rows_per_fragment: rows,
-            max_bytes_per_file: Some(options.target_file_bytes),
-            num_threads: Some(1),
-            batch_size: Some(1),
-            io_buffer_size: Some(record_bytes as u64),
-            compaction_mode: Some(CompactionMode::TryBinaryCopy),
-            binary_copy_read_batch_bytes: Some(record_bytes),
-            ..Default::default()
-        },
+        options: options.native_options(
+            rows,
+            record_bytes,
+            true,
+            options.sort_for(&dataset, &indices),
+        ),
     };
     let reservation = phases
         .measure(Phase::Admission, async {
