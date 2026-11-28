@@ -4,6 +4,90 @@ use crate::{materializer::SmallFileCompaction, reader};
 #[cfg(all(unix, feature = "service"))]
 mod process;
 
+#[tokio::test]
+async fn sorted_compaction_drains_on_resource_exhaustion() -> Result<()> {
+    use crate::materializer::compaction::execute_rewrite;
+    use arrow_array::RecordBatchIterator;
+    use datafusion_common::DataFusionError;
+    use lance::dataset::{
+        optimize::{
+            commit_compaction, CompactionMode, CompactionOptions, CompactionTask, IgnoreRemap,
+            TaskData,
+        },
+        WriteParams,
+    };
+
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("exhausted-sort.lance");
+    let batch = RecordBatch::try_from_iter([(
+        "id",
+        Arc::new(StringArray::from(vec![
+            "session-4-with-a-long-turn-id",
+            "session-1-with-a-long-turn-id",
+            "session-3-with-a-long-turn-id",
+            "session-2-with-a-long-turn-id",
+        ])) as ArrayRef,
+    )])?;
+    let schema = batch.schema();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch)], schema),
+        path.to_str().context("invalid fixture path")?,
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            max_rows_per_file: 1,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    let before = dataset
+        .scan()
+        .scan_in_order(true)
+        .with_row_id()
+        .try_into_batch()
+        .await?;
+    assert_eq!(dataset.manifest().fragments.len(), 4);
+    let task = CompactionTask {
+        task: TaskData {
+            fragments: dataset.manifest().fragments.as_ref().clone(),
+        },
+        read_version: dataset.version_id(),
+        options: CompactionOptions {
+            target_rows_per_fragment: 4,
+            sort_by: vec!["id".into()],
+            sort_memory_bytes: Some(64),
+            compaction_mode: Some(CompactionMode::Reencode),
+            ..Default::default()
+        },
+    };
+    let error = anyhow::Error::from(task.execute(&dataset).await.unwrap_err());
+    assert!(
+        error.chain().any(|cause| matches!(
+            cause.downcast_ref::<DataFusionError>(),
+            Some(DataFusionError::ResourcesExhausted(_))
+        )),
+        "{error:#}"
+    );
+
+    let result = execute_rewrite(task, &dataset).await?;
+    assert_eq!(result.original_fragments.len(), 4);
+    assert_eq!(result.new_fragments.len(), 1);
+    commit_compaction(
+        &mut dataset,
+        vec![result],
+        Arc::new(IgnoreRemap::default()),
+        &CompactionOptions::default(),
+    )
+    .await?;
+    let after = dataset
+        .scan()
+        .scan_in_order(true)
+        .with_row_id()
+        .try_into_batch()
+        .await?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
 pub(super) fn options(enabled: bool) -> Options {
     Options {
         max_source_bytes: 1 << 20,
