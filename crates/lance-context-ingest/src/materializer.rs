@@ -6,7 +6,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use lance::{dataset::builder::DatasetBuilder, Dataset};
 use lance_context_wal::replication::{publication as p, source};
 use object_store::path::Path as ObjectPath;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 mod advance;
 pub(crate) mod annotation_compaction;
@@ -39,8 +39,20 @@ pub use turn_id_index::{TurnIdIndex, TurnIdIndexType};
 pub struct Storage {
     pub uri: String,
     pub base: ObjectPath,
-    pub options: HashMap<String, String>,
+    /// Authorized Lance configuration, including renewable credential providers.
+    /// Cloning preserves the original accessor and wrapper identities.
+    pub params: lance_io::object_store::ObjectStoreParams,
     pub session: Arc<lance::session::Session>,
+}
+
+impl Storage {
+    pub(crate) fn read_params(
+        &self,
+        mut read: lance::dataset::ReadParams,
+    ) -> lance::dataset::ReadParams {
+        read.store_options = Some(self.params.clone());
+        read
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -907,7 +919,7 @@ pub async fn read_dataset(
         ingress.scope.incarnation,
     )?;
     let mut builder = DatasetBuilder::from_uri(&storage.uri)
-        .with_storage_options(storage.options.clone())
+        .with_read_params(storage.read_params(Default::default()))
         .with_session(storage.session.clone())
         .with_commit_handler(Arc::new(reader));
     if let Some(version) = version {

@@ -199,7 +199,8 @@ impl LanceIndexStoreExt for LanceIndexStore {
             index_dir,
             Arc::new(cache),
             format_version,
-        ))
+        )
+        .with_native_memory(dataset.session().native_memory()))
     }
 
     async fn from_dataset_for_existing(dataset: &Dataset, index: &IndexMetadata) -> Result<Self> {
@@ -211,7 +212,9 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let object_store = dataset.object_store_for_index(index).await?;
         let store =
             Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
-        Ok(store.with_file_sizes(index.file_size_map()))
+        Ok(store
+            .with_native_memory(dataset.session().native_memory())
+            .with_file_sizes(index.file_size_map()))
     }
 }
 

@@ -74,19 +74,27 @@ pub(crate) fn out_of_line_payload_byte_lengths(
 #[derive(Debug, Default)]
 pub struct InlineBitpacking {
     uncompressed_bit_width: u64,
+    native_memory: lance_core::memory::NativeMemory,
 }
 
 impl InlineBitpacking {
     pub fn new(uncompressed_bit_width: u64) -> Self {
         Self {
             uncompressed_bit_width,
+            native_memory: None,
         }
     }
 
     pub fn from_description(description: &metadata::InlineBitpacking) -> Self {
         Self {
             uncompressed_bit_width: description.uncompressed_bits_per_value,
+            native_memory: None,
         }
+    }
+
+    pub fn with_native_memory(mut self, memory: lance_core::memory::NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
     }
 
     /// The minimum number of bytes required to actually get compression
@@ -220,6 +228,7 @@ impl InlineBitpacking {
     fn unchunk<T: ArrowNativeType + BitPackingUninit + Pod>(
         data: LanceBuffer,
         num_values: u64,
+        memory: &lance_core::memory::NativeMemory,
     ) -> Result<DataBlock> {
         // This macro decompresses a chunk(1024 values) of bitpacked values.
         let uncompressed_bit_width = std::mem::size_of::<T>() * 8;
@@ -255,7 +264,7 @@ impl InlineBitpacking {
             ));
         }
 
-        let chunk_words = data.borrow_to_typed_view::<T>();
+        let chunk_words = data.borrow_to_typed_slice_with_native_memory::<T>(memory)?;
         let bit_width_value = chunk_words[0].as_usize();
         if bit_width_value > uncompressed_bit_width {
             return Err(Error::corrupt_file_named(
@@ -293,6 +302,11 @@ impl InlineBitpacking {
             ));
         }
 
+        let reservation = lance_core::memory::try_reserve(
+            memory,
+            lance_core::memory::NativeMemoryKind::Decode,
+            ELEMS_PER_CHUNK as usize * std::mem::size_of::<T>(),
+        )?;
         let mut decompressed = Vec::with_capacity(ELEMS_PER_CHUNK as usize);
         unsafe {
             BitPackingUninit::unchecked_unpack_uninit(
@@ -306,7 +320,7 @@ impl InlineBitpacking {
 
         decompressed.truncate(num_values as usize);
         Ok(DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::reinterpret_vec(decompressed),
+            data: LanceBuffer::reinterpret_vec(decompressed).with_reservation(reservation),
             bits_per_value: uncompressed_bit_width as u64,
             num_values,
             block_info: BlockInfo::new(),
@@ -382,10 +396,10 @@ impl MiniBlockDecompressor for InlineBitpacking {
             return Ok(self.empty_block());
         }
         match self.uncompressed_bit_width {
-            8 => Self::unchunk::<u8>(data, num_values),
-            16 => Self::unchunk::<u16>(data, num_values),
-            32 => Self::unchunk::<u32>(data, num_values),
-            64 => Self::unchunk::<u64>(data, num_values),
+            8 => Self::unchunk::<u8>(data, num_values, &self.native_memory),
+            16 => Self::unchunk::<u16>(data, num_values, &self.native_memory),
+            32 => Self::unchunk::<u32>(data, num_values, &self.native_memory),
+            64 => Self::unchunk::<u64>(data, num_values, &self.native_memory),
             _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
         }
     }
@@ -407,10 +421,10 @@ impl BlockDecompressor for InlineBitpacking {
             return Ok(self.empty_block());
         }
         match self.uncompressed_bit_width {
-            8 => Self::unchunk::<u8>(data, num_values),
-            16 => Self::unchunk::<u16>(data, num_values),
-            32 => Self::unchunk::<u32>(data, num_values),
-            64 => Self::unchunk::<u64>(data, num_values),
+            8 => Self::unchunk::<u8>(data, num_values, &self.native_memory),
+            16 => Self::unchunk::<u16>(data, num_values, &self.native_memory),
+            32 => Self::unchunk::<u32>(data, num_values, &self.native_memory),
+            64 => Self::unchunk::<u64>(data, num_values, &self.native_memory),
             _ => unimplemented!("Bitpacking word size must be 8, 16, 32, or 64"),
         }
     }
@@ -773,7 +787,7 @@ mod test {
         }
 
         let data = LanceBuffer::reinterpret_vec(chunk);
-        let decoded = InlineBitpacking::unchunk::<T>(data, num_values).unwrap();
+        let decoded = InlineBitpacking::unchunk::<T>(data, num_values, &None).unwrap();
         let DataBlock::FixedWidth(fixed) = decoded else {
             panic!("expected FixedWidth DataBlock");
         };
@@ -785,7 +799,7 @@ mod test {
     where
         T: ArrowNativeType + BitPackingUninit + Pod,
     {
-        let err = InlineBitpacking::unchunk::<T>(data, num_values).unwrap_err();
+        let err = InlineBitpacking::unchunk::<T>(data, num_values, &None).unwrap_err();
         assert!(matches!(err, lance_core::Error::CorruptFile { .. }));
         let err = err.to_string();
         assert!(

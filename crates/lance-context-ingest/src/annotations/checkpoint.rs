@@ -264,7 +264,19 @@ impl Service {
     /// The caller must select/pin exactly this complete source prefix. This
     /// method does not authorize publication, confirmation or source closure.
     pub async fn freeze(&self, transaction: Uuid) -> Result<Option<FrozenCheckpoint>> {
+        let ordered_wait = self.shared.phases.enter(Phase::AnnotationOrderedWait);
         let _ordered = self.shared.ordered.lock().await;
+        ordered_wait.complete();
+        self.shared
+            .phases
+            .measure(
+                Phase::AnnotationFreezeHold,
+                self.freeze_ordered(transaction),
+            )
+            .await
+    }
+
+    async fn freeze_ordered(&self, transaction: Uuid) -> Result<Option<FrozenCheckpoint>> {
         let through = self.shared.progress.borrow().through;
         ensure!(
             self.shared
@@ -330,7 +342,23 @@ impl Service {
             Arc::ptr_eq(&self.shared, &prepared.origin),
             "foreign application checkpoint"
         );
+        let ordered_wait = self.shared.phases.enter(Phase::AnnotationOrderedWait);
         let _ordered = self.shared.ordered.lock().await;
+        ordered_wait.complete();
+        self.shared
+            .phases
+            .measure(
+                Phase::AnnotationInstallHold,
+                self.install_published_ordered(prepared, selected),
+            )
+            .await
+    }
+
+    async fn install_published_ordered(
+        &self,
+        prepared: &PreparedCheckpoint,
+        selected: Arc<Dataset>,
+    ) -> Result<()> {
         ensure!(
             self.shared
                 .frames
@@ -554,9 +582,8 @@ pub(crate) async fn load_with_read_params(
     )?;
     Ok(Arc::new(
         DatasetBuilder::from_uri(&storage.uri)
-            .with_read_params(read_params)
+            .with_read_params(storage.read_params(read_params))
             .with_version(version)
-            .with_storage_options(storage.options.clone())
             .with_session(storage.session.clone())
             .with_commit_handler(Arc::new(handler))
             .load()

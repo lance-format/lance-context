@@ -14,6 +14,8 @@ pub(super) struct Lookup {
     pub(super) registrations: Option<RegistrationLookup>,
     pub(super) patches: Option<PatchLookup>,
     pub(super) bodies: Option<single_body::Lookup>,
+    pub(super) body_stop: Option<PrefetchStop>,
+    body_local_end: bool,
 }
 
 /// Read committed metadata only. The caller retains the returned page; neither
@@ -23,6 +25,16 @@ pub(super) async fn source_page(
     after: u64,
     replay_cut: Option<u64>,
 ) -> Result<Option<lance_context_wal::replication::Page>> {
+    Ok(read_page(service, after, replay_cut)
+        .await?
+        .map(|(page, _)| page))
+}
+
+async fn read_page(
+    service: &Service,
+    after: u64,
+    replay_cut: Option<u64>,
+) -> Result<Option<(lance_context_wal::replication::Page, bool)>> {
     let ingress = &service.ingress;
     let group = service.group()?;
     let response = service
@@ -97,7 +109,10 @@ pub(super) async fn source_page(
         };
         *count = count.saturating_add(1);
     }
-    Ok(Some(page))
+    let local_end = page.entries.is_empty()
+        && page.through == observed.applied
+        && replay_cut.is_none_or(|cut| page.through < cut);
+    Ok(Some((page, local_end)))
 }
 
 pub(super) async fn fetch(
@@ -217,7 +232,12 @@ pub(super) async fn prepare(
         // Accumulate whole admitted records, rather than repeatedly scanning
         // history for arbitrary 2048-key chunks. The apply budget bounds frames
         // and the subsequent shared key-only query independently.
-        let mut bytes = head.meta.body_bytes;
+        // A deferred speculative window may be topped up at promotion. Its
+        // already-admitted tail still consumes the same wire-byte bound.
+        let mut bytes = queued.iter().fold(head.meta.body_bytes, |bytes, pending| {
+            bytes.saturating_add(pending.meta.body_bytes)
+        });
+        let mut local_end = false;
         let stop = loop {
             if queued.len() + 1 >= MAX_REQUESTS {
                 break PrefetchStop::RequestBound;
@@ -229,12 +249,14 @@ pub(super) async fn prepare(
                 if replay_cut.is_some_and(|cut| page.through >= cut) {
                     break PrefetchStop::PageExhausted;
                 }
-                let Some(next) = source_page(service, page.through, replay_cut).await? else {
+                let Some((next, at_end)) = read_page(service, page.through, replay_cut).await?
+                else {
                     break PrefetchStop::PageExhausted;
                 };
                 // Replace only after validation. On cancellation the old page
                 // and every admitted input remain available to this driver.
                 *page = next;
+                local_end = at_end;
                 // One empty response ends this window, even if it advances
                 // past control/foreign records. Do not poll for future writes.
             }
@@ -259,7 +281,11 @@ pub(super) async fn prepare(
             .prefetch
             .record(queued.len() + 1, bytes, stop);
         // Driver refreshes this on stale-base detection as well as initially.
-        return Ok(Lookup::default());
+        return Ok(Lookup {
+            body_stop: Some(stop),
+            body_local_end: local_end,
+            ..Lookup::default()
+        });
     }
     if head.meta.body_bytes > MAX_PAYLOAD_BYTES
         || head.decoded.rows() > MAX_ROWS
@@ -348,5 +374,46 @@ pub(super) async fn prepare(
         registrations,
         patches,
         bodies: None,
+        body_stop: None,
+        body_local_end: false,
     })
+}
+
+/// Give released producer lanes a bounded opportunity to commit their next
+/// request before sealing a foreground query. A local end is only an observed
+/// gap, not proof that the upstream producer has no queued input. The caller
+/// retains the absolute deadline across cancellation; it never resets on input.
+pub(super) async fn coalesce(
+    service: &Service,
+    head: &Pending,
+    page: &mut lance_context_wal::replication::Page,
+    queued: &mut VecDeque<Pending>,
+    replay_cut: Option<u64>,
+    deadline: tokio::time::Instant,
+) -> Result<Lookup> {
+    let mut lookup = prepare(service, head, page, queued, replay_cut).await?;
+    while lookup.body_local_end
+        && matches!(lookup.body_stop, Some(PrefetchStop::PageExhausted))
+        && service.apply_backpressure().is_none()
+        && tokio::time::Instant::now() < deadline
+    {
+        // Use the driver's existing idle cadence. Do not spin on an empty
+        // replica or hold the ordered apply/publication gate while waiting.
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(5)),
+        )
+        .await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, prepare(service, head, page, queued, replay_cut))
+            .await
+        {
+            Ok(result) => lookup = result?,
+            // prepare retains validated metadata and decoded bodies before
+            // advancing the page. A cancelled refill cannot skip a record.
+            Err(_) => break,
+        }
+    }
+    Ok(lookup)
 }

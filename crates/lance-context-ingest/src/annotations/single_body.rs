@@ -188,7 +188,27 @@ impl Service {
         is_schema(&self.ingress.schema)
     }
 
-    pub(super) async fn lookup_bodies(&self, keys: &[&str]) -> Result<Option<Lookup>> {
+    pub(super) fn prepare_body_lookup(
+        &self,
+        keys: &[&str],
+    ) -> Result<Option<crate::turn_ingestion::PreparedTurnLookup>> {
+        self.ingress
+            .turn_spec
+            .as_ref()
+            .context("missing body spec")?
+            .prepare_lookup(
+                keys,
+                self.lookup_budget
+                    .as_ref()
+                    .context("missing body lookup budget")?,
+            )
+    }
+
+    pub(super) async fn lookup_prepared_bodies(
+        &self,
+        mut prepared: crate::turn_ingestion::PreparedTurnLookup,
+        window: lookup_capture::Window,
+    ) -> Result<Option<Lookup>> {
         self.shared
             .phases
             .measure(Phase::AnnotationRegistrationLookup, async {
@@ -197,15 +217,6 @@ impl Service {
                     .turn_spec
                     .as_ref()
                     .context("missing body spec")?;
-                let Some(mut prepared) = spec.prepare_lookup(
-                    keys,
-                    self.lookup_budget
-                        .as_ref()
-                        .context("missing body lookup budget")?,
-                )?
-                else {
-                    return Ok(None);
-                };
                 let Some(base) = self
                     .shared
                     .staging
@@ -214,7 +225,18 @@ impl Service {
                 else {
                     return Ok(None);
                 };
-                let keys = match spec.lookup_prepared(base.dataset().clone(), prepared).await {
+                prepared.cached_keys = base.cached_keys();
+                self.shared
+                    .lookup_capture
+                    .record(self, spec, &base, &prepared.keys, window);
+                let keys = match spec
+                    .lookup_prepared_with_parallelism(
+                        base.dataset().clone(),
+                        prepared,
+                        self.body_lookup_parallelism,
+                    )
+                    .await
+                {
                     Ok(keys) => keys,
                     Err(error)
                         if error.chain().any(|cause| {
@@ -245,7 +267,7 @@ impl Service {
         after: u64,
         pending: &Pending,
         lookup: &Lookup,
-    ) -> Result<Option<ApplyOutcome>> {
+    ) -> Result<Option<(ApplyOutcome, usize)>> {
         let mixed::Decoded::Creates { rows, .. } = &pending.decoded else {
             bail!("immutable body cannot apply patches")
         };
@@ -265,7 +287,7 @@ impl Service {
         Ok(self
             .shared
             .staging
-            .register_immutable_committed(after, pending.index, &rows, &lookup.base)
+            .register_immutable_committed_with_count(after, pending.index, &rows, &lookup.base)
             .await?)
     }
 

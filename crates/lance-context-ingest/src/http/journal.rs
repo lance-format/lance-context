@@ -14,6 +14,10 @@ const MAX_TOKEN: usize = 12 << 10;
 mod mutations;
 #[cfg(feature = "materializer")]
 pub use mutations::DurableMutationClient;
+#[cfg(feature = "materializer")]
+mod replacement;
+#[cfg(feature = "materializer")]
+pub use replacement::{ProducerControlClient, ReplacementIntent};
 
 enum Acknowledged {
     Append(Accepted),

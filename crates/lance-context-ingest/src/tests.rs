@@ -43,6 +43,8 @@ mod network;
 #[cfg(feature = "service")]
 mod preparation;
 #[cfg(feature = "materializer")]
+mod query_metadata;
+#[cfg(feature = "materializer")]
 mod reader;
 #[cfg(feature = "worker")]
 mod worker;

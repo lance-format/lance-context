@@ -125,7 +125,7 @@ pub async fn provision(
             scope.incarnation,
         )?;
         let selected = DatasetBuilder::from_uri(&storage.uri)
-            .with_storage_options(storage.options.clone())
+            .with_read_params(storage.read_params(Default::default()))
             .with_session(storage.session.clone())
             .with_commit_handler(Arc::new(reader))
             .load()
@@ -239,7 +239,7 @@ pub async fn provision(
 
 async fn canonical(storage: &Storage, version: Option<u64>) -> Result<Dataset> {
     let mut builder = DatasetBuilder::from_uri(&storage.uri)
-        .with_storage_options(storage.options.clone())
+        .with_read_params(storage.read_params(Default::default()))
         .with_session(storage.session.clone())
         .with_commit_handler(Arc::new(ConditionalPutCommitHandler));
     if let Some(version) = version {

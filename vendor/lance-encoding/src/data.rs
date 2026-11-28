@@ -29,6 +29,9 @@ use arrow_buffer::{ArrowNativeType, BooleanBuffer, BooleanBufferBuilder, NullBuf
 use arrow_data::{ArrayData, ArrayDataBuilder};
 use arrow_schema::DataType;
 use lance_arrow::DataTypeExt;
+use lance_core::memory::{
+    NativeMemory, NativeMemoryKind, NativeReservation, reserve_vec, try_reserve,
+};
 
 use lance_core::{Error, Result};
 
@@ -225,16 +228,38 @@ impl FixedWidthDataBlock {
 
 #[derive(Debug)]
 struct VariableWidthDataBlockBuilder<T: OffsetSizeTrait> {
+    native_memory: NativeMemory,
+    bytes_reservation: NativeReservation,
+    offsets_reservation: NativeReservation,
     offsets: Vec<T>,
     bytes: Vec<u8>,
 }
 
 impl<T: OffsetSizeTrait> VariableWidthDataBlockBuilder<T> {
-    fn new(estimated_size_bytes: u64) -> Self {
-        Self {
-            offsets: vec![T::from_usize(0).unwrap()],
-            bytes: Vec::with_capacity(estimated_size_bytes as usize),
-        }
+    fn new(estimated_size_bytes: u64, native_memory: NativeMemory) -> Result<Self> {
+        let mut builder = Self {
+            offsets: Vec::new(),
+            bytes: Vec::new(),
+            native_memory,
+            bytes_reservation: None,
+            offsets_reservation: None,
+        };
+        reserve_vec(
+            &mut builder.offsets,
+            &mut builder.offsets_reservation,
+            &builder.native_memory,
+            NativeMemoryKind::Decode,
+            1,
+        )?;
+        builder.offsets.push(T::from_usize(0).unwrap());
+        reserve_vec(
+            &mut builder.bytes,
+            &mut builder.bytes_reservation,
+            &builder.native_memory,
+            NativeMemoryKind::Decode,
+            estimated_size_bytes as usize,
+        )?;
+        Ok(builder)
     }
 }
 
@@ -272,6 +297,20 @@ impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthD
                 .into(),
             ));
         }
+        reserve_vec(
+            &mut self.bytes,
+            &mut self.bytes_reservation,
+            &self.native_memory,
+            NativeMemoryKind::Decode,
+            selected_data_len,
+        )?;
+        reserve_vec(
+            &mut self.offsets,
+            &mut self.offsets_reservation,
+            &self.native_memory,
+            NativeMemoryKind::Decode,
+            (selection.end - selection.start) as usize,
+        )?;
         let previous_len = self.bytes.len();
 
         self.bytes
@@ -292,8 +331,9 @@ impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthD
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.offsets.len() - 1) as u64;
         DataBlock::VariableWidth(VariableWidthBlock {
-            data: LanceBuffer::from(self.bytes),
-            offsets: LanceBuffer::reinterpret_vec(self.offsets),
+            data: LanceBuffer::from(self.bytes).with_reservation(self.bytes_reservation),
+            offsets: LanceBuffer::reinterpret_vec(self.offsets)
+                .with_reservation(self.offsets_reservation),
             bits_per_offset: T::get_byte_width() as u8 * 8,
             num_values,
             block_info: BlockInfo::new(),
@@ -301,16 +341,51 @@ impl<T: OffsetSizeTrait + bytemuck::Pod> DataBlockBuilderImpl for VariableWidthD
     }
 }
 
+fn reserve_bitmap(
+    values: &mut BooleanBufferBuilder,
+    reservation: &mut NativeReservation,
+    memory: &NativeMemory,
+    additional: usize,
+) -> Result<()> {
+    let required = values.len() + additional;
+    if required <= values.capacity() {
+        return Ok(());
+    }
+    let bytes = required.div_ceil(8).div_ceil(64) * 64;
+    let capacity = bytes.max(values.capacity() / 8 * 2);
+    let mut next = try_reserve(memory, NativeMemoryKind::Decode, capacity)?;
+    if let Some(next) = &mut next {
+        next.set_backed_bytes(0);
+    }
+    values.reserve(additional);
+    if let Some(next) = &mut next {
+        next.set_backed_bytes(capacity);
+    }
+    *reservation = next;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct BitmapDataBlockBuilder {
+    native_memory: NativeMemory,
+    reservation: NativeReservation,
     values: BooleanBufferBuilder,
 }
 
 impl BitmapDataBlockBuilder {
-    fn new(estimated_size_bytes: u64) -> Self {
-        Self {
-            values: BooleanBufferBuilder::new(estimated_size_bytes as usize * 8),
-        }
+    fn new(estimated_size_bytes: u64, native_memory: NativeMemory) -> Result<Self> {
+        let mut builder = Self {
+            values: BooleanBufferBuilder::new(0),
+            native_memory,
+            reservation: None,
+        };
+        reserve_bitmap(
+            &mut builder.values,
+            &mut builder.reservation,
+            &builder.native_memory,
+            estimated_size_bytes as usize * 8,
+        )?;
+        Ok(builder)
     }
 }
 
@@ -321,6 +396,12 @@ impl DataBlockBuilderImpl for BitmapDataBlockBuilder {
 
     fn append_validated(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
         let bitmap_blk = data_block.as_fixed_width_ref().unwrap();
+        reserve_bitmap(
+            &mut self.values,
+            &mut self.reservation,
+            &self.native_memory,
+            (selection.end - selection.start) as usize,
+        )?;
         self.values.append_packed_range(
             selection.start as usize..selection.end as usize,
             &bitmap_blk.data,
@@ -333,7 +414,7 @@ impl DataBlockBuilderImpl for BitmapDataBlockBuilder {
         let num_values = bool_buf.len() as u64;
         let bits_buf = bool_buf.into_inner();
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::from(bits_buf),
+            data: LanceBuffer::from(bits_buf).with_reservation(self.reservation),
             bits_per_value: 1,
             num_values,
             block_info: BlockInfo::new(),
@@ -343,19 +424,35 @@ impl DataBlockBuilderImpl for BitmapDataBlockBuilder {
 
 #[derive(Debug)]
 struct FixedWidthDataBlockBuilder {
+    native_memory: NativeMemory,
+    reservation: NativeReservation,
     bits_per_value: u64,
     bytes_per_value: u64,
     values: Vec<u8>,
 }
 
 impl FixedWidthDataBlockBuilder {
-    fn new(bits_per_value: u64, estimated_size_bytes: u64) -> Self {
+    fn new(
+        bits_per_value: u64,
+        estimated_size_bytes: u64,
+        native_memory: NativeMemory,
+    ) -> Result<Self> {
         assert!(bits_per_value.is_multiple_of(8));
-        Self {
+        let mut builder = Self {
             bits_per_value,
             bytes_per_value: bits_per_value / 8,
-            values: Vec::with_capacity(estimated_size_bytes as usize),
-        }
+            values: Vec::new(),
+            native_memory,
+            reservation: None,
+        };
+        reserve_vec(
+            &mut builder.values,
+            &mut builder.reservation,
+            &builder.native_memory,
+            NativeMemoryKind::Decode,
+            estimated_size_bytes as usize,
+        )?;
+        Ok(builder)
     }
 }
 
@@ -369,6 +466,13 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
         assert_eq!(self.bits_per_value, block.bits_per_value);
         let start = selection.start as usize * self.bytes_per_value as usize;
         let end = selection.end as usize * self.bytes_per_value as usize;
+        reserve_vec(
+            &mut self.values,
+            &mut self.reservation,
+            &self.native_memory,
+            NativeMemoryKind::Decode,
+            end - start,
+        )?;
         self.values.extend_from_slice(&block.data[start..end]);
         Ok(())
     }
@@ -376,7 +480,7 @@ impl DataBlockBuilderImpl for FixedWidthDataBlockBuilder {
     fn finish(self: Box<Self>) -> DataBlock {
         let num_values = (self.values.len() / self.bytes_per_value as usize) as u64;
         DataBlock::FixedWidth(FixedWidthDataBlock {
-            data: LanceBuffer::from(self.values),
+            data: LanceBuffer::from(self.values).with_reservation(self.reservation),
             bits_per_value: self.bits_per_value,
             num_values,
             block_info: BlockInfo::new(),
@@ -575,16 +679,31 @@ impl DataBlockBuilderImpl for FixedSizeListBlockBuilder {
 
 #[derive(Debug)]
 struct NullableDataBlockBuilder {
+    native_memory: NativeMemory,
+    reservation: NativeReservation,
     inner: Box<dyn DataBlockBuilderImpl>,
     validity: BooleanBufferBuilder,
 }
 
 impl NullableDataBlockBuilder {
-    fn new(inner: Box<dyn DataBlockBuilderImpl>, estimated_size_bytes: usize) -> Self {
-        Self {
+    fn new(
+        inner: Box<dyn DataBlockBuilderImpl>,
+        estimated_size_bytes: usize,
+        native_memory: NativeMemory,
+    ) -> Result<Self> {
+        let mut builder = Self {
             inner,
-            validity: BooleanBufferBuilder::new(estimated_size_bytes * 8),
-        }
+            validity: BooleanBufferBuilder::new(0),
+            native_memory,
+            reservation: None,
+        };
+        reserve_bitmap(
+            &mut builder.validity,
+            &mut builder.reservation,
+            &builder.native_memory,
+            estimated_size_bytes * 8,
+        )?;
+        Ok(builder)
     }
 }
 
@@ -604,6 +723,12 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
             selection.start as usize,
             (selection.end - selection.start) as usize,
         );
+        reserve_bitmap(
+            &mut self.validity,
+            &mut self.reservation,
+            &self.native_memory,
+            bool_buf.len(),
+        )?;
         self.validity.append_buffer(&bool_buf);
         Ok(())
     }
@@ -612,7 +737,8 @@ impl DataBlockBuilderImpl for NullableDataBlockBuilder {
         let inner_block = self.inner.finish();
         DataBlock::Nullable(NullableDataBlock {
             data: Box::new(inner_block),
-            nulls: LanceBuffer::from(self.validity.finish().into_inner()),
+            nulls: LanceBuffer::from(self.validity.finish().into_inner())
+                .with_reservation(self.reservation),
             block_info: BlockInfo::new(),
         })
     }
@@ -1058,6 +1184,7 @@ impl StructDataBlock {
 /// A data block for dictionary encoded data
 #[derive(Debug, Clone)]
 pub struct DictionaryDataBlock {
+    pub(crate) native_memory: NativeMemory,
     /// The indices buffer
     pub indices: FixedWidthDataBlock,
     /// The dictionary itself
@@ -1065,6 +1192,12 @@ pub struct DictionaryDataBlock {
 }
 
 impl DictionaryDataBlock {
+    /// Retain the caller for later dictionary expansion into plain values.
+    pub fn with_native_memory(mut self, memory: NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
+    }
+
     fn decode_helper<K: ArrowDictionaryKeyType>(self) -> Result<DataBlock> {
         // Handle empty batch - this can happen when decoding a range that contains
         // only empty/null lists, or when reading sparse data
@@ -1076,9 +1209,13 @@ impl DictionaryDataBlock {
         let estimated_size_bytes = self.dictionary.data_size()
             * (self.indices.num_values + self.dictionary.num_values() - 1)
             / self.dictionary.num_values();
-        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes);
+        let mut data_builder = DataBlockBuilder::with_capacity_estimate(estimated_size_bytes)
+            .with_native_memory(self.native_memory.clone());
 
-        let indices = self.indices.data.borrow_to_typed_slice::<K::Native>();
+        let indices = self
+            .indices
+            .data
+            .borrow_to_typed_slice_with_native_memory::<K::Native>(&self.native_memory)?;
         let indices = indices.as_ref();
 
         let selections = indices.iter().map(|idx| {
@@ -1155,6 +1292,7 @@ impl DictionaryDataBlock {
 
     pub fn from_parts(indices: FixedWidthDataBlock, dictionary: DataBlock) -> Self {
         Self {
+            native_memory: None,
             indices,
             dictionary: Box::new(dictionary),
         }
@@ -1371,33 +1509,40 @@ impl DataBlock {
         }
     }
 
-    fn make_builder(&self, estimated_size_bytes: u64) -> Box<dyn DataBlockBuilderImpl> {
-        match self {
+    fn make_builder(
+        &self,
+        estimated_size_bytes: u64,
+        memory: NativeMemory,
+    ) -> Result<Box<dyn DataBlockBuilderImpl>> {
+        Ok(match self {
             Self::FixedWidth(inner) => {
                 if inner.bits_per_value == 1 {
-                    Box::new(BitmapDataBlockBuilder::new(estimated_size_bytes))
+                    Box::new(BitmapDataBlockBuilder::new(estimated_size_bytes, memory)?)
                 } else {
                     Box::new(FixedWidthDataBlockBuilder::new(
                         inner.bits_per_value,
                         estimated_size_bytes,
-                    ))
+                        memory,
+                    )?)
                 }
             }
             Self::VariableWidth(inner) => {
                 if inner.bits_per_offset == 32 {
                     Box::new(VariableWidthDataBlockBuilder::<i32>::new(
                         estimated_size_bytes,
-                    ))
+                        memory,
+                    )?)
                 } else if inner.bits_per_offset == 64 {
                     Box::new(VariableWidthDataBlockBuilder::<i64>::new(
                         estimated_size_bytes,
-                    ))
+                        memory,
+                    )?)
                 } else {
                     todo!()
                 }
             }
             Self::FixedSizeList(inner) => {
-                let inner_builder = inner.child.make_builder(estimated_size_bytes);
+                let inner_builder = inner.child.make_builder(estimated_size_bytes, memory)?;
                 Box::new(FixedSizeListBlockBuilder::new(
                     inner_builder,
                     inner.dimension,
@@ -1407,13 +1552,15 @@ impl DataBlock {
                 // There's no easy way to know what percentage of the data is in the valiidty buffer
                 // but 1/16th seems like a reasonable guess.
                 let estimated_validity_size_bytes = estimated_size_bytes / 16;
-                let inner_builder = nullable
-                    .data
-                    .make_builder(estimated_size_bytes - estimated_validity_size_bytes);
+                let inner_builder = nullable.data.make_builder(
+                    estimated_size_bytes - estimated_validity_size_bytes,
+                    memory.clone(),
+                )?;
                 Box::new(NullableDataBlockBuilder::new(
                     inner_builder,
                     estimated_validity_size_bytes as usize,
-                ))
+                    memory,
+                )?)
             }
             Self::Struct(struct_data_block) => {
                 let num_children = struct_data_block.children.len();
@@ -1425,13 +1572,13 @@ impl DataBlock {
                 let child_builders = struct_data_block
                     .children
                     .iter()
-                    .map(|child| child.make_builder(per_child_estimate))
-                    .collect();
+                    .map(|child| child.make_builder(per_child_estimate, memory.clone()))
+                    .collect::<Result<Vec<_>>>()?;
                 Box::new(StructDataBlockBuilder::new(child_builders))
             }
             Self::AllNull(_) => Box::new(AllNullDataBlockBuilder::default()),
             _ => todo!("make_builder for {:?}", self),
-        }
+        })
     }
 }
 
@@ -1779,6 +1926,7 @@ fn arrow_dictionary_to_data_block(arrays: &[ArrayRef], validity: Option<NullBuff
 
     let items = DataBlock::from(values);
     DataBlock::Dictionary(DictionaryDataBlock {
+        native_memory: None,
         indices: indices_block,
         dictionary: Box::new(items),
     })
@@ -2093,6 +2241,7 @@ trait DataBlockBuilderImpl: std::fmt::Debug {
 
 #[derive(Debug)]
 pub struct DataBlockBuilder {
+    native_memory: NativeMemory,
     estimated_size_bytes: u64,
     builder: Option<Box<dyn DataBlockBuilderImpl>>,
 }
@@ -2100,20 +2249,27 @@ pub struct DataBlockBuilder {
 impl DataBlockBuilder {
     pub fn with_capacity_estimate(estimated_size_bytes: u64) -> Self {
         Self {
+            native_memory: None,
             estimated_size_bytes,
             builder: None,
         }
     }
 
-    fn get_builder(&mut self, block: &DataBlock) -> &mut dyn DataBlockBuilderImpl {
+    pub fn with_native_memory(mut self, memory: NativeMemory) -> Self {
+        self.native_memory = memory;
+        self
+    }
+
+    fn get_builder(&mut self, block: &DataBlock) -> Result<&mut dyn DataBlockBuilderImpl> {
         if self.builder.is_none() {
-            self.builder = Some(block.make_builder(self.estimated_size_bytes));
+            self.builder =
+                Some(block.make_builder(self.estimated_size_bytes, self.native_memory.clone())?);
         }
-        self.builder.as_mut().unwrap().as_mut()
+        Ok(self.builder.as_mut().unwrap().as_mut())
     }
 
     pub fn append(&mut self, data_block: &DataBlock, selection: Range<u64>) -> Result<()> {
-        self.get_builder(data_block).append(data_block, selection)
+        self.get_builder(data_block)?.append(data_block, selection)
     }
 
     fn append_ranges(
@@ -2122,7 +2278,7 @@ impl DataBlockBuilder {
         selections: impl IntoIterator<Item = Range<u64>>,
     ) -> Result<()> {
         let full_selection = 0..data_block.num_values();
-        let builder = self.get_builder(data_block);
+        let builder = self.get_builder(data_block)?;
         builder.validate_append(data_block, &full_selection)?;
         for selection in selections {
             if selection.start > selection.end || selection.end > full_selection.end {
@@ -2857,6 +3013,7 @@ mod tests {
             block_info: BlockInfo::new(),
         };
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            native_memory: None,
             indices: FixedWidthDataBlock {
                 data: LanceBuffer::reinterpret_vec(vec![0_i32, 1, 2]),
                 bits_per_value: 32,
@@ -2879,6 +3036,7 @@ mod tests {
     #[test]
     fn dictionary_rejects_indices_wider_than_declared_key_type() {
         let dictionary = DataBlock::Dictionary(DictionaryDataBlock {
+            native_memory: None,
             indices: FixedWidthDataBlock {
                 data: LanceBuffer::reinterpret_vec(vec![0_u32, 1, 128]),
                 bits_per_value: 32,

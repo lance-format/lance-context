@@ -99,8 +99,23 @@ pub enum Phase {
     AnnotationCompactionRemap,
     /// Validating and persisting narrow rewrite metadata after index remapping.
     AnnotationCompactionMetadata,
+    /// Waiting for the shared ordered gate in apply, freeze or installation.
+    AnnotationOrderedWait,
+    /// Freezing a checkpoint while holding the ordered gate.
+    AnnotationFreezeHold,
+    /// Installing a confirmed publication while holding the ordered gate.
+    AnnotationInstallHold,
+    /// Full-body registration, including core locks and optional cache warming.
+    AnnotationFullBodyApply,
+    /// Synchronous frame/result accounting after apply, through progress delivery.
+    AnnotationApplyHandoff,
+    /// Last-reported pressure episodes, through a reason change or progress.
+    /// Includes retries; these are not exclusive resource-stall or CPU times.
+    AnnotationApplyMemoryPressure,
+    AnnotationSourceWindowPressure,
+    AnnotationStagingPressure,
 }
-const NAMES: [&str; 53] = [
+const NAMES: [&str; 61] = [
     "claim",
     "acquire",
     "state",
@@ -154,6 +169,14 @@ const NAMES: [&str; 53] = [
     "annotation_maintenance_publish",
     "annotation_compaction_remap",
     "annotation_compaction_metadata",
+    "annotation_ordered_wait",
+    "annotation_freeze_hold",
+    "annotation_install_hold",
+    "annotation_full_body_apply",
+    "annotation_apply_handoff",
+    "annotation_apply_memory_pressure",
+    "annotation_source_window_pressure",
+    "annotation_staging_pressure",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
@@ -185,6 +208,9 @@ pub struct Observation {
     pub completed: u64,
     pub failed: u64,
     pub cancelled: u64,
+    /// Approximate in-flight count from independently sampled counters.
+    /// Its elapsed time is not included in elapsed_micros until it finishes.
+    pub active: u64,
     /// Includes failed/cancelled work, but not time still in flight.
     pub elapsed_micros: u64,
     /// Longest finished interval, including failed/cancelled work.
@@ -204,12 +230,16 @@ impl Counters {
     pub fn observation(&self) -> [Observation; PHASE_COUNT] {
         std::array::from_fn(|i| {
             let c = &self.0[i];
+            let started = c.started.load(Ordering::Relaxed);
+            let completed = c.completed.load(Ordering::Relaxed);
+            let cancelled = c.cancelled.load(Ordering::Relaxed);
             Observation {
                 phase: NAMES[i],
-                started: c.started.load(Ordering::Relaxed),
-                completed: c.completed.load(Ordering::Relaxed),
+                started,
+                completed,
                 failed: c.failed.load(Ordering::Relaxed),
-                cancelled: c.cancelled.load(Ordering::Relaxed),
+                cancelled,
+                active: started.saturating_sub(completed.saturating_add(cancelled)),
                 elapsed_micros: c.elapsed_micros.load(Ordering::Relaxed),
                 max_elapsed_micros: c.max_elapsed_micros.load(Ordering::Relaxed),
             }
@@ -227,7 +257,7 @@ impl Counters {
         result
     }
 
-    pub(super) fn blocking<T, E>(
+    pub(crate) fn blocking<T, E>(
         self: &Arc<Self>,
         phase: Phase,
         work: impl FnOnce() -> Result<T, E>,
@@ -238,7 +268,7 @@ impl Counters {
         result
     }
 
-    fn enter(self: &Arc<Self>, phase: Phase) -> Guard {
+    pub(crate) fn enter(self: &Arc<Self>, phase: Phase) -> Guard {
         self.0[phase as usize]
             .started
             .fetch_add(1, Ordering::Relaxed);
@@ -251,11 +281,18 @@ impl Counters {
     }
 }
 
-struct Guard {
+pub(crate) struct Guard {
     counters: Arc<Counters>,
     phase: Phase,
     start: Instant,
     success: Option<bool>,
+}
+impl Guard {
+    /// End a successful synchronous section or a resolved pressure episode.
+    /// Dropping an unfinished guard continues to record cancellation.
+    pub(crate) fn complete(mut self) {
+        self.success = Some(true);
+    }
 }
 impl Drop for Guard {
     fn drop(&mut self) {

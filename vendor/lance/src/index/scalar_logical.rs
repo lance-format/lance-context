@@ -15,7 +15,8 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::{Error, Result};
 use lance_index::metrics::MetricsCollector;
 use lance_index::scalar::{
-    AnyQuery, CreatedIndex, ScalarIndex, SearchOptions, SearchResult, UpdateCriteria,
+    AnyQuery, BloomFilterQuery, CreatedIndex, PreparedUtf8BloomQuery, ScalarIndex, SearchOptions,
+    SearchResult, UpdateCriteria,
 };
 use lance_index::{Index, IndexType};
 use lance_select::{NullableRowAddrSet, RowAddrMask, RowAddrTreeMap};
@@ -24,6 +25,7 @@ use roaring::RoaringBitmap;
 use serde_json::json;
 
 use crate::dataset::Dataset;
+use crate::dataset::index::LanceIndexStoreExt;
 use crate::index::prefilter::DatasetPreFilter;
 use crate::index::scalar::fetch_index_details;
 use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
@@ -55,6 +57,31 @@ pub struct LogicalScalarIndex {
 }
 
 impl LogicalScalarIndex {
+    /// Borrow an opened segment only from this snapshot and storage binding.
+    pub async fn cached_segment(
+        dataset: &Dataset,
+        segment: &IndexMetadata,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Option<Arc<dyn ScalarIndex>>> {
+        let resolved = super::frag_reuse::open_row_id_remapping(dataset, segment, metrics).await?;
+        let cache_id = super::frag_reuse::fri_cache_id(&resolved);
+        let cache = super::frag_reuse::scoped_index_cache(dataset, &resolved)
+            .for_index(&segment.uuid, cache_id);
+        let Some(entry) = cache
+            .get_unsized_with_key(&lance_index::scalar::registry::ScalarIndexCacheKey)
+            .await
+        else {
+            return Ok(None);
+        };
+        let store: Arc<dyn lance_index::scalar::IndexStore> = Arc::new(
+            lance_index::scalar::lance_format::LanceIndexStore::from_dataset_for_existing(
+                dataset, segment,
+            )
+            .await?,
+        );
+        Ok(entry.index_for_store(&store))
+    }
+
     /// Merge several already-opened segments of one scalar index into a single
     /// searchable [`ScalarIndex`].
     ///
@@ -182,6 +209,15 @@ impl ScalarIndex for LogicalScalarIndex {
         options: SearchOptions,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        // Prepare UTF-8 membership once for all physical Bloom segments,
+        // retaining each segment's independent coverage mask.
+        let prepared = query
+            .as_any()
+            .downcast_ref::<BloomFilterQuery>()
+            .and_then(PreparedUtf8BloomQuery::try_new);
+        let query = prepared
+            .as_ref()
+            .map_or(query, |prepared| prepared as &dyn AnyQuery);
         let results = try_join_all(self.segments.iter().zip(&self.masks).map(
             |(segment, mask)| async move {
                 let result = segment.search_with_options(query, options, metrics).await?;

@@ -125,15 +125,12 @@ async fn provision_mode(
     let (narrow_store, narrow_path) = ObjectStore::from_uri_and_params(
         narrow.session.store_registry(),
         &narrow.uri,
-        &parameters(&narrow.options),
+        &narrow.params,
     )
     .await?;
-    let (body_store, body_path) = ObjectStore::from_uri_and_params(
-        body.session.store_registry(),
-        &body.uri,
-        &parameters(&body.options),
-    )
-    .await?;
+    let (body_store, body_path) =
+        ObjectStore::from_uri_and_params(body.session.store_registry(), &body.uri, &body.params)
+            .await?;
     ensure!(
         narrow_store.store_prefix != body_store.store_prefix
             || (!narrow_path.prefix_matches(&body_path) && !body_path.prefix_matches(&narrow_path)),
@@ -161,7 +158,7 @@ async fn provision_mode(
             scope.incarnation,
         )?;
         let selected = DatasetBuilder::from_uri(&narrow.uri)
-            .with_storage_options(narrow.options.clone())
+            .with_read_params(narrow.read_params(Default::default()))
             .with_session(narrow.session.clone())
             .with_commit_handler(Arc::new(reader))
             .load()
@@ -326,7 +323,7 @@ async fn empty(
             mode: WriteMode::Create,
             enable_stable_row_ids: true,
             skip_auto_cleanup: true,
-            store_params: Some(parameters(&storage.options)),
+            store_params: Some(storage.params.clone()),
             session: Some(storage.session.clone()),
             commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
             transaction_properties: Some(Arc::new(properties.clone())),

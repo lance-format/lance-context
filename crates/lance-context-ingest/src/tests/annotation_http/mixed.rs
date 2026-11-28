@@ -66,7 +66,7 @@ async fn frontend_with_settings(
     config.tables.push(config::Table {
         binding: settings.binding,
         uri: narrow.uri.clone(),
-        storage_options: narrow.options.clone(),
+        storage_options: narrow.params.storage_options().cloned().unwrap_or_default(),
         bootstrap: crate::bootstrap::Identity {
             owner: Uuid::new_v4(),
             acquisition: Uuid::new_v4(),
@@ -92,7 +92,7 @@ async fn frontend_with_settings(
         projection: None,
         body: Some(config::Body {
             uri: body.uri.clone(),
-            storage_options: body.options.clone(),
+            storage_options: body.params.storage_options().cloned().unwrap_or_default(),
         }),
         exclusive_reclamation: None,
     });

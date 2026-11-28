@@ -21,15 +21,40 @@ use std::sync::{
 };
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
+mod full_body;
+
 #[derive(Default)]
 struct LostReply {
     once: AtomicBool,
     completion: Mutex<Option<MutationReply>>,
+    replacement_once: AtomicBool,
 }
 
 async fn lose_reply(State(lost): State<Arc<LostReply>>, request: Request, next: Next) -> Response {
     let update = request.uri().path().ends_with("/update");
+    let replace = request.uri().path().ends_with("/replace-producer");
     let response = next.run(request).await;
+    if replace && response.status() == axum::http::StatusCode::OK {
+        let body = to_bytes(response.into_body(), 32 << 10).await.unwrap();
+        let reply: crate::http::annotations::ReplaceProducerReply =
+            serde_json::from_slice(&body).unwrap();
+        if matches!(
+            reply,
+            crate::http::annotations::ReplaceProducerReply::Opened { .. }
+        ) && !lost.replacement_once.swap(true, Ordering::AcqRel)
+        {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "lost replacement reply",
+            )
+                .into_response();
+        }
+        return (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response();
+    }
     if update
         && response.status() == axum::http::StatusCode::OK
         && !lost.once.swap(true, Ordering::AcqRel)
@@ -106,17 +131,51 @@ async fn client(
     base: reqwest::Url,
     spec: &TurnIngestionSpec,
 ) -> Result<DurableMutationClient> {
+    client_with_open(
+        root,
+        base,
+        spec,
+        ProducerOpen {
+            bucket: 0,
+            slot: 1,
+            expected_generation: 0,
+            operation: Uuid::from_u128(101),
+        },
+    )
+    .await
+}
+
+async fn client_with_open(
+    root: &std::path::Path,
+    base: reqwest::Url,
+    spec: &TurnIngestionSpec,
+    open: ProducerOpen,
+) -> Result<DurableMutationClient> {
+    open_client(root, base, spec, open, false).await
+}
+
+pub(super) async fn open_client(
+    root: &std::path::Path,
+    base: reqwest::Url,
+    spec: &TurnIngestionSpec,
+    open: ProducerOpen,
+    full_body: bool,
+) -> Result<DurableMutationClient> {
+    if full_body {
+        return DurableMutationClient::open_full_body(
+            journal(root, base, open),
+            &annotation_publication::one_shard(),
+            binding(),
+            spec,
+            &fixture::limits(),
+            Shard { bucket: 0 },
+            transport()?,
+            MergeMemoryBudget::new(64 << 20),
+        )
+        .await;
+    }
     DurableMutationClient::open(
-        journal(
-            root,
-            base,
-            ProducerOpen {
-                bucket: 0,
-                slot: 1,
-                expected_generation: 0,
-                operation: Uuid::from_u128(101),
-            },
-        ),
+        journal(root, base, open),
         &annotation_publication::one_shard(),
         binding(),
         spec,
@@ -270,7 +329,7 @@ async fn exercise() -> Result<()> {
             .sequence,
         3
     );
-    let duplicate = writer.append(0, create).await?;
+    let duplicate = writer.append(0, create.clone()).await?;
     assert_eq!(duplicate.completion.meta.sequence, 4);
     let read = reqwest::Client::new()
         .post(b.base.join("api/v1/annotations/rollouts/read")?)
@@ -306,7 +365,101 @@ async fn exercise() -> Result<()> {
             .status(),
         reqwest::StatusCode::BAD_REQUEST
     );
+    // Abandon an executor journal after a durable tail, with a scheduler-owned
+    // control intent. Lose the successful replacement reply, then retry via
+    // the other ingress without reacquiring the now-stale predecessor.
+    use crate::http::{
+        annotations::ReplaceProducerReply,
+        journal::{ProducerControlClient, ReplacementIntent},
+    };
+    lost.once.store(false, Ordering::Release);
+    assert!(writer.append(0, create.clone()).await.is_err());
+    assert_eq!(
+        writer
+            .last_completed(0)
+            .await?
+            .unwrap()
+            .completion
+            .meta
+            .sequence,
+        4
+    );
+    let abandoned_index = lost
+        .completion
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .completion
+        .index;
+    annotation_runtime::drained(&c, &service, abandoned_index).await?;
     writer.shutdown().await?;
+    let control = |base| {
+        ProducerControlClient::new(
+            base,
+            reqwest::Client::builder()
+                .retry(reqwest::retry::never())
+                .build()
+                .unwrap(),
+            DEADLINE,
+            &annotation_publication::one_shard(),
+            &binding(),
+            &spec,
+            &fixture::limits(),
+            Shard { bucket: 0 },
+        )
+    };
+    let old_open = ProducerOpen {
+        bucket: 0,
+        slot: 1,
+        expected_generation: 0,
+        operation: Uuid::from_u128(101),
+    };
+    let ctl = control(a.base.clone())?;
+    let intent = ctl.prepare_replacement(&old_open, Uuid::new_v4()).await?;
+    let persisted = serde_json::to_vec(&intent)?;
+    assert!(
+        ctl.execute(&intent).await.is_err(),
+        "injected successful reply loss"
+    );
+    assert!(lost.replacement_once.load(Ordering::Acquire));
+    let intent: ReplacementIntent = serde_json::from_slice(&persisted)?;
+    let ctl = control(b.base.clone())?;
+    let ReplaceProducerReply::Opened { open, .. } = ctl.execute(&intent).await? else {
+        panic!("retired predecessor")
+    };
+    assert_eq!(open.expected_generation, 1);
+    let successor_root = root.path().join("successor");
+    std::fs::create_dir(&successor_root)?;
+    let successor = client_with_open(&successor_root, b.base.clone(), &spec, open.clone()).await?;
+    let replayed = successor.append(0, create).await?;
+    assert_eq!(replayed.completion.meta.sequence, 1);
+    assert_eq!(replayed.completion.result, MutationResult::Applied);
+    annotation_runtime::drained(&c, &service, replayed.completion.index).await?;
+    assert_eq!(selected.body, successor.selected_body().await?.body);
+    assert_eq!(
+        service.get(&ids[0], DEADLINE).await?.unwrap().score,
+        Some(0.9)
+    );
+    let ReplaceProducerReply::Opened { open: again, .. } = ctl.execute(&intent).await? else {
+        panic!("same intent")
+    };
+    assert_eq!(
+        open, again,
+        "retry cannot allocate another generation after successor writes"
+    );
+    // A competing intent for the stale predecessor cannot revoke the successor.
+    let mut conflicting = serde_json::to_value(&intent)?;
+    let other = serde_json::to_value(Uuid::new_v4())?;
+    conflicting["successor"]["operation"] = other.clone();
+    conflicting["request"]["operation"] = other;
+    let conflicting: ReplacementIntent = serde_json::from_value(conflicting)?;
+    assert!(ctl
+        .execute(&conflicting)
+        .await
+        .unwrap_err()
+        .is::<ProducerReplacementFenced>());
+    successor.shutdown().await?;
     first.shutdown().await;
     second.shutdown().await;
     a.shutdown().await?;

@@ -294,13 +294,15 @@ impl LanceStream {
             file_fragments = filtered_fragments;
         }
 
-        let scan_scheduler = ScanScheduler::new(
+        let scan_scheduler = ScanScheduler::new_with_native_memory(
             dataset.object_store.clone(),
             SchedulerConfig::new(config.io_buffer_size),
+            dataset.session().native_memory(),
         );
         // Shared for this scan so every base file reuses one scheduler per base
         // at the scan's own io_buffer_size, matching the primary scheduler.
-        let base_schedulers = BaseSchedulers::new(config.io_buffer_size);
+        let base_schedulers = BaseSchedulers::new(config.io_buffer_size)
+            .with_native_memory(dataset.session().native_memory());
 
         let scan_scheduler_clone = scan_scheduler.clone();
 

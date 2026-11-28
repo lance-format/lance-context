@@ -34,6 +34,10 @@ impl Owner {
         Router::new()
             .route("/api/v1/health", get(health))
             .route("/api/v1/annotations/{table}/producer", post(open))
+            .route(
+                "/api/v1/annotations/{table}/replace-producer",
+                post(replace),
+            )
             .route("/api/v1/annotations/{table}/update", post(update))
             .route("/api/v1/annotations/{table}/read", post(read))
             .route("/api/v1/annotations/{table}/read-body", post(read_body))
@@ -285,6 +289,52 @@ impl Owner {
                     })
                     .into_response()
                 }
+                Operation::Replace => {
+                    let request: ReplaceProducerRequest = serde_json::from_slice(&bytes)
+                        .map_err(|_| Failure::bad("invalid_replacement"))?;
+                    let previous = ingress
+                        .restore_producer(&self.gate.0.keys, &request.producer)
+                        .map_err(|_| Failure::bad("invalid_producer"))?;
+                    if previous.bucket() != self.service.bucket()
+                        || request.operation.is_nil()
+                        || request.operation == previous.open.operation
+                        || previous.generation() == u64::MAX
+                        || ingress.scope.contract.policy != WritePolicy::TurnIngestion
+                    {
+                        return Err(Failure::bad("invalid_replacement"));
+                    }
+                    let replaced = ingress
+                        .replace_producer(&previous, request.operation)
+                        .await
+                        .map_err(|error| {
+                            if error.is::<ProducerReplacementFenced>() {
+                                Failure {
+                                    status: StatusCode::CONFLICT,
+                                    code: "producer_replacement_fenced",
+                                    outcome: "rejected",
+                                }
+                            } else {
+                                Failure::unavailable("replacement_outcome_unknown", "unknown")
+                            }
+                        })?;
+                    let reply = match replaced {
+                        ProducerReplacement::WaitingForRetirement { last } => {
+                            ReplaceProducerReply::WaitingForRetirement { last }
+                        }
+                        ProducerReplacement::Opened(next) => ReplaceProducerReply::Opened {
+                            open: next.open.clone(),
+                            credential: Opened {
+                                producer: self.gate.0.keys.encode_producer(&next).map_err(
+                                    |_| Failure::unavailable("credential_unavailable", "unknown"),
+                                )?,
+                                generation: next.generation(),
+                                scope: receipt::scope_hash(&ingress.scope)
+                                    .map_err(|_| Failure::bad("invalid_scope"))?,
+                            },
+                        },
+                    };
+                    Json(reply).into_response()
+                }
                 Operation::Read => {
                     let point: PointRequest = serde_json::from_slice(&bytes)
                         .map_err(|_| Failure::bad("invalid_point_read"))?;
@@ -403,6 +453,13 @@ async fn health(State(owner): State<Owner>) -> StatusCode {
 
 async fn open(State(owner): State<Owner>, Path(table): Path<String>, request: Request) -> Response {
     owner.dispatch(table, request, Operation::Open).await
+}
+async fn replace(
+    State(owner): State<Owner>,
+    Path(table): Path<String>,
+    request: Request,
+) -> Response {
+    owner.dispatch(table, request, Operation::Replace).await
 }
 async fn update(
     State(owner): State<Owner>,

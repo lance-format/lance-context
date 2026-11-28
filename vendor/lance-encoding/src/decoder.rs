@@ -677,7 +677,7 @@ impl Default for CoreFieldDecoderStrategy {
     fn default() -> Self {
         Self {
             validate_data: false,
-            decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
+            decompressor_strategy: Arc::new(DefaultDecompressionStrategy::default()),
             cache_repetition_index: false,
         }
     }
@@ -694,7 +694,9 @@ impl CoreFieldDecoderStrategy {
     pub fn from_decoder_config(config: &DecoderConfig) -> Self {
         Self {
             validate_data: config.validate_on_decode,
-            decompressor_strategy: Arc::new(DefaultDecompressionStrategy {}),
+            decompressor_strategy: Arc::new(DefaultDecompressionStrategy::with_native_memory(
+                config.native_memory.clone(),
+            )),
             cache_repetition_index: config.cache_repetition_index,
         }
     }
@@ -2282,6 +2284,8 @@ impl RequestedRows {
 /// Configuration for decoder behavior
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
+    /// Caller-owned admission for allocations retained by decoded buffers.
+    pub native_memory: lance_core::memory::NativeMemory,
     /// Whether to cache repetition indices for better performance.
     ///
     /// This defaults to the `LANCE_READ_CACHE_REPETITION_INDEX` environment variable
@@ -2314,6 +2318,7 @@ pub struct DecoderConfig {
 impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
+            native_memory: None,
             cache_repetition_index: default_cache_repetition_index(),
             validate_on_decode: false,
             inline_scheduling: None,

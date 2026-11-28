@@ -53,6 +53,7 @@ url = { version = "2", optional = true }
 
 [dev-dependencies]
 bincode = "1.3"
+lance-core = "14.0.3"
 url = "2"
 async-trait = "0.1.92"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
@@ -81,4 +82,13 @@ required-features = ["service", "lance-io-metrics"]
 
 [[example]]
 name = "annotation_result_probe"
+required-features = ["service"]
+
+[[example]]
+name = "managed_turn_replay"
+required-features = ["service", "http-client"]
+
+[[example]]
+name = "body_lookup_probe"
+path = "examples/body_lookup_probe/main.rs"
 required-features = ["service"]
