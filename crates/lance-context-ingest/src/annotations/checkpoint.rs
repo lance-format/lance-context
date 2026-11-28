@@ -281,6 +281,25 @@ impl std::fmt::Display for PriorRejected {
 }
 impl std::error::Error for PriorRejected {}
 
+/// The receipt's producer generation is older than the generation that now
+/// owns its slot. The slot's state describes another producer, so the
+/// receipt's outcome can no longer be answered; it is never reported Applied.
+#[derive(Debug)]
+pub struct ReceiptSuperseded {
+    pub receipt_generation: u64,
+    pub slot_generation: u64,
+}
+impl std::fmt::Display for ReceiptSuperseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "receipt producer generation {} superseded by slot generation {}",
+            self.receipt_generation, self.slot_generation
+        )
+    }
+}
+impl std::error::Error for ReceiptSuperseded {}
+
 impl Results {
     pub fn record_sticky(
         &mut self,
@@ -304,6 +323,7 @@ impl Results {
     /// outcome and the same-producer earliest rejection are checked before
     /// falling back to the published snapshot, as `resolve` does.
     pub fn resolve_streamed(&self, accepted: &AcceptedAppend, slot: usize) -> Result<Completed> {
+        self.check_generation(accepted, slot)?;
         if let Some((producer, index, rejection)) = &self.sticky[slot] {
             if *producer == accepted.meta.producer {
                 if *index == accepted.position.index {
@@ -343,7 +363,35 @@ impl Results {
     }
 
 
+    /// Newest producer generation observed for `slot` (live latest, sticky,
+    /// or the published snapshot).
+    fn slot_generation(&self, slot: usize) -> u64 {
+        let live = self.latest[slot]
+            .as_ref()
+            .map_or(0, |r| r.meta.producer.as_u128() as u64);
+        let sticky = self.sticky[slot]
+            .as_ref()
+            .map_or(0, |(p, _, _)| p.as_u128() as u64);
+        let base = self.base.outcome(slot).map_or(0, |o| o.generation);
+        live.max(sticky).max(base)
+    }
+
+    /// Refuse a receipt whose producer generation is older than the slot's
+    /// current generation: its state now belongs to a reused slot.
+    pub fn check_generation(&self, accepted: &AcceptedAppend, slot: usize) -> Result<()> {
+        let receipt_generation = accepted.meta.producer.as_u128() as u64;
+        let slot_generation = self.slot_generation(slot);
+        if receipt_generation < slot_generation {
+            return Err(anyhow::Error::new(ReceiptSuperseded {
+                receipt_generation,
+                slot_generation,
+            }));
+        }
+        Ok(())
+    }
+
     pub fn resolve(&self, accepted: &AcceptedAppend, slot: usize) -> Result<Completed> {
+        self.check_generation(accepted, slot)?;
         if let Some(result) = &self.latest[slot] {
             if result.index == accepted.position.index && result.meta == accepted.meta {
                 return Ok(result.clone());
