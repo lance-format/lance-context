@@ -25,6 +25,48 @@ impl Body {
 }
 
 impl Service {
+    /// The staged source at `index` was retired from the WAL. Recapture this
+    /// owner's installed compatible view and require it to cover `index` for
+    /// exactly this table, group and incarnation (the source closure's cut
+    /// and version). Uncovered or foreign metadata stays an error.
+    async fn recapture_retired(&self, index: u64) -> Result<ImmutableBodyRead> {
+        let (_, value) = crate::reader::observe(
+            &self.ingress,
+            self.group()?,
+            query::Query::SourceClosure {
+                table: self.ingress.scope.table,
+            },
+        )
+        .await?;
+        let query::Value::SourceClosure(closed) = value else {
+            bail!("source closure unavailable");
+        };
+        let closed = closed.context("retired WAL payload without a source closure")?;
+        let closure = closed.permit.closure();
+        ensure!(
+            closure.table == self.ingress.scope.table
+                && closure.group == self.group()?
+                && closure.incarnation == self.ingress.scope.incarnation,
+            "foreign source closure"
+        );
+        ensure!(
+            index <= closure.through,
+            "unpublished WAL payload unavailable"
+        );
+        let (view, materialized) = {
+            let _ordered = self.shared.ordered.lock().await;
+            self.shared.staging.capture_immutable_installed().await?
+        };
+        let TurnBodySource::Materialized(base) = view.source() else {
+            bail!("installed recapture is not a materialized base")
+        };
+        ensure!(
+            materialized >= index && base.version().version >= closure.version,
+            "installed view does not cover the retired WAL payload"
+        );
+        Ok(view)
+    }
+
     /// Quorum barrier then local applied view. This read never scans WAL data
     /// and never consults an independently opened latest Lance snapshot.
     pub async fn get_full_body(&self, key: &str, deadline: Duration) -> Result<Option<Body>> {
@@ -61,7 +103,7 @@ impl Service {
                 None => self.barrier().await?,
             };
             self.wait_through(through).await?;
-            let (view, staged, deferred) = {
+            let (mut view, staged, deferred) = {
                 let _ordered = self.shared.ordered.lock().await;
                 let view = self.shared.staging.capture_immutable_body(key).await?;
                 let mut deferred = None;
@@ -86,13 +128,22 @@ impl Service {
                 };
                 (view, staged, deferred)
             };
+            let mut refetched = None;
+            if let Some((source, meta)) = deferred {
+                // Capture -> Close -> Fetch: publication can retire the WAL
+                // record after the ordered capture. The row is then in the
+                // installed base; recapture it below and read from Lance.
+                match self.refetch_bodies(source.record_index, meta).await {
+                    Ok(fetched) => refetched = Some((source, fetched)),
+                    Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
+                        view = self.recapture_retired(source.record_index).await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             let (batch, hold) = if let Some(row) = staged {
                 (row.batch.clone(), Hold::Staged { _row: row })
-            } else if let Some((source, meta)) = deferred {
-                // The captured view keeps this generation (and therefore its
-                // WAL record) from being retired while the body is refetched.
-                let (bodies, reservation) =
-                    self.refetch_bodies(source.record_index, meta).await?;
+            } else if let Some((source, (bodies, reservation))) = refetched {
                 let spec = self.ingress.turn_spec.as_ref().unwrap();
                 let mut row = source.row as usize;
                 let mut found = None;

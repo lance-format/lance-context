@@ -131,6 +131,18 @@ async fn read_page(
     Ok(Some((page, local_end)))
 }
 
+/// The WAL no longer holds this committed record: publication retired it.
+#[derive(Debug)]
+pub(super) struct PayloadRetired {
+    pub index: u64,
+}
+impl std::fmt::Display for PayloadRetired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "committed annotation payload {} retired from the WAL", self.index)
+    }
+}
+impl std::error::Error for PayloadRetired {}
+
 pub(super) async fn fetch(
     service: &Service,
     index: u64,
@@ -175,6 +187,9 @@ pub(super) async fn fetch(
                 Err(error) if error.is::<payload_memory::Unavailable>() => return Ok(None),
                 Err(error) => return Err(error),
             };
+            if matches!(response.reply, Reply::Record(None)) {
+                return Err(anyhow::Error::new(PayloadRetired { index }));
+            }
             ensure!(
                 matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
                 "committed annotation payload unavailable"

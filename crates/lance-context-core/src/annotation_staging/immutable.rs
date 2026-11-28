@@ -342,6 +342,22 @@ impl AnnotationStaging {
         })
     }
 
+    /// Capture the installed compatible base (never a staged source) with
+    /// the WAL cut it materializes through. Used when a captured staged
+    /// source was retired by publication before its body was fetched.
+    pub async fn capture_immutable_installed(&self) -> Result<(ImmutableBodyRead, u64)> {
+        self.require_immutable()?;
+        let reader = reserve(&self.readers, 1)?;
+        let state = self.state.read().await;
+        Ok((
+            ImmutableBodyRead {
+                source: body::CapturedBody::Base(state.base.clone()),
+                _reader: reader,
+            },
+            state.materialized,
+        ))
+    }
+
     fn require_immutable(&self) -> Result<()> {
         if !self.immutable_body {
             return Err(invalid("not an immutable body staging instance"));
