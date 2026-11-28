@@ -697,20 +697,27 @@ impl Service {
             annotations.through() == through,
             "value/result freeze cut differs"
         );
+        // Take each guard in its own statement: owner_batch() locks the same
+        // non-reentrant write_batch mutex, so it must not run while a guard
+        // from a struct field initializer is still alive.
+        let sources = self.shared.window.lock().unwrap().freeze(through);
+        let bodies = self.shared.frames.lock().unwrap().freeze();
+        let write_batch = self
+            .shared
+            .write_batch
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(owner_batch::WriteBatch::freeze);
+        let owner = self.owner_batch().then(|| self.clone());
         let frozen = FrozenCheckpoint {
             origin: self.shared.clone(),
             annotations,
             results: Arc::new(snapshot),
-            sources: self.shared.window.lock().unwrap().freeze(through),
-            bodies: self.shared.frames.lock().unwrap().freeze(),
-            write_batch: self
-                .shared
-                .write_batch
-                .lock()
-                .unwrap()
-                .as_mut()
-                .map(owner_batch::WriteBatch::freeze),
-            owner: self.owner_batch().then(|| self.clone()),
+            sources,
+            bodies,
+            write_batch,
+            owner,
             body_preparation: tokio::sync::Mutex::new(None),
             _source_generation: source_generation,
         };
