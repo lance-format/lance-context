@@ -84,6 +84,11 @@ pub struct TurnLookupObservation {
     pub rows_scanned: Option<usize>,
     /// Native task-stream wait time in nanoseconds; this is not CPU time.
     pub task_wait_time_ns: Option<usize>,
+    /// Primary-key columns covered by a scalar index (e.g. ZoneMap/Bloom)
+    /// on the captured base when the scan was planned.
+    pub indexed_key_columns: usize,
+    /// The native plan consumed a scalar index input for the key filter.
+    pub index_used: bool,
 }
 
 /// Key-only results for one exact captured base. A miss is meaningful only for
@@ -311,6 +316,14 @@ impl TurnIngestionSpec {
                 .collect::<Vec<_>>(),
         )?;
         scan.filter(&predicate)?;
+        // The filter is a per-column IN list on exactly the key columns, so a
+        // ZoneMap/Bloom index on any of them prunes fragments/zones before
+        // reading. Enable scalar index use explicitly and record coverage.
+        let indexed = indexed_key_columns(&base, &self.primary_key).await?;
+        observation.indexed_key_columns = indexed;
+        if indexed > 0 {
+            scan.use_scalar_index(true);
+        }
         let readahead = if base.session().native_memory().is_some() {
             // These are scanner targets, not a replacement for admission of
             // actual native pages. Keep the caller's pool and shared runtime.
@@ -333,6 +346,7 @@ impl TurnIngestionSpec {
         // without polling to EOF just to trigger its completion callback.
         // Preserve Scanner::execution_options and the logical schema adapter.
         let plan = scan.create_plan().await?;
+        observation.index_used = uses_index(plan.as_ref());
         let plan = if readahead > 1 {
             parallel_membership_scan(
                 plan,
@@ -419,6 +433,38 @@ impl TurnIngestionSpec {
             _workspace: reservation,
         })
     }
+}
+
+/// Key columns with at least one scalar index segment on this base.
+async fn indexed_key_columns(base: &Dataset, primary_key: &[String]) -> Result<usize> {
+    use lance::index::DatasetIndexExt;
+    let indices = base.load_indices().await?;
+    let schema = base.schema();
+    Ok(primary_key
+        .iter()
+        .filter(|name| {
+            schema.field(name).is_some_and(|field| {
+                indices
+                    .iter()
+                    .any(|index| index.fields.first() == Some(&field.id))
+            })
+        })
+        .count())
+}
+
+fn uses_index(plan: &dyn ExecutionPlan) -> bool {
+    if let Some(read) = plan.downcast_ref::<FilteredReadExec>() {
+        if read.index_input().is_some() {
+            return true;
+        }
+    }
+    let name = plan.name();
+    if name.contains("ScalarIndex") || name.contains("MaterializeIndex") {
+        return true;
+    }
+    plan.children()
+        .iter()
+        .any(|child| uses_index(child.as_ref()))
 }
 
 /// Membership needs no row order. Use the native shared task stream so each
