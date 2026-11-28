@@ -53,6 +53,18 @@ pub(super) mod observation;
 pub mod payload_memory;
 pub mod timing;
 
+#[derive(Debug)]
+pub(super) struct FetchAhead {
+    pub(super) leader: u64,
+}
+
+impl std::fmt::Display for FetchAhead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WAL replica has not applied the requested index")
+    }
+}
+impl std::error::Error for FetchAhead {}
+
 #[derive(Clone, Debug)]
 pub struct Endpoint {
     pub data_address: String,
@@ -379,6 +391,15 @@ impl Handle {
     /// Complete after validating that already durable payload, without waiting
     /// for the next poll to persist unrelated proposals or peer updates.
     pub fn read_accepted(&self, group: u64, index: u64) -> Result<Pending<Option<Batch>>> {
+        self.fetch_accepted(group, index, false)
+    }
+
+    fn fetch_accepted(
+        &self,
+        group: u64,
+        index: u64,
+        require_applied: bool,
+    ) -> Result<Pending<Option<Batch>>> {
         ensure!(index > 0 && index < u64::MAX, "invalid accepted index");
         let route = self.route(group)?;
         let credit = self.shared.data.reserve(self.max_record + 1024)?;
@@ -387,7 +408,16 @@ impl Handle {
             reply,
             _credit: credit,
         };
-        self.enqueue(route, Work::Fetch(index, Instant::now(), completion), true)?;
+        self.enqueue(
+            route,
+            Work::Fetch {
+                index,
+                queued_at: Instant::now(),
+                require_applied,
+                reply: completion,
+            },
+            true,
+        )?;
         Ok(Pending(receive))
     }
 }
@@ -634,7 +664,21 @@ async fn execute(handle: &Handle, request: WireRequest, body: Bytes) -> Result<(
             Reply::Source(handle.read_source(group, request)?.await?)
         }
         WireRequest::Fetch { group, index } => {
-            Reply::Record(handle.read_accepted(group, index)?.await?.map(|batch| {
+            let batch = match handle.fetch_accepted(group, index, true)?.await {
+                Ok(batch) => batch,
+                Err(error) => {
+                    if let Some(ahead) = error.downcast_ref::<FetchAhead>() {
+                        return Ok((
+                            Reply::Redirect {
+                                leader: ahead.leader,
+                            },
+                            Bytes::new(),
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+            Reply::Record(batch.map(|batch| {
                 output = batch.body;
                 batch.meta
             }))
@@ -1198,7 +1242,7 @@ impl Client {
                     Reply::Record(Some(meta)) if fetch => {
                         meta.check_body_length(body_len, self.max_record)?
                     }
-                    Reply::Record(None) | Reply::Unknown if fetch => {
+                    Reply::Record(None) | Reply::Unknown | Reply::Redirect { .. } if fetch => {
                         ensure!(body_len == 0, "unexpected record payload")
                     }
                     Reply::Record(_) => anyhow::bail!("record reply for non-fetch request"),

@@ -317,7 +317,12 @@ enum Work {
     ReadSource(source_read::Request, Completion<source_read::Observation>),
     Campaign(Completion<()>),
     #[cfg(feature = "peer-transport")]
-    Fetch(u64, Instant, Completion<Option<Batch>>),
+    Fetch {
+        index: u64,
+        queued_at: Instant,
+        require_applied: bool,
+        reply: Completion<Option<Batch>>,
+    },
     Local(LocalWork),
     Checkpoint(Box<images::CheckpointWork>),
 }
@@ -949,7 +954,12 @@ impl Worker {
                 }
             },
             #[cfg(feature = "peer-transport")]
-            Work::Fetch(index, queued_at, reply) => {
+            Work::Fetch {
+                index,
+                queued_at,
+                require_applied,
+                reply,
+            } => {
                 // Only previously durable applied state is readable here. The
                 // owned, validated payload needs no subsequent poll; this does
                 // not release commits, quorum reads, or image mutations early.
@@ -961,7 +971,20 @@ impl Worker {
                     service,
                     &result,
                 );
-                reply.finish(result);
+                // The worker still owns the same applied state as the fetch.
+                // A routed miss ahead of that cut must try another voter.
+                reply.finish(result.and_then(|batch| {
+                    if require_applied && batch.is_none() {
+                        let status = self.node.status(self.group)?;
+                        if status.applied < index {
+                            return Err(client::FetchAhead {
+                                leader: status.leader,
+                            }
+                            .into());
+                        }
+                    }
+                    Ok(batch)
+                }));
             }
             Work::Local(work) => after_poll.push(work(&mut self.node)),
             Work::Checkpoint(work) => self.queue_checkpoint(work),
