@@ -134,6 +134,95 @@ async fn routed_fetch_skips_a_replica_behind_the_payload_index() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routed_fetch_checks_a_legacy_miss_before_accepting_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut c = RpcCluster::open(dir.path(), Options::default()).await?;
+    let leader = c.leader().await?;
+    let lagging = (1..=3).find(|voter| *voter != leader).unwrap();
+    let caught_up = (1..=3)
+        .find(|voter| *voter != leader && *voter != lagging)
+        .unwrap();
+    let follower = c.net.nodes.remove(&lagging).context("missing follower")?;
+    follower.network.shutdown().await?;
+    let original = batch(1);
+    let response = c
+        .client
+        .request(
+            leader,
+            Request::Append {
+                group: 10,
+                batch: original.clone(),
+            },
+        )
+        .await?;
+    let index = accepted(&response);
+    drop(response);
+    assert!(follower.handle.observation(10)?.status.applied < index);
+    timeout(Duration::from_secs(5), async {
+        while c.net.nodes[&caught_up]
+            .handle
+            .observation(10)?
+            .status
+            .applied
+            < index
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+
+    for (node, fetches) in [(lagging, 1), (caught_up, 2)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut endpoints = c.endpoints.clone();
+        endpoints.get_mut(&node).unwrap().data_address = listener.local_addr()?.to_string();
+        let client = client(&c, endpoints, Duration::from_secs(3))?;
+        client.leaders.lock().unwrap().insert(10, node);
+        let mut tls = (*c.net.tls[&node].server).clone();
+        tls.alpn_protocols = vec![ALPN.to_vec()];
+        let expected = original.clone();
+        // The real follower's control socket reports its applied position.
+        // Its replaced data socket supplies the old empty-reply behavior.
+        let server = async {
+            let (socket, _) = listener.accept().await?;
+            let mut socket = TlsAcceptor::from(Arc::new(tls)).accept(socket).await?;
+            for attempt in 0..fetches {
+                let (id, meta_len, body_len) = prefix(&mut socket, 0).await?;
+                assert_eq!(body_len, 0);
+                let (scope, wire): (Scope, WireRequest) =
+                    codec().deserialize(&receive(&mut socket, meta_len).await?)?;
+                assert!(
+                    matches!(wire, WireRequest::Fetch { group: 10, index: actual } if actual == index)
+                );
+                let (reply, body) = if attempt == 0 {
+                    (Reply::Record(None), Bytes::new())
+                } else {
+                    (
+                        Reply::Record(Some(expected.meta.clone())),
+                        expected.body.clone(),
+                    )
+                };
+                send(&mut socket, id, &codec().serialize(&(scope, reply))?, &body).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (fetched, served) = timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                client.request_routed(Request::Fetch { group: 10, index }),
+                server
+            )
+        })
+        .await?;
+        served?;
+        let fetched = fetched?;
+        assert!(matches!(&fetched.reply, Reply::Record(Some(meta)) if meta == &original.meta));
+        assert_eq!(fetched.body, original.body);
+    }
+    c.shutdown().await?;
+    follower.runtime.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_voters_share_the_original_fetch_deadline() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let c = RpcCluster::open(dir.path(), Options::default()).await?;
