@@ -155,7 +155,7 @@ impl WriteBatch {
     /// so a cancelled step can never record a partial list. A spill failure
     /// stops the owner before progress or receipts advance; fenced recovery
     /// replays the WAL from the last publication and rebuilds the list.
-    pub fn record(&mut self, survivors: Survivors) -> Result<()> {
+    pub(super) fn record(&mut self, survivors: Survivors) -> Result<()> {
         self.active.rows += survivors.rows.len() as u64;
         if !survivors.rows.is_empty() {
             self.active.metas.insert(survivors.index, survivors.meta.clone());
