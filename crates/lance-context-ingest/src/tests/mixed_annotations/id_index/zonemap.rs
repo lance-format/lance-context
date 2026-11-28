@@ -257,7 +257,7 @@ async fn zonemap_and_btree_turn_segments_never_mix() -> Result<()> {
             .await??
             .unwrap_err();
         assert!(
-            format!("{error:#}").contains("turn ID index type differs"),
+            format!("{error:#}").contains("turn index type differs"),
             "{error:#}"
         );
         let (_, now) = coverage(&c, &narrow).await?;
