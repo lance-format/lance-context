@@ -15,10 +15,11 @@ use lance_context_api::{
     ListGenericStoresResponse, ListRowsResponse, MAX_BATCH_GET_IDS,
 };
 use lance_context_core::{GenericStore, GenericStoreOptions};
+use lance_context_metrics::ReadFailureStage;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
-use crate::error::AppError;
+use crate::error::{AppError, ReadFailureError};
 use crate::state::AppState;
 
 /// Upper bound on one generic append request body.
@@ -210,10 +211,12 @@ async fn get_generic_row_refreshing_on_miss(
     store_lock: &RwLock<GenericStore>,
     id: &str,
     columns: Option<&[String]>,
-) -> Result<Option<serde_json::Map<String, serde_json::Value>>, AppError> {
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, ReadFailureError> {
     {
         let store = store_lock.read().await;
-        let row = store.get(id, columns).await.map_err(AppError::from_lance)?;
+        let row = store.get(id, columns).await.map_err(|error| {
+            ReadFailureError::from_lance(error, ReadFailureStage::GenericLookup)
+        })?;
         if row.is_some() || store.is_version_pinned() {
             return Ok(row);
         }
@@ -221,9 +224,14 @@ async fn get_generic_row_refreshing_on_miss(
 
     let mut store = store_lock.write().await;
     if !store.is_version_pinned() {
-        store.refresh_latest().await.map_err(AppError::from_lance)?;
+        store.refresh_latest().await.map_err(|error| {
+            ReadFailureError::from_lance(error, ReadFailureStage::GenericRefresh)
+        })?;
     }
-    store.get(id, columns).await.map_err(AppError::from_lance)
+    store
+        .get(id, columns)
+        .await
+        .map_err(|error| ReadFailureError::from_lance(error, ReadFailureStage::GenericRetryLookup))
 }
 
 /// `GET /api/v1/generic/{name}/rows/{id}`
@@ -231,8 +239,11 @@ pub async fn get_row(
     State(state): State<Arc<AppState>>,
     Path((name, id)): Path<(String, String)>,
     Query(query): Query<GetRowQuery>,
-) -> Result<Json<serde_json::Map<String, serde_json::Value>>, AppError> {
-    let store = state.get_or_open_generic_store(&name).await?;
+) -> Result<Json<serde_json::Map<String, serde_json::Value>>, ReadFailureError> {
+    let store = state
+        .get_or_open_generic_store(&name)
+        .await
+        .map_err(|error| ReadFailureError::new(error, ReadFailureStage::GenericStoreOpen))?;
 
     let columns: Option<Vec<String>> = query.columns.as_ref().map(|raw| {
         raw.split(',')
@@ -244,7 +255,12 @@ pub async fn get_row(
 
     let row = get_generic_row_refreshing_on_miss(&store, &id, columns.as_deref())
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("Row '{id}' does not exist")))?;
+        .ok_or_else(|| {
+            ReadFailureError::new(
+                AppError::NotFound(format!("Row '{id}' does not exist")),
+                ReadFailureStage::GenericLookup,
+            )
+        })?;
     Ok(Json(row))
 }
 

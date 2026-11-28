@@ -31,6 +31,21 @@ Concurrent scrapes return 503 rather than building several snapshots at once.
 Recent read errors have priority if long table names fill the response budget.
 Successful access never erases an unexpired read error.
 
+Generic single-row GET failures can additionally include `read_error_diagnostic`
+on the same table entry. Its closed `stage` values distinguish store open,
+initial lookup, refresh after a miss, and retry lookup. `kind` identifies the
+typed error family (`internal`, `overloaded`, `lance_io`, `lance_timeout`,
+`lance_arrow`, or `lance_other`), not a provider-specific root cause. No raw
+error text is retained. The process-local `sequence` identifies that observation
+together with the verified worker incarnation and `coverage_started_at_unix_millis`;
+it is not a client request ID or a storage request ID.
+
+This optional diagnostic comes from that exact response's in-process extension;
+it does not alter HTTP headers, bodies, status, retries, or store locking. It
+expires with the corresponding read error and becomes null if a newer error has
+no diagnostic. Consumers must accept absent/null fields from older instances or
+other routes and must not carry a previous diagnostic forward onto a new error.
+
 Validation: metrics crate unit and real Axum middleware tests, Clippy with
 warnings denied, and opt-in/disabled tests in isolated processes. The manual
 release-mode microbenchmark performs one million parse+cache-update operations

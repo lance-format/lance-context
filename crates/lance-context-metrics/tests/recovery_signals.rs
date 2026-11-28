@@ -2,10 +2,14 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
     middleware,
+    response::IntoResponse,
     routing::get,
     Router,
 };
-use lance_context_metrics::{http_metrics_layer, install_recorder, metrics_router};
+use lance_context_metrics::{
+    http_metrics_layer, install_recorder, metrics_router, ReadFailureDiagnostic, ReadFailureKind,
+    ReadFailureStage,
+};
 use std::{process::Command, sync::Arc};
 use tokio::sync::Notify;
 use tower::ServiceExt;
@@ -32,6 +36,18 @@ async fn middleware_records_inflight_demand_and_read_failures_without_payloads()
     let entered = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     let app = Router::new()
+        .route(
+            "/api/v1/generic/{name}/rows/{id}",
+            get(|| async {
+                let mut response =
+                    (StatusCode::INTERNAL_SERVER_ERROR, "secret-error-body").into_response();
+                response.extensions_mut().insert(ReadFailureDiagnostic::new(
+                    ReadFailureStage::GenericRefresh,
+                    ReadFailureKind::LanceIo,
+                ));
+                response
+            }),
+        )
         .route(
             "/api/v1/rollouts/{name}/records",
             get(|| async {
@@ -126,6 +142,62 @@ async fn middleware_records_inflight_demand_and_read_failures_without_payloads()
                 .unwrap();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/generic/diagnostic/rows/secret-id?sig=secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let sequence = response
+        .extensions()
+        .get::<ReadFailureDiagnostic>()
+        .unwrap()
+        .sequence();
+    assert_eq!(
+        to_bytes(response.into_body(), 4096).await.unwrap(),
+        "secret-error-body"
+    );
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/internal/recovery-signals?nonce=diagnostic")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("secret"));
+    if std::env::var("RECOVERY_SIGNALS_ENABLED").unwrap() == "true" {
+        assert_eq!(status, StatusCode::OK);
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let diagnostic = snapshot["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "generic:diagnostic")
+            .unwrap();
+        assert_eq!(diagnostic["read_error_status"], 500);
+        assert_eq!(
+            diagnostic["read_error_route"],
+            "/api/v1/generic/{name}/rows/{id}"
+        );
+        assert_eq!(
+            diagnostic["read_error_diagnostic"],
+            serde_json::json!({
+                "sequence": sequence, "stage": "generic_refresh", "kind": "lance_io",
+            })
+        );
+    } else {
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
     if std::env::var("RECOVERY_SIGNALS_ENABLED").unwrap() == "true" {
         let response = app
