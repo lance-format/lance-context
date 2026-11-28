@@ -295,6 +295,14 @@ impl StreamingProducer {
             "foreign turn body schema"
         );
         for (bucket, rows) in self.route(&batch)? {
+            // A whole batch keeps its Arrow buffers. Check the retained
+            // allocation too: a small slice can still pin an oversized parent.
+            if rows.len() == batch.num_rows()
+                && batch.num_rows() <= self.shared.max_rows
+                && batch.get_array_memory_size() <= self.shared.max_bytes
+            {
+                return self.admit(bucket, batch).await;
+            }
             let part = arrow_select::take::take_record_batch(&batch, &rows)?;
             self.admit(bucket, part).await?;
         }
