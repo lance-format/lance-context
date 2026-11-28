@@ -28,7 +28,7 @@ license = "Apache-2.0"
 # Pinned one-line validation fix; dependencies remain the released Arrow crates.
 parquet-variant = { git = "https://github.com/beinan/arrow-rs", rev = "3b82666c986414727c20b05d1cbb1c63a71a5877" }
 lance-io = { path = "vendor/lance-io" }
-# Scoped encoder lifetime tracking, Lance 14.0.2; see vendor/lance-core/BACKPORT.md.
+# Scoped encoder lifetime tracking, Lance 14.0.3; see vendor/lance-core/BACKPORT.md.
 lance-core = { path = "vendor/lance-core" }
 lance = { path = "vendor/lance" }
 lance-encoding = { path = "vendor/lance-encoding" }

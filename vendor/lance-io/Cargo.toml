@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.94.0"
 name = "lance-io"
-version = "14.0.2"
+version = "14.0.3"
 authors = ["Lance Devs <dev@lance.org>"]
 build = false
 autolib = false
@@ -191,10 +191,10 @@ version = "1.1.0"
 
 [dependencies.lance-core]
 path = "../lance-core"
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.lance-namespace]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dependencies.log]
 version = "0.4"
@@ -297,7 +297,7 @@ features = [
 ]
 
 [dev-dependencies.lance-testing]
-version = "=14.0.2"
+version = "=14.0.3"
 
 [dev-dependencies.metrics-util]
 version = "0.19"

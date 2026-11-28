@@ -1,9 +1,11 @@
-# Lance 14.0.2 compatibility patches
+# Lance 14.0.3 compatibility patches
 
-This directory starts from the official published `lance 14.0.2` crate.
-Archive SHA256: `6895913cb87c0ca8140d13a3c980ceb5b6c67d95f5e96093a3e157347021c61b`.
-Upstream commit: `40f15ed1b71b66950961b175829fdf17a763f108`.
+This directory starts from the official published `lance 14.0.3` crate.
+Archive SHA256: `f2d220b0b8bcadec407aa4677dbfbcafee2fa69e56421d1ce07f156ad8c08503`.
+Upstream commit: `c7dc014f1e722ad7dcc9a731991e4f33bb8852bb`.
 The original Cargo manifest, VCS provenance, and Apache 2.0 license are retained.
+The upstream 14.0.3 legacy Blob compatibility test uses the released v12 fixture
+in `test_data/v12.0.0/blobs/legacy_fragment.lance` at the repository root.
 
 Cargo.toml uses sibling paths for the patched crates and excludes Cargo's reserved
 provenance filenames during sdist repackaging. Standalone regression manifests
