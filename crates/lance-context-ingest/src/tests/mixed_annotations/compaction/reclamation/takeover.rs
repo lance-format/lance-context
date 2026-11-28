@@ -109,16 +109,17 @@ async fn exercise() -> Result<()> {
     let error = tokio::time::timeout(Duration::from_secs(30), old_task)
         .await??
         .unwrap_err();
-    let message = format!("{error:#}");
     // The old publisher may reach Plan or Prepare before observing the
     // successor's source fence. Both replicated commands reject stale authority.
     assert!(
-        message.contains("fenced")
-            || message.contains("view is behind source closure")
-            || message
-                == "publication selection rejected: Commit(Committed(Publisher(Rejected(Authority))))"
-            || message == "materialization result rejected: Publisher(Rejected(Authority))",
-        "{message}"
+        error.chain().any(|cause| {
+            let message = cause.to_string();
+            message.contains("fenced")
+                || message.contains("view is behind source closure")
+                || message == "publication selection rejected: Commit(Committed(Publisher(Rejected(Authority))))"
+                || message == "materialization result rejected: Publisher(Rejected(Authority))"
+        }),
+        "{error:#}"
     );
     assert!(!abandoned.exists());
     assert!(live.iter().all(|p| p.exists()));
