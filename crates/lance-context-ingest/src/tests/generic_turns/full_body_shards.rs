@@ -52,13 +52,25 @@ impl Physical {
         spec: &TurnIngestionSpec,
         uploads: Arc<MergeMemoryBudget>,
     ) -> Result<(Service, Runtime)> {
+        self.owner_with_limits(c, layout, spec, uploads, fixture::limits())
+            .await
+    }
+
+    async fn owner_with_limits(
+        &self,
+        c: &network::Cluster,
+        layout: &Arc<Layout>,
+        spec: &TurnIngestionSpec,
+        uploads: Arc<MergeMemoryBudget>,
+        limits: lance_context_core::annotation_staging::Limits,
+    ) -> Result<(Service, Runtime)> {
         Runtime::connect_body_shard(
             c.client.clone(),
             layout.clone(),
             self.binding.clone(),
             self.storage.clone(),
             Configuration {
-                limits: fixture::limits(),
+                limits,
                 upload_budget: uploads,
                 apply_budget: MergeMemoryBudget::new(8 << 20),
                 publication_budget: MergeMemoryBudget::new(8 << 20),

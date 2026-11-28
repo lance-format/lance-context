@@ -26,17 +26,42 @@ impl Pool for Gate {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BodyMode {
+    ResidentFrames,
+    OwnerBatch,
+}
+
+impl BodyMode {
+    fn configure(self, runtime: Runtime) -> Result<Runtime> {
+        match self {
+            Self::ResidentFrames => runtime.without_owner_batch(),
+            Self::OwnerBatch => runtime.with_owner_batch(Default::default()),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_body_lookup_refills_across_a_retained_short_page() -> Result<()> {
-    tokio::time::timeout(DEADLINE, exercise(false)).await?
+    tokio::time::timeout(DEADLINE, exercise(false, BodyMode::ResidentFrames)).await?
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_body_cancelled_cross_page_lookahead_replays_without_skipping() -> Result<()> {
-    tokio::time::timeout(DEADLINE, exercise(true)).await?
+    tokio::time::timeout(DEADLINE, exercise(true, BodyMode::ResidentFrames)).await?
 }
 
-async fn exercise(cancel: bool) -> Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_batch_lookup_refills_across_a_retained_short_page() -> Result<()> {
+    tokio::time::timeout(DEADLINE, exercise(false, BodyMode::OwnerBatch)).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_batch_cancelled_cross_page_lookahead_replays_without_skipping() -> Result<()> {
+    tokio::time::timeout(DEADLINE, exercise(true, BodyMode::OwnerBatch)).await?
+}
+
+async fn exercise(cancel: bool, mode: BodyMode) -> Result<()> {
     let input = bodies()?;
     let spec = TurnIngestionSpec::new(
         input[0].schema(),
@@ -62,7 +87,7 @@ async fn exercise(cancel: bool) -> Result<()> {
     )
     .await?;
     let state = annotation_publication::state(&c).await?;
-    let (service, mut runtime) = Runtime::connect_body_shard(
+    let (service, runtime) = Runtime::connect_body_shard(
         c.client.clone(),
         annotation_publication::one_shard(),
         binding(),
@@ -92,6 +117,7 @@ async fn exercise(cancel: bool) -> Result<()> {
         &spec,
     )
     .await?;
+    let mut runtime = mode.configure(runtime)?;
     let initial = service.observation().await.0.applied;
     let gate = Arc::new(Gate::default());
     let mut backlog = Vec::new();
@@ -141,13 +167,17 @@ async fn exercise(cancel: bool) -> Result<()> {
     runtime.apply_once_for_test().await?;
     let observed = service.body_lookup_observation();
     assert_eq!(observed.completed_lookups, 1);
-    // The window is no longer capped at eight requests: it spans the whole
-    // committed backlog, bounded by key workspace. Only the first eight keep
-    // decoded bodies resident; the rest are keys-only until re-read from WAL.
+    // The key window spans the backlog in both modes. The resident path
+    // keeps eight bodies. The owner batch path drops all of them, including
+    // the head, which is tracked separately from the eleven lookahead records.
+    let (keys_only_records, apply_refetches) = match mode {
+        BodyMode::ResidentFrames => (4, 4),
+        BodyMode::OwnerBatch => (11, 0),
+    };
     assert_eq!(observed.last_lookup_requests, 12);
     assert_eq!(observed.prefetch.request_bound, 0);
     assert_eq!(observed.prefetch.page_exhausted, 1);
-    assert_eq!(observed.prefetch.keys_only_records, 4);
+    assert_eq!(observed.prefetch.keys_only_records, keys_only_records);
     assert_eq!(observed.prefetch.body_refetches, 0);
     assert_eq!(observed.scans_started, 1);
     assert_eq!(
@@ -177,18 +207,28 @@ async fn exercise(cancel: bool) -> Result<()> {
         drop(service);
         let (service, runtime) = owner(&c, &storage, &spec).await?;
         assert!(service.observation().await.0.applied < backlog[0].1);
-        finish(&c, &storage, &spec, &input, service, runtime, backlog).await?;
+        finish(
+            &c,
+            &storage,
+            &spec,
+            &input,
+            service,
+            mode.configure(runtime)?,
+            backlog,
+        )
+        .await?;
     } else {
         for (_, index) in backlog.iter().skip(1) {
             runtime.apply_once_for_test().await?;
             assert_eq!(service.observation().await.0.applied, *index);
         }
-        // One history scan covered all twelve requests; keys-only records
-        // were re-read from the durable WAL instead of held in memory.
+        // Both modes cover the full window with one history scan. The
+        // resident path refetches deferred bodies during apply. The owner
+        // batch path fetches survivors during publication instead.
         let observed = service.body_lookup_observation();
         assert_eq!(observed.completed_lookups, 1);
         assert_eq!(observed.scans_started, 1);
-        assert_eq!(observed.prefetch.body_refetches, 4);
+        assert_eq!(observed.prefetch.body_refetches, apply_refetches);
         finish(&c, &storage, &spec, &input, service, runtime, backlog).await?;
     }
     c.shutdown().await
