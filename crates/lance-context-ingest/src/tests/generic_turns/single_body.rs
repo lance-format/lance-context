@@ -9,6 +9,7 @@ use crate::tests::annotation_runtime::{drained, run_owner};
 mod compaction;
 mod coverage;
 mod cross_page;
+mod native_memory;
 #[cfg(unix)]
 mod process;
 mod staged_lookup;

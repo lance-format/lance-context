@@ -110,6 +110,18 @@ impl Runtime {
         Ok(self)
     }
 
+    /// Cap the full-body key window below its half-lookup-budget default,
+    /// so a fixture can force a real `KeyBound` window boundary.
+    #[cfg(test)]
+    pub(crate) fn with_body_key_window_for_test(self, bytes: usize) -> Self {
+        self.driver
+            .service
+            .shared
+            .key_window_for_test
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
     /// Obtain a process-local, opt-in diagnostic handle bound to this owner.
     /// Arming it captures one future historical lookup's keys, never bodies.
     pub fn body_lookup_capture(&self) -> Result<super::lookup_capture::Handle> {

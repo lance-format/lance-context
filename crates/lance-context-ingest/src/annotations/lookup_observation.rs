@@ -8,7 +8,13 @@ pub enum PrefetchStop {
     RequestBound,
     ByteBound,
     Admission,
+    /// The next record's keys would exceed the window's key workspace.
+    KeyBound,
 }
+
+/// Power-of-two buckets of keys per prepared full-body window: bucket `i`
+/// counts windows with `2^i <= keys < 2^(i+1)` (bucket 0 also holds 0-1).
+pub const KEYS_PER_WINDOW_BUCKETS: usize = 20;
 
 /// Completed prefetch decisions, before lookup admission. These are selected
 /// inputs, not applied requests or completed native scans. A full-body window
@@ -26,6 +32,17 @@ pub struct BodyPrefetchObservation {
     pub request_bound: u64,
     pub byte_bound: u64,
     pub admission: u64,
+    pub key_bound: u64,
+    /// Keys and conservative key-workspace bytes of prepared windows.
+    pub keys: u64,
+    pub last_keys: u64,
+    pub max_keys: u64,
+    pub last_key_workspace_bytes: u64,
+    pub keys_per_window: [u64; KEYS_PER_WINDOW_BUCKETS],
+    /// Records admitted into a window with decoded bodies released (keys only).
+    pub keys_only_records: u64,
+    /// Keys-only records re-read and decoded from the WAL before apply.
+    pub body_refetches: u64,
     /// Validated empty ReadSource responses with more locally applied metadata
     /// beyond the page cursor. That metadata need not match this table/bucket.
     pub source_empty_with_remaining_metadata: u64,
@@ -50,9 +67,24 @@ impl BodyPrefetchObservation {
             PrefetchStop::RequestBound => &mut self.request_bound,
             PrefetchStop::ByteBound => &mut self.byte_bound,
             PrefetchStop::Admission => &mut self.admission,
+            PrefetchStop::KeyBound => &mut self.key_bound,
         };
         *count = count.saturating_add(1);
     }
+
+    pub(super) fn record_keys(&mut self, keys: usize, workspace: usize, keys_only: usize) {
+        let keys = keys as u64;
+        self.keys = self.keys.saturating_add(keys);
+        self.last_keys = keys;
+        self.max_keys = self.max_keys.max(keys);
+        self.last_key_workspace_bytes = workspace as u64;
+        self.keys_per_window[keys_bucket(keys)] += 1;
+        self.keys_only_records = self.keys_only_records.saturating_add(keys_only as u64);
+    }
+}
+
+pub(super) fn keys_bucket(keys: u64) -> usize {
+    (keys.max(1).ilog2() as usize).min(KEYS_PER_WINDOW_BUCKETS - 1)
 }
 
 /// A native metric may be absent from a successful scan's execution plan.
@@ -266,5 +298,32 @@ mod tests {
                 total: 33
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod keys_histogram_tests {
+    use super::*;
+
+    #[test]
+    fn keys_per_window_buckets_are_power_of_two() {
+        assert_eq!(keys_bucket(0), 0);
+        assert_eq!(keys_bucket(1), 0);
+        assert_eq!(keys_bucket(2), 1);
+        assert_eq!(keys_bucket(2047), 10);
+        assert_eq!(keys_bucket(2048), 11);
+        assert_eq!(keys_bucket(50_000), 15);
+        assert_eq!(keys_bucket(u64::MAX), KEYS_PER_WINDOW_BUCKETS - 1);
+        let mut observed = BodyPrefetchObservation::default();
+        observed.record_keys(2300, 1 << 20, 0);
+        observed.record_keys(40_000, 8 << 20, 30);
+        observed.record(31, 1 << 30, PrefetchStop::KeyBound);
+        assert_eq!(observed.keys, 42_300);
+        assert_eq!(observed.max_keys, 40_000);
+        assert_eq!(observed.last_keys, 40_000);
+        assert_eq!(observed.keys_per_window[11], 1);
+        assert_eq!(observed.keys_per_window[15], 1);
+        assert_eq!(observed.keys_only_records, 30);
+        assert_eq!(observed.key_bound, 1);
     }
 }
