@@ -1,6 +1,7 @@
 //! Exercise real owner response ownership without a socket draining it first.
 use super::*;
 use crate::http::annotations::PointRequest;
+use crate::materializer::observation::Phase;
 use lance_context_core::MergeReservation;
 
 pub(super) async fn idle_budget(budget: &Arc<MergeMemoryBudget>) -> Result<MergeReservation> {
@@ -129,7 +130,7 @@ async fn fenced_read() -> Result<()> {
     // Fresh native caches guarantee the next body lookup reaches real IO.
     let faults = Arc::new(fault_store::Faults::default());
     physical.storage = fault_store::storage(&directory, faults.clone()).await?;
-    let (_, old_runtime) = physical.owner(&c, &layout, &spec, budget.clone()).await?;
+    let (old_service, old_runtime) = physical.owner(&c, &layout, &spec, budget.clone()).await?;
     let old_owner = Owner::new(&old_runtime, keys()?, Default::default())?;
     let old_server = Server::start(old_owner.router()).await?;
     let (stop_old, stopped_old) = tokio::sync::oneshot::channel();
@@ -151,6 +152,15 @@ async fn fenced_read() -> Result<()> {
         result = tokio::time::timeout(DEADLINE, entered) => { result??; }
     }
     assert!(!pending.is_finished());
+    let phases = old_service.phase_observation();
+    assert_eq!(phases[Phase::AnnotationPointRead as usize].active, 1);
+    assert_eq!(
+        phases[Phase::AnnotationPointRecoveryWait as usize].completed,
+        1
+    );
+    assert_eq!(phases[Phase::AnnotationPointCapture as usize].completed, 1);
+    assert_eq!(phases[Phase::AnnotationPointWalFetch as usize].started, 0);
+    assert_eq!(phases[Phase::AnnotationPointLanceScan as usize].active, 1);
     // Keep the old runtime alive but unpolled during takeover. Its background
     // shutdown cannot substitute for the HTTP handler's own epoch fence.
 

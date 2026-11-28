@@ -104,44 +104,58 @@ impl Service {
     ) -> Result<Option<Body>> {
         ensure!(self.is_single_body(), "not a single body service");
         self.validate_turn(key)?;
-        tokio::time::timeout(deadline, async {
+        let phases = &self.shared.phases;
+        let lookup = tokio::time::timeout(deadline, async {
             let through = match recovery_cut {
                 Some(cut) => cut,
                 None => self.barrier().await?,
             };
-            self.wait_through(through).await?;
-            let (mut view, staged, deferred) = {
-                let _ordered = self.shared.ordered.lock().await;
-                let view = self.shared.staging.capture_immutable_body(key).await?;
-                let mut deferred = None;
-                let staged = match view.source() {
-                    TurnBodySource::Unmaterialized(source) => {
-                        let meta = self
-                            .shared
-                            .write_batch
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .and_then(|batch| batch.deferred(source.record_index));
-                        match meta {
-                            Some(meta) => {
-                                deferred = Some((source, meta));
-                                None
+            phases
+                .measure(
+                    Phase::AnnotationPointRecoveryWait,
+                    self.wait_through(through),
+                )
+                .await?;
+            let (mut view, staged, deferred) = phases
+                .measure(Phase::AnnotationPointCapture, async {
+                    let _ordered = self.shared.ordered.lock().await;
+                    let view = self.shared.staging.capture_immutable_body(key).await?;
+                    let mut deferred = None;
+                    let staged = match view.source() {
+                        TurnBodySource::Unmaterialized(source) => {
+                            let meta = self
+                                .shared
+                                .write_batch
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .and_then(|batch| batch.deferred(source.record_index));
+                            match meta {
+                                Some(meta) => {
+                                    deferred = Some((source, meta));
+                                    None
+                                }
+                                None => Some(self.shared.frames.lock().unwrap().row(source, key)?),
                             }
-                            None => Some(self.shared.frames.lock().unwrap().row(source, key)?),
                         }
-                    }
-                    TurnBodySource::Materialized(_) => None,
-                };
-                (view, staged, deferred)
-            };
+                        TurnBodySource::Materialized(_) => None,
+                    };
+                    Ok::<_, anyhow::Error>((view, staged, deferred))
+                })
+                .await?;
             let mut refetched = None;
             let mut recaptured = false;
             if let Some((source, meta)) = deferred {
                 // Capture -> Close -> Fetch: publication can retire the WAL
                 // record after the ordered capture. The row is then in the
                 // installed base; recapture it below and read from Lance.
-                match self.refetch_bodies(source.record_index, meta).await {
+                match phases
+                    .measure(
+                        Phase::AnnotationPointWalFetch,
+                        self.refetch_bodies(source.record_index, meta),
+                    )
+                    .await
+                {
                     Ok(fetched) => refetched = Some((source, fetched)),
                     Err(error) if error.is::<super::prefetch::PayloadRetired>() => {
                         self.recapture_retired(&mut view, source.record_index)
@@ -208,18 +222,23 @@ impl Service {
                     .batch_readahead(1)
                     .fragment_readahead(1)
                     .io_buffer_size(self.ingress.scope.contract.max_record_bytes as u64);
-                let mut stream = scan.try_into_stream().await?;
-                let mut found = None;
-                while let Some(batch) = stream.try_next().await? {
-                    if batch.num_rows() == 0 {
-                        continue;
-                    }
-                    ensure!(
-                        batch.num_rows() == 1 && found.is_none(),
-                        "duplicate immutable body key"
-                    );
-                    found = Some(batch);
-                }
+                let found = phases
+                    .measure(Phase::AnnotationPointLanceScan, async {
+                        let mut stream = scan.try_into_stream().await?;
+                        let mut found = None;
+                        while let Some(batch) = stream.try_next().await? {
+                            if batch.num_rows() == 0 {
+                                continue;
+                            }
+                            ensure!(
+                                batch.num_rows() == 1 && found.is_none(),
+                                "duplicate immutable body key"
+                            );
+                            found = Some(batch);
+                        }
+                        Ok(found)
+                    })
+                    .await?;
                 let Some(batch) = found else {
                     // A recaptured base was proven to cover the retired WAL
                     // record that staged this key; absence is corruption.
@@ -247,8 +266,11 @@ impl Service {
                 _view: view,
                 _workspace: workspace,
             }))
-        })
-        .await
-        .context("full body read deadline exceeded")?
+        });
+        phases
+            .measure(Phase::AnnotationPointRead, async {
+                lookup.await.context("full body read deadline exceeded")?
+            })
+            .await
     }
 }

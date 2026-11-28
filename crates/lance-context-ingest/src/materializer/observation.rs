@@ -114,8 +114,14 @@ pub enum Phase {
     AnnotationApplyMemoryPressure,
     AnnotationSourceWindowPressure,
     AnnotationStagingPressure,
+    /// A full-body point read waiting for its recovery cut to be applied.
+    AnnotationPointRecoveryWait,
+    /// Fetching and decoding the exact WAL record captured by a point read.
+    AnnotationPointWalFetch,
+    /// Looking up a point body in the captured installed Lance version.
+    AnnotationPointLanceScan,
 }
-const NAMES: [&str; 61] = [
+const NAMES: [&str; 64] = [
     "claim",
     "acquire",
     "state",
@@ -177,6 +183,9 @@ const NAMES: [&str; 61] = [
     "annotation_apply_memory_pressure",
     "annotation_source_window_pressure",
     "annotation_staging_pressure",
+    "annotation_point_recovery_wait",
+    "annotation_point_wal_fetch",
+    "annotation_point_lance_scan",
 ];
 pub const PHASE_COUNT: usize = NAMES.len();
 
