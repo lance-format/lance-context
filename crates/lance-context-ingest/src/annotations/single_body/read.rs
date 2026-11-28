@@ -29,7 +29,7 @@ impl Body {
 }
 
 impl Service {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
     pub(crate) fn apply_budget_for_test(&self) -> &Arc<MergeMemoryBudget> {
         &self.apply_budget
     }

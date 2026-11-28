@@ -1,6 +1,10 @@
 //! One task per lane: pull up to the record cap from the shared buffer,
 //! encode, commit, record the pending Applied wait, pull again.
-use std::{future::Future, sync::{atomic::Ordering, Arc}, time::Instant};
+use std::{
+    future::Future,
+    sync::{atomic::Ordering, Arc},
+    time::Instant,
+};
 
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
@@ -8,11 +12,19 @@ use lance_context_wal::replication::runtime::client::payload_memory::Reservation
 
 use super::{encode, LaneSlot, Pending, RowExceedsRecord, Shared, BACKOFF_MAX, BACKOFF_MIN};
 
-pub(super) async fn run(shared: Arc<Shared>, slot: Arc<LaneSlot>, _slot_memory: Box<dyn Reservation>) {
+pub(super) async fn run(
+    shared: Arc<Shared>,
+    slot: Arc<LaneSlot>,
+    _slot_memory: Box<dyn Reservation>,
+) {
     let bucket = slot.shard.bucket;
     loop {
         let idle = Instant::now();
-        let pulled = match shared.buffer.pull(bucket, shared.max_rows, shared.max_bytes).await {
+        let pulled = match shared
+            .buffer
+            .pull(bucket, shared.max_rows, shared.max_bytes)
+            .await
+        {
             Ok(Some(pulled)) => pulled,
             Ok(None) => return,
             Err(_) => return, // buffer already failed; fence/send surface it
@@ -30,7 +42,12 @@ pub(super) async fn run(shared: Arc<Shared>, slot: Arc<LaneSlot>, _slot_memory: 
     }
 }
 
-async fn commit_rows(shared: &Shared, slot: &LaneSlot, batches: Vec<RecordBatch>, rows: usize) -> Result<()> {
+async fn commit_rows(
+    shared: &Shared,
+    slot: &LaneSlot,
+    batches: Vec<RecordBatch>,
+    rows: usize,
+) -> Result<()> {
     let schema = shared.spec.body_schema().clone();
     let body = if batches.len() == 1 {
         batches.into_iter().next().unwrap()
@@ -106,7 +123,14 @@ async fn commit(
             p.rows += rows;
             p.keys.extend(keys);
         }
-        None => *pending = Some(Pending { latest: reply, records: 1, rows, keys }),
+        None => {
+            *pending = Some(Pending {
+                latest: reply,
+                records: 1,
+                rows,
+                keys,
+            })
+        }
     }
     Ok(())
 }

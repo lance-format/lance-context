@@ -128,7 +128,13 @@ impl Runtime {
         let service = &self.driver.service;
         service.ensure_owner_batch_unstarted()?;
         *service.shared.write_batch.lock().unwrap() = None;
-        service.shared.batch_metrics.lock().unwrap().observed.enabled = false;
+        service
+            .shared
+            .batch_metrics
+            .lock()
+            .unwrap()
+            .observed
+            .enabled = false;
         Ok(self)
     }
 

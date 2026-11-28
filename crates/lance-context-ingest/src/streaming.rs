@@ -202,7 +202,10 @@ impl StreamingProducer {
     /// Reserve every lane's fixed slot, then start one task per lane. Resume
     /// recovered journal intents on the clients before opening.
     pub fn open(config: Config) -> Result<Self> {
-        ensure!(!config.shards.is_empty(), "streaming producer has no shards");
+        ensure!(
+            !config.shards.is_empty(),
+            "streaming producer has no shards"
+        );
         ensure!(config.applied_parallelism > 0, "zero applied parallelism");
         let first = &config.shards.values().next().unwrap().binding;
         let (tenant, table) = (first.tenant.clone(), first.qualified_table.clone());
@@ -333,7 +336,8 @@ impl StreamingProducer {
             return Ok(batch);
         }
         self.shared.metrics.dropped_known(hits);
-        let keep = arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
+        let keep =
+            arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
         Ok(arrow_select::filter::filter_record_batch(&batch, &keep)?)
     }
 
@@ -347,9 +351,10 @@ impl StreamingProducer {
             .context("invalid routing column")?;
         let mut groups = BTreeMap::<u32, Vec<u32>>::new();
         for row in 0..batch.num_rows() {
-            let bucket = shared
-                .layout
-                .session_bucket(&shared.tenant, &shared.table, sessions.value(row))?;
+            let bucket =
+                shared
+                    .layout
+                    .session_bucket(&shared.tenant, &shared.table, sessions.value(row))?;
             ensure!(
                 shared.buffer.has_shard(bucket),
                 "turn routed to unconfigured shard {bucket}"
@@ -425,11 +430,11 @@ impl StreamingProducer {
                 let shared = self.shared.clone();
                 async move {
                     let started = std::time::Instant::now();
-                    let reply = lane::retry(&shared, || {
-                        slot.client.wait_applied(slot.key, &latest)
-                    })
-                    .await;
-                    shared.metrics.applied_wait(started.elapsed(), reply.is_ok());
+                    let reply =
+                        lane::retry(&shared, || slot.client.wait_applied(slot.key, &latest)).await;
+                    shared
+                        .metrics
+                        .applied_wait(started.elapsed(), reply.is_ok());
                     let reply = reply?;
                     Ok((
                         slot.clone(),
@@ -473,9 +478,20 @@ impl StreamingProducer {
         let mut cache_updates = Vec::new();
         for (slot, applied) in resolved {
             // Nothing committed after the snapshot: sender lock held.
-            let keys = slot.pending.lock().unwrap().take().map(|p| p.keys).unwrap_or_default();
+            let keys = slot
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .map(|p| p.keys)
+                .unwrap_or_default();
             let applied_ok = applied.reply.completion.result == MutationResult::Applied;
-            cache_updates.push((slot.shard.bucket, applied.reply.completion.index, keys, applied_ok));
+            cache_updates.push((
+                slot.shard.bucket,
+                applied.reply.completion.index,
+                keys,
+                applied_ok,
+            ));
             fence
                 .shards
                 .entry(slot.shard.bucket)

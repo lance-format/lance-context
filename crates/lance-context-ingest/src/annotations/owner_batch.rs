@@ -158,7 +158,9 @@ impl WriteBatch {
     pub(super) fn record(&mut self, survivors: Survivors) -> Result<()> {
         self.active.rows += survivors.rows.len() as u64;
         if !survivors.rows.is_empty() {
-            self.active.metas.insert(survivors.index, survivors.meta.clone());
+            self.active
+                .metas
+                .insert(survivors.index, survivors.meta.clone());
         }
         self.active.ram_bytes += survivors.ram_bytes();
         self.active.ram.push(survivors);
@@ -224,7 +226,11 @@ impl WriteBatch {
         self.active
             .metas
             .get(&index)
-            .or_else(|| self.frozen.as_ref().and_then(|f| f.segment.metas.get(&index)))
+            .or_else(|| {
+                self.frozen
+                    .as_ref()
+                    .and_then(|f| f.segment.metas.get(&index))
+            })
             .cloned()
     }
 }
@@ -590,7 +596,13 @@ struct KeyRuns {
 }
 impl KeyRuns {
     fn new(dir: Option<PathBuf>, limit: usize) -> Self {
-        Self { dir, limit, current: Vec::new(), current_bytes: 0, files: Vec::new() }
+        Self {
+            dir,
+            limit,
+            current: Vec::new(),
+            current_bytes: 0,
+            files: Vec::new(),
+        }
     }
     fn push(&mut self, key: SortKey) -> Result<()> {
         self.current_bytes += key.bytes();
@@ -615,8 +627,14 @@ impl KeyRuns {
             );
             sources.push(RunSource::File(reader.lines()));
         }
-        sources.push(RunSource::Ram(std::mem::take(&mut self.current).into_iter()));
-        let mut merge = KeyMerge { _files: self.files, sources, heap: std::collections::BinaryHeap::new() };
+        sources.push(RunSource::Ram(
+            std::mem::take(&mut self.current).into_iter(),
+        ));
+        let mut merge = KeyMerge {
+            _files: self.files,
+            sources,
+            heap: std::collections::BinaryHeap::new(),
+        };
         for at in 0..merge.sources.len() {
             merge.refill(at)?;
         }
@@ -677,7 +695,10 @@ impl Locate {
     }
     fn at(&mut self, row: u32) -> Result<(usize, usize)> {
         let b = self.ends.partition_point(|end| *end <= row);
-        ensure!(b < self.ends.len(), "write batch survivor exceeds its source rows");
+        ensure!(
+            b < self.ends.len(),
+            "write batch survivor exceeds its source rows"
+        );
         let start = if b == 0 { 0 } else { self.ends[b - 1] };
         Ok((b, (row - start) as usize))
     }
@@ -742,7 +763,10 @@ fn gather(
     for (&index, (bodies, _)) in fetched {
         base.insert(index, (batches.len(), Locate::new(bodies)));
         for batch in bodies {
-            batches.push(RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?);
+            batches.push(RecordBatch::try_new(
+                schema.clone(),
+                batch.columns().to_vec(),
+            )?);
         }
     }
     let order = window
