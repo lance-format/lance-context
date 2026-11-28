@@ -525,7 +525,15 @@ impl Runtime {
                 .context("annotation manifests unavailable")?
                 .head;
             let base = checkpoint::load(&service.ingress, &storage, version).await?;
-            materializer::TurnIdIndex::validate_base(&base)?;
+            let index_type = c
+                .publication
+                .turn_id_index
+                .as_ref()
+                .filter(|_| c.publication.status_index.is_none())
+                .map_or(materializer::TurnIdIndexType::Btree, |index| {
+                    index.index_type
+                });
+            materializer::TurnIdIndex::validate_base(&base, index_type)?;
         }
         if service.is_single_body() {
             // Single-body Turns owners run the streaming owner batch pipeline
