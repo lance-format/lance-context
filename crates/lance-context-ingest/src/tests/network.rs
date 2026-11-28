@@ -355,6 +355,38 @@ impl Cluster {
             application,
         })
     }
+    #[cfg(all(feature = "http-client", feature = "service"))]
+    pub(super) async fn stop_source_leader(&mut self, group: u64) -> Result<u64> {
+        ensure!(
+            self.nodes.len() == 3,
+            "leader-loss fixture requires three live voters"
+        );
+        let source = self.nodes[0].0.handle().observation(group)?.status;
+        let stopped = source.leader;
+        ensure!((1..=3).contains(&stopped), "source group has no leader");
+        let (runtime, peer, rpc) = self.nodes.remove(stopped as usize - 1);
+        rpc.shutdown().await?;
+        peer.shutdown().await?;
+        runtime.shutdown().await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let a = self.nodes[0].0.handle().observation(group)?.status;
+                let b = self.nodes[1].0.handle().observation(group)?.status;
+                if a.leader == b.leader
+                    && a.leader != 0
+                    && a.leader != stopped
+                    && a.term > source.term
+                    && b.term > source.term
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        Ok(stopped)
+    }
+
     pub async fn shutdown(self) -> Result<()> {
         for (runtime, peer, rpc) in self.nodes {
             rpc.shutdown().await?;

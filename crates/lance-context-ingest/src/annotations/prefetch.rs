@@ -131,6 +131,22 @@ async fn read_page(
     Ok(Some((page, local_end)))
 }
 
+/// The WAL no longer holds this committed record: publication retired it.
+#[derive(Debug)]
+pub(super) struct PayloadRetired {
+    pub index: u64,
+}
+impl std::fmt::Display for PayloadRetired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "committed annotation payload {} retired from the WAL",
+            self.index
+        )
+    }
+}
+impl std::error::Error for PayloadRetired {}
+
 pub(super) async fn fetch(
     service: &Service,
     index: u64,
@@ -175,6 +191,9 @@ pub(super) async fn fetch(
                 Err(error) if error.is::<payload_memory::Unavailable>() => return Ok(None),
                 Err(error) => return Err(error),
             };
+            if matches!(response.reply, Reply::Record(None)) {
+                return Err(anyhow::Error::new(PayloadRetired { index }));
+            }
             ensure!(
                 matches!(response.reply, Reply::Record(Some(ref observed)) if observed == &meta),
                 "committed annotation payload unavailable"
@@ -370,7 +389,10 @@ pub(super) async fn prepare(
                 // Keep the metadata entry; this record starts a later window.
                 break PrefetchStop::KeyBound;
             }
-            let retain = resident.0 < MAX_REQUESTS
+            // Owner batch mode keeps no bodies at all: survivors are
+            // refetched from the WAL when the write batch is published.
+            let retain = !service.owner_batch()
+                && resident.0 < MAX_REQUESTS
                 && next.meta.body_bytes <= MAX_PAYLOAD_BYTES.saturating_sub(resident.1);
             if retain {
                 resident = (resident.0 + 1, resident.1 + next.meta.body_bytes);

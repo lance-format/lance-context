@@ -497,6 +497,10 @@ pub struct FrozenCheckpoint {
     results: Arc<Snapshot>,
     sources: lance_context_wal::replication::publication::SourceRange,
     pub(super) bodies: mixed::frames::Frozen,
+    /// Keys-only survivors of an owner batch, bound to this exact cut.
+    pub(super) write_batch: Option<Arc<owner_batch::Frozen>>,
+    /// The owning service, retained only to refetch owner batch bodies.
+    owner: Option<Service>,
     pub(super) body_preparation:
         tokio::sync::Mutex<Option<lance_context_core::annotation_staging::BodySnapshot>>,
     _source_generation: tokio::sync::OwnedSemaphorePermit,
@@ -506,12 +510,16 @@ pub struct PreparedCheckpoint {
     annotations: PreparedAnnotations,
     results: Arc<Snapshot>,
     bodies: mixed::frames::Frozen,
+    write_batch: Option<Arc<owner_batch::Frozen>>,
 }
 impl FrozenCheckpoint {
     pub async fn prepare_full_body(
         &self,
         workspace: &Arc<MergeMemoryBudget>,
     ) -> Result<PreparedCheckpoint> {
+        if let Some(batch) = &self.write_batch {
+            return self.prepare_owner_batch(workspace, batch.clone()).await;
+        }
         let mut selection = std::collections::BTreeMap::<u64, Vec<(u32, &str)>>::new();
         for (key, source) in self.annotations.new_turns() {
             selection
@@ -538,6 +546,47 @@ impl FrozenCheckpoint {
                 .map_err(runtime::publication_write_error)?,
             results: self.results.clone(),
             bodies: self.bodies.clone(),
+            write_batch: None,
+        })
+    }
+
+    /// Write stage: stream the frozen survivors back from the WAL, cluster
+    /// each chunk by (session_id, id) and write them as ONE fragment.
+    async fn prepare_owner_batch(
+        &self,
+        workspace: &Arc<MergeMemoryBudget>,
+        batch: Arc<owner_batch::Frozen>,
+    ) -> Result<PreparedCheckpoint> {
+        let started = std::time::Instant::now();
+        let mut expected = std::collections::BTreeMap::<u64, u32>::new();
+        for (_, source) in self.annotations.new_turns() {
+            *expected.entry(source.record_index).or_default() += 1;
+        }
+        let rows = expected.values().map(|n| *n as usize).sum::<usize>();
+        ensure!(
+            rows as u64 == batch.rows(),
+            "owner write batch differs from frozen first-create rows"
+        );
+        let service = self
+            .owner
+            .as_ref()
+            .context("owner batch lost its service")?;
+        let stream = service.survivor_stream(batch.clone(), expected)?;
+        let annotations = self
+            .annotations
+            .prepare_immutable_body_stream(workspace, rows, stream, batch.clone())
+            .await
+            .map_err(runtime::publication_write_error)?;
+        self.origin.batch_metrics.lock().unwrap().fragment(
+            rows as u64,
+            started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+        );
+        Ok(PreparedCheckpoint {
+            origin: self.origin.clone(),
+            annotations,
+            results: self.results.clone(),
+            bodies: self.bodies.clone(),
+            write_batch: Some(batch),
         })
     }
 
@@ -566,6 +615,7 @@ impl FrozenCheckpoint {
             annotations: self.annotations.prepare(workspace, batch_rows).await?,
             results: self.results.clone(),
             bodies: self.bodies.clone(),
+            write_batch: None,
         })
     }
 
@@ -587,6 +637,7 @@ impl FrozenCheckpoint {
                 .await?,
             results: self.results.clone(),
             bodies: self.bodies.clone(),
+            write_batch: None,
         })
     }
 }
@@ -655,12 +706,27 @@ impl Service {
             annotations.through() == through,
             "value/result freeze cut differs"
         );
+        // Take each guard in its own statement: owner_batch() locks the same
+        // non-reentrant write_batch mutex, so it must not run while a guard
+        // from a struct field initializer is still alive.
+        let sources = self.shared.window.lock().unwrap().freeze(through);
+        let bodies = self.shared.frames.lock().unwrap().freeze();
+        let write_batch = self
+            .shared
+            .write_batch
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(owner_batch::WriteBatch::freeze);
+        let owner = self.owner_batch().then(|| self.clone());
         let frozen = FrozenCheckpoint {
             origin: self.shared.clone(),
             annotations,
             results: Arc::new(snapshot),
-            sources: self.shared.window.lock().unwrap().freeze(through),
-            bodies: self.shared.frames.lock().unwrap().freeze(),
+            sources,
+            bodies,
+            write_batch,
+            owner,
             body_preparation: tokio::sync::Mutex::new(None),
             _source_generation: source_generation,
         };
@@ -704,11 +770,27 @@ impl Service {
                 .is_current(&prepared.bodies),
             "body source generation differs from prepared checkpoint"
         );
+        ensure!(
+            match (
+                &prepared.write_batch,
+                self.shared.write_batch.lock().unwrap().as_ref()
+            ) {
+                (Some(frozen), Some(batch)) => batch.is_current(frozen),
+                (None, None) => true,
+                _ => false,
+            },
+            "owner write batch differs from prepared checkpoint"
+        );
         self.shared
             .staging
             .install_published(&prepared.annotations, selected)
             .await?;
         self.shared.frames.lock().unwrap().retire(&prepared.bodies);
+        if let Some(frozen) = &prepared.write_batch {
+            if let Some(batch) = self.shared.write_batch.lock().unwrap().as_mut() {
+                batch.retire(frozen);
+            }
+        }
         self.shared.results.lock().unwrap().base = prepared.results.clone();
         Ok(())
     }
