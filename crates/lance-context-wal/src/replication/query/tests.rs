@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "tests/batching.rs"]
 mod batching;
+#[path = "tests/deferred.rs"]
+mod deferred;
 
 fn nodes(limits: Limits) -> Result<(tempfile::TempDir, Vec<Node>)> {
     let root = tempfile::tempdir()?;
