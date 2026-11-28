@@ -54,7 +54,7 @@ async fn indexed_base_keeps_active_updates_readers_and_replay_boundary() -> Resu
         .await?;
     let mut before = before;
     before.installed_base.version = selected.version_id();
-    assert_eq!(staging.observation().await, before);
+    assert_eq!(stable(staging.observation().await), stable(before));
     assert_eq!(current(&staging, "turn-000000").await?, expected);
     assert_eq!(selected.manifest().fragments, base.manifest().fragments);
     assert_eq!(selected.load_indices().await?.len(), 1);
