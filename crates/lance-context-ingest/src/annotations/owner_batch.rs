@@ -158,7 +158,9 @@ impl WriteBatch {
     pub(super) fn record(&mut self, survivors: Survivors) -> Result<()> {
         self.active.rows += survivors.rows.len() as u64;
         if !survivors.rows.is_empty() {
-            self.active.metas.insert(survivors.index, survivors.meta.clone());
+            self.active
+                .metas
+                .insert(survivors.index, survivors.meta.clone());
         }
         self.active.ram_bytes += survivors.ram_bytes();
         self.active.ram.push(survivors);
@@ -224,7 +226,11 @@ impl WriteBatch {
         self.active
             .metas
             .get(&index)
-            .or_else(|| self.frozen.as_ref().and_then(|f| f.segment.metas.get(&index)))
+            .or_else(|| {
+                self.frozen
+                    .as_ref()
+                    .and_then(|f| f.segment.metas.get(&index))
+            })
             .cloned()
     }
 }
@@ -446,8 +452,8 @@ impl Service {
     /// sorted runs bounded by `spill_bytes`, spilled to the write batch's spill
     /// directory. Pass 2 k-way merges the runs and refetches bodies in key
     /// order, in windows of at most `refetch_bytes` of distinct records. Under
-    /// apply-memory pressure a window releases what it holds and waits; it is
-    /// never flushed early, so the published fragment is globally ordered.
+    /// apply-memory pressure, emit the prefix that fits as a smaller Arrow
+    /// batch and continue with its suffix in the same sorted fragment.
     pub(super) fn survivor_stream(
         &self,
         frozen: Arc<Frozen>,
@@ -548,11 +554,18 @@ impl Service {
                 if window.is_empty() {
                     break;
                 }
-                let fetched = fetch_window(&service, &records).await.map_err(external)?;
-                let batch = gather(&schema, &fetched, &window).map_err(external)?;
-                service.shared.batch_metrics.lock().unwrap().observed.clustered_chunks += 1;
-                drop(fetched);
-                yield batch;
+                let mut start = 0;
+                while start < window.len() {
+                    let (fetched, admitted) = fetch_window_prefix(&service, &records, &window[start..])
+                        .await
+                        .map_err(external)?;
+                    let end = start + admitted;
+                    let batch = gather(&schema, &fetched, &window[start..end]).map_err(external)?;
+                    service.shared.batch_metrics.lock().unwrap().observed.clustered_chunks += 1;
+                    drop(fetched);
+                    start = end;
+                    yield batch;
+                }
             }
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -583,7 +596,13 @@ struct KeyRuns {
 }
 impl KeyRuns {
     fn new(dir: Option<PathBuf>, limit: usize) -> Self {
-        Self { dir, limit, current: Vec::new(), current_bytes: 0, files: Vec::new() }
+        Self {
+            dir,
+            limit,
+            current: Vec::new(),
+            current_bytes: 0,
+            files: Vec::new(),
+        }
     }
     fn push(&mut self, key: SortKey) -> Result<()> {
         self.current_bytes += key.bytes();
@@ -608,8 +627,14 @@ impl KeyRuns {
             );
             sources.push(RunSource::File(reader.lines()));
         }
-        sources.push(RunSource::Ram(std::mem::take(&mut self.current).into_iter()));
-        let mut merge = KeyMerge { _files: self.files, sources, heap: std::collections::BinaryHeap::new() };
+        sources.push(RunSource::Ram(
+            std::mem::take(&mut self.current).into_iter(),
+        ));
+        let mut merge = KeyMerge {
+            _files: self.files,
+            sources,
+            heap: std::collections::BinaryHeap::new(),
+        };
         for at in 0..merge.sources.len() {
             merge.refill(at)?;
         }
@@ -670,7 +695,10 @@ impl Locate {
     }
     fn at(&mut self, row: u32) -> Result<(usize, usize)> {
         let b = self.ends.partition_point(|end| *end <= row);
-        ensure!(b < self.ends.len(), "write batch survivor exceeds its source rows");
+        ensure!(
+            b < self.ends.len(),
+            "write batch survivor exceeds its source rows"
+        );
         let start = if b == 0 { 0 } else { self.ends[b - 1] };
         Ok((b, (row - start) as usize))
     }
@@ -689,32 +717,39 @@ async fn refetch_waiting(
     }
 }
 
-/// Fetch every record of one window. On admission pressure, release what
-/// the window holds and wait, so concurrent fetchers cannot deadlock on the
-/// shared apply budget. The window is never cut short.
-async fn fetch_window(
+/// Fetch a contiguous prefix of the sorted rows, keeping the decoded bodies
+/// for that prefix until the caller has formed its output batch. Only the
+/// first record can wait for admission, when the prefix holds no reservation.
+async fn fetch_window_prefix(
     service: &Service,
     records: &BTreeMap<u64, BatchMeta>,
-) -> Result<BTreeMap<u64, (Vec<RecordBatch>, MergeReservation)>> {
-    'retry: loop {
-        let mut held = BTreeMap::new();
-        for (&index, meta) in records {
-            match service.try_refetch_bodies(index, meta.clone()).await? {
-                Some(fetched) => {
-                    held.insert(index, fetched);
-                }
-                None => {
-                    drop(held);
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                    continue 'retry;
-                }
-            }
+    sorted: &[(u64, u32)],
+) -> Result<(BTreeMap<u64, (Vec<RecordBatch>, MergeReservation)>, usize)> {
+    let mut held = BTreeMap::new();
+    let mut admitted = 0;
+    let mut fetched_bytes = 0;
+    for &(index, _) in sorted {
+        if let std::collections::btree_map::Entry::Vacant(entry) = held.entry(index) {
+            let meta = records
+                .get(&index)
+                .context("sorted source record missing")?;
+            let fetched = if admitted == 0 {
+                refetch_waiting(service, index, meta).await?
+            } else {
+                let Some(fetched) = service.try_refetch_bodies(index, meta.clone()).await? else {
+                    break;
+                };
+                fetched
+            };
+            fetched_bytes += meta.body_bytes;
+            entry.insert(fetched);
         }
-        let mut metrics = service.shared.batch_metrics.lock().unwrap();
-        metrics.observed.refetched_records += records.len() as u64;
-        metrics.observed.refetched_bytes += records.values().map(|m| m.body_bytes).sum::<u64>();
-        return Ok(held);
+        admitted += 1;
     }
+    let mut metrics = service.shared.batch_metrics.lock().unwrap();
+    metrics.observed.refetched_records += held.len() as u64;
+    metrics.observed.refetched_bytes += fetched_bytes;
+    Ok((held, admitted))
 }
 
 /// Copy the window's rows, in key order, into one storage-schema batch.
@@ -728,7 +763,10 @@ fn gather(
     for (&index, (bodies, _)) in fetched {
         base.insert(index, (batches.len(), Locate::new(bodies)));
         for batch in bodies {
-            batches.push(RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?);
+            batches.push(RecordBatch::try_new(
+                schema.clone(),
+                batch.columns().to_vec(),
+            )?);
         }
     }
     let order = window

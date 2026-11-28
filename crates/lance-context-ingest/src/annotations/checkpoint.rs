@@ -120,7 +120,10 @@ impl Snapshot {
             }
             2 => {
                 use base64::{engine::general_purpose::STANDARD, Engine as _};
-                ensure!(encoded.rejected.is_empty(), "invalid annotation result snapshot");
+                ensure!(
+                    encoded.rejected.is_empty(),
+                    "invalid annotation result snapshot"
+                );
                 let bytes = STANDARD.decode(
                     encoded
                         .outcomes
@@ -128,7 +131,10 @@ impl Snapshot {
                         .context("annotation result snapshot has no outcomes")?,
                 )?;
                 let bitmap = (encoded.slots as usize).div_ceil(8);
-                ensure!(bytes.len() >= bitmap, "truncated annotation result snapshot");
+                ensure!(
+                    bytes.len() >= bitmap,
+                    "truncated annotation result snapshot"
+                );
                 let (bits, mut rest) = bytes.split_at(bitmap);
                 fn take<'a>(rest: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
                     ensure!(rest.len() >= n, "truncated annotation result snapshot");
@@ -174,10 +180,7 @@ impl Snapshot {
                         },
                     ));
                 }
-                ensure!(
-                    rest.is_empty(),
-                    "trailing annotation result snapshot bytes"
-                );
+                ensure!(rest.is_empty(), "trailing annotation result snapshot bytes");
                 // Bitmap padding bits beyond `slots` must be clear.
                 for slot in encoded.slots..(bitmap as u32 * 8) {
                     ensure!(
@@ -203,7 +206,9 @@ impl Snapshot {
         for (slot, outcome) in &self.outcomes {
             ensure!(*slot < self.slots, "result slot outside capacity");
             bytes[*slot as usize / 8] |= 1 << (slot % 8);
-            let code = |e: &Option<(u64, Rejection)>| e.as_ref().map_or(0, |(_, r)| reason_code(&r.reason));
+            let code = |e: &Option<(u64, Rejection)>| {
+                e.as_ref().map_or(0, |(_, r)| reason_code(&r.reason))
+            };
             let header = code(&outcome.sticky)
                 | (code(&outcome.latest) << 3)
                 | ((outcome.latest.is_some() as u8) << 6)
@@ -309,7 +314,10 @@ impl Results {
         result: &MutationResult,
     ) {
         let entry = &mut self.sticky[slot];
-        if entry.as_ref().is_some_and(|(producer, _, _)| *producer != meta.producer) {
+        if entry
+            .as_ref()
+            .is_some_and(|(producer, _, _)| *producer != meta.producer)
+        {
             *entry = None;
         }
         if let MutationResult::Rejected(rejection) = result {
@@ -361,7 +369,6 @@ impl Results {
         }
         self.resolve(accepted, slot)
     }
-
 
     /// Newest producer generation observed for `slot` (live latest, sticky,
     /// or the published snapshot).
@@ -560,18 +567,20 @@ impl FrozenCheckpoint {
             rows as u64 == batch.rows(),
             "owner write batch differs from frozen first-create rows"
         );
-        let service = self.owner.as_ref().context("owner batch lost its service")?;
+        let service = self
+            .owner
+            .as_ref()
+            .context("owner batch lost its service")?;
         let stream = service.survivor_stream(batch.clone(), expected)?;
         let annotations = self
             .annotations
             .prepare_immutable_body_stream(workspace, rows, stream, batch.clone())
             .await
             .map_err(runtime::publication_write_error)?;
-        self.origin
-            .batch_metrics
-            .lock()
-            .unwrap()
-            .fragment(rows as u64, started.elapsed().as_micros().try_into().unwrap_or(u64::MAX));
+        self.origin.batch_metrics.lock().unwrap().fragment(
+            rows as u64,
+            started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+        );
         Ok(PreparedCheckpoint {
             origin: self.origin.clone(),
             annotations,
@@ -762,7 +771,10 @@ impl Service {
             "body source generation differs from prepared checkpoint"
         );
         ensure!(
-            match (&prepared.write_batch, self.shared.write_batch.lock().unwrap().as_ref()) {
+            match (
+                &prepared.write_batch,
+                self.shared.write_batch.lock().unwrap().as_ref()
+            ) {
                 (Some(frozen), Some(batch)) => batch.is_current(frozen),
                 (None, None) => true,
                 _ => false,

@@ -124,7 +124,11 @@ impl DurableMutationClient {
     /// HTTP 409 `receipt_superseded` (slot reused by a newer generation) is
     /// returned as a `ReceiptSuperseded` failure, never Applied.
     pub async fn wait_applied(&self, key: usize, commit: &CommitReply) -> Result<MutationReply> {
-        let open = self.inner.opens.get(key).context("client lane out of range")?;
+        let open = self
+            .inner
+            .opens
+            .get(key)
+            .context("client lane out of range")?;
         validate_commit(commit, &self.inner.scope, open)?;
         let response = self
             .inner
@@ -306,7 +310,11 @@ pub(super) fn validate(value: &MutationReply, scope: &Scope, open: &ProducerOpen
     Ok(())
 }
 
-pub(super) fn validate_commit(value: &CommitReply, scope: &Scope, open: &ProducerOpen) -> Result<()> {
+pub(super) fn validate_commit(
+    value: &CommitReply,
+    scope: &Scope,
+    open: &ProducerOpen,
+) -> Result<()> {
     let meta = &value.meta;
     ensure!(
         value.index > 0

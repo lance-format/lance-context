@@ -193,34 +193,30 @@ impl Owner {
                 .await
                 .map_err(|_| Failure::bad("invalid_annotation_ipc"))?;
             let map_append = |error: anyhow::Error| match error.downcast_ref::<AppendFailure>() {
-                    Some(AppendFailure::DiskBudgetNotSubmitted) => {
-                        Failure::unavailable("wal_disk_capacity", "not_submitted")
-                    }
-                    Some(AppendFailure::PendingCapacityNotSubmitted) => {
-                        Failure::unavailable("request_capacity", "not_submitted")
-                    }
-                    // This is a committed WAL decision, not a local capacity
-                    // guess or an ambiguous transport failure. Exact retained
-                    // requests resolve before the WAL checks capacity.
-                    Some(AppendFailure::Capacity) => {
-                        Failure::unavailable("wal_capacity", "rejected")
-                    }
-                    Some(AppendFailure::Sequence { .. } | AppendFailure::ProducerFenced) => {
-                        Failure {
-                            status: StatusCode::CONFLICT,
-                            code: "producer_sequence_rejected",
-                            outcome: "rejected",
-                        }
-                    }
-                    _ => {
-                        let meta = prepared.meta();
-                        eprintln!(
+                Some(AppendFailure::DiskBudgetNotSubmitted) => {
+                    Failure::unavailable("wal_disk_capacity", "not_submitted")
+                }
+                Some(AppendFailure::PendingCapacityNotSubmitted) => {
+                    Failure::unavailable("request_capacity", "not_submitted")
+                }
+                // This is a committed WAL decision, not a local capacity
+                // guess or an ambiguous transport failure. Exact retained
+                // requests resolve before the WAL checks capacity.
+                Some(AppendFailure::Capacity) => Failure::unavailable("wal_capacity", "rejected"),
+                Some(AppendFailure::Sequence { .. } | AppendFailure::ProducerFenced) => Failure {
+                    status: StatusCode::CONFLICT,
+                    code: "producer_sequence_rejected",
+                    outcome: "rejected",
+                },
+                _ => {
+                    let meta = prepared.meta();
+                    eprintln!(
                             "annotation mutation outcome unknown: table={} bucket={} producer={} sequence={}: {error:#}",
                             meta.stream, meta.bucket, meta.producer, meta.sequence
                         );
-                        Failure::unavailable("annotation_outcome_unknown", "unknown")
-                    }
-                };
+                    Failure::unavailable("annotation_outcome_unknown", "unknown")
+                }
+            };
             if commit_ack {
                 let accepted = self
                     .service
@@ -240,7 +236,10 @@ impl Owner {
                     meta: accepted.meta().clone(),
                 };
                 return self
-                    .fenced(operation, (StatusCode::ACCEPTED, Json(reply)).into_response())
+                    .fenced(
+                        operation,
+                        (StatusCode::ACCEPTED, Json(reply)).into_response(),
+                    )
                     .await
                     .map(|response| (response, None));
             }

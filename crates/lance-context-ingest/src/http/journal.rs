@@ -487,25 +487,20 @@ impl DurableClient {
             next.producer = Some(credential);
             self.persist(key, lane, next).await?;
         }
-        let mut request = self
-            .client
-            .post(self.endpoint(
-                if self.scope.contract.policy == WritePolicy::TurnIngestion {
-                    "update"
-                } else {
-                    "append"
-                },
-            ));
+        let mut request = self.client.post(self.endpoint(
+            if self.scope.contract.policy == WritePolicy::TurnIngestion {
+                "update"
+            } else {
+                "append"
+            },
+        ));
         #[cfg(feature = "materializer")]
         if commit {
             ensure!(
                 self.scope.contract.policy == WritePolicy::TurnIngestion,
                 "commit-ack mode requires a mutation table"
             );
-            request = request.header(
-                super::annotations::ACK_MODE,
-                super::annotations::ACK_COMMIT,
-            );
+            request = request.header(super::annotations::ACK_MODE, super::annotations::ACK_COMMIT);
         }
         let response = request
             .timeout(self.timeout)

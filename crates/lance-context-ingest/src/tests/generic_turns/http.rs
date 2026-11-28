@@ -175,16 +175,7 @@ pub(super) async fn open_client(
         .await;
     }
     DurableMutationClient::open(
-        journal(
-            root,
-            base,
-            ProducerOpen {
-                bucket: 0,
-                slot: 1,
-                expected_generation: 0,
-                operation: Uuid::from_u128(101),
-            },
-        ),
+        journal(root, base, open),
         &annotation_publication::one_shard(),
         binding(),
         spec,

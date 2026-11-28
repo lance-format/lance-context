@@ -230,7 +230,11 @@ impl AppliedKeyCache {
         }
         #[cfg(feature = "applied-key-cache")]
         let disk = match &config.disk_dir {
-            Some(dir) => Some(open_disk(dir, &config, &serde_json::to_vec(&config.scopes)?)?),
+            Some(dir) => Some(open_disk(
+                dir,
+                &config,
+                &serde_json::to_vec(&config.scopes)?,
+            )?),
             None => None,
         };
         #[cfg(not(feature = "applied-key-cache"))]
@@ -256,7 +260,12 @@ impl AppliedKeyCache {
     }
 
     /// Scoped keys of every row of a batch routed to `bucket`.
-    pub fn batch_keys(&self, bucket: u32, batch: &RecordBatch, columns: &[String]) -> Result<Vec<Key>> {
+    pub fn batch_keys(
+        &self,
+        bucket: u32,
+        batch: &RecordBatch,
+        columns: &[String],
+    ) -> Result<Vec<Key>> {
         batch_keys(&self.scope(bucket)?.1, batch, columns)
     }
 
@@ -298,7 +307,9 @@ impl AppliedKeyCache {
             }
             let mut evicted = 0;
             while ram.map.len() > self.capacity {
-                let Some(old) = ram.order.pop_front() else { break };
+                let Some(old) = ram.order.pop_front() else {
+                    break;
+                };
                 if ram.map.remove(&old).is_some() {
                     evicted += 1;
                 }
@@ -338,8 +349,12 @@ impl AppliedKeyCache {
         staged.entry(shard).or_default().push_back((index, keys));
         let mut total = self.metrics.staged_keys.fetch_add(added, Relaxed) + added;
         while total > self.capacity as u64 {
-            let Some(queue) = staged.values_mut().max_by_key(|q| q.len()) else { break };
-            let Some((_, old)) = queue.pop_front() else { break };
+            let Some(queue) = staged.values_mut().max_by_key(|q| q.len()) else {
+                break;
+            };
+            let Some((_, old)) = queue.pop_front() else {
+                break;
+            };
             let n = old.len() as u64;
             total -= n;
             self.metrics.staged_keys.fetch_sub(n, Relaxed);
@@ -352,7 +367,11 @@ impl AppliedKeyCache {
     /// full body covers. `selected` must be this shard's scope (table,
     /// incarnation, bucket); otherwise nothing is inserted. Blocking when the
     /// disk tier is enabled.
-    pub fn prove(&self, shard: u32, selected: &crate::annotations::single_body::SelectedBody) -> Result<u64> {
+    pub fn prove(
+        &self,
+        shard: u32,
+        selected: &crate::annotations::single_body::SelectedBody,
+    ) -> Result<u64> {
         let (scope, _) = self.scope(shard)?;
         anyhow::ensure!(
             selected.table == scope.table
@@ -362,12 +381,19 @@ impl AppliedKeyCache {
         );
         let proven: Vec<Key> = {
             let mut staged = self.staged.lock().unwrap();
-            let Some(queue) = staged.get_mut(&shard) else { return Ok(0) };
+            let Some(queue) = staged.get_mut(&shard) else {
+                return Ok(0);
+            };
             let mut keys = Vec::new();
-            while queue.front().is_some_and(|(index, _)| *index <= selected.through) {
+            while queue
+                .front()
+                .is_some_and(|(index, _)| *index <= selected.through)
+            {
                 keys.extend(queue.pop_front().unwrap().1);
             }
-            self.metrics.staged_keys.fetch_sub(keys.len() as u64, Relaxed);
+            self.metrics
+                .staged_keys
+                .fetch_sub(keys.len() as u64, Relaxed);
             keys
         };
         self.insert(&proven, Reason::Proven)?;
@@ -377,7 +403,11 @@ impl AppliedKeyCache {
     /// Drop staged, unproven keys of the given shards (failed fence).
     pub fn discard_staged(&self) {
         let mut staged = self.staged.lock().unwrap();
-        let n: usize = staged.values().flat_map(|q| q.iter()).map(|(_, k)| k.len()).sum();
+        let n: usize = staged
+            .values()
+            .flat_map(|q| q.iter())
+            .map(|(_, k)| k.len())
+            .sum();
         staged.clear();
         self.metrics.staged_keys.fetch_sub(n as u64, Relaxed);
         self.metrics.unproven_dropped.fetch_add(n as u64, Relaxed);
@@ -385,7 +415,9 @@ impl AppliedKeyCache {
 
     /// Remove keys of a record later reported Rejected.
     pub fn remove(&self, keys: &[Key]) -> Result<()> {
-        self.metrics.removed_rejected.fetch_add(keys.len() as u64, Relaxed);
+        self.metrics
+            .removed_rejected
+            .fetch_add(keys.len() as u64, Relaxed);
         {
             let mut ram = self.ram.lock().unwrap();
             for key in keys {
@@ -408,7 +440,9 @@ impl AppliedKeyCache {
     pub fn contains_many(&self, keys: &[Key]) -> Result<Vec<bool>> {
         let mut found = {
             let ram = self.ram.lock().unwrap();
-            keys.iter().map(|key| ram.map.contains_key(key)).collect::<Vec<_>>()
+            keys.iter()
+                .map(|key| ram.map.contains_key(key))
+                .collect::<Vec<_>>()
         };
         let ram_hits = found.iter().filter(|hit| **hit).count() as u64;
         self.metrics.ram_hits.fetch_add(ram_hits, Relaxed);

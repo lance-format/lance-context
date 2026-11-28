@@ -29,9 +29,14 @@ impl Body {
 }
 
 impl Service {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
     pub(crate) fn apply_budget_for_test(&self) -> &Arc<MergeMemoryBudget> {
         &self.apply_budget
+    }
+
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
+    pub(crate) fn decode_workspace_for_test(&self, bytes: usize) -> Result<usize> {
+        super::super::decode_workspace(&self.ingress.scope.contract, &self.limits, bytes)
     }
 
     #[cfg(all(test, feature = "http-client", feature = "service"))]
