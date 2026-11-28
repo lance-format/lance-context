@@ -215,7 +215,11 @@ impl AppliedKeyCache {
         }
         #[cfg(feature = "applied-key-cache")]
         let disk = match &config.disk_dir {
-            Some(dir) => Some(open_disk(dir, &config, &serde_json::to_vec(&config.scopes)?)?),
+            Some(dir) => Some(open_disk(
+                dir,
+                &config,
+                &serde_json::to_vec(&config.scopes)?,
+            )?),
             None => None,
         };
         #[cfg(not(feature = "applied-key-cache"))]
@@ -240,7 +244,12 @@ impl AppliedKeyCache {
     }
 
     /// Scoped keys of every row of a batch routed to `bucket`.
-    pub fn batch_keys(&self, bucket: u32, batch: &RecordBatch, columns: &[String]) -> Result<Vec<Key>> {
+    pub fn batch_keys(
+        &self,
+        bucket: u32,
+        batch: &RecordBatch,
+        columns: &[String],
+    ) -> Result<Vec<Key>> {
         batch_keys(&self.scope(bucket)?.1, batch, columns)
     }
 
@@ -281,7 +290,9 @@ impl AppliedKeyCache {
             }
             let mut evicted = 0;
             while ram.map.len() > self.capacity {
-                let Some(old) = ram.order.pop_front() else { break };
+                let Some(old) = ram.order.pop_front() else {
+                    break;
+                };
                 if ram.map.remove(&old).is_some() {
                     evicted += 1;
                 }
@@ -309,7 +320,9 @@ impl AppliedKeyCache {
 
     /// Remove keys of a record later reported Rejected.
     pub fn remove(&self, keys: &[Key]) -> Result<()> {
-        self.metrics.removed_rejected.fetch_add(keys.len() as u64, Relaxed);
+        self.metrics
+            .removed_rejected
+            .fetch_add(keys.len() as u64, Relaxed);
         {
             let mut ram = self.ram.lock().unwrap();
             for key in keys {
@@ -332,7 +345,9 @@ impl AppliedKeyCache {
     pub fn contains_many(&self, keys: &[Key]) -> Result<Vec<bool>> {
         let mut found = {
             let ram = self.ram.lock().unwrap();
-            keys.iter().map(|key| ram.map.contains_key(key)).collect::<Vec<_>>()
+            keys.iter()
+                .map(|key| ram.map.contains_key(key))
+                .collect::<Vec<_>>()
         };
         let ram_hits = found.iter().filter(|hit| **hit).count() as u64;
         self.metrics.ram_hits.fetch_add(ram_hits, Relaxed);

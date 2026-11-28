@@ -335,7 +335,8 @@ impl StreamingProducer {
             return Ok(batch);
         }
         self.shared.metrics.dropped_known(hits);
-        let keep = arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
+        let keep =
+            arrow_array::BooleanArray::from(found.iter().map(|hit| !hit).collect::<Vec<_>>());
         Ok(arrow_select::filter::filter_record_batch(&batch, &keep)?)
     }
 
@@ -476,7 +477,13 @@ impl StreamingProducer {
         let mut cache_updates = Vec::new();
         for (slot, applied) in resolved {
             // Nothing committed after the snapshot: sender lock held.
-            let keys = slot.pending.lock().unwrap().take().map(|p| p.keys).unwrap_or_default();
+            let keys = slot
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .map(|p| p.keys)
+                .unwrap_or_default();
             let applied_ok = applied.reply.completion.result == MutationResult::Applied;
             cache_updates.push((keys, applied_ok));
             fence

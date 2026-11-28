@@ -123,7 +123,14 @@ async fn commit(
             p.rows += rows;
             p.keys.extend(keys);
         }
-        None => *pending = Some(Pending { latest: reply, records: 1, rows, keys }),
+        None => {
+            *pending = Some(Pending {
+                latest: reply,
+                records: 1,
+                rows,
+                keys,
+            })
+        }
     }
     Ok(())
 }
