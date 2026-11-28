@@ -3,9 +3,13 @@ use futures::TryStreamExt;
 use lance_context_core::annotation_staging::{ImmutableBodyRead, TurnBodySource};
 
 enum Hold {
-    Staged { _row: mixed::frames::HeldRow },
+    Staged {
+        _row: mixed::frames::HeldRow,
+    },
     /// Owner batch: the staged body was refetched from its WAL record.
-    Refetched { _reservation: MergeReservation },
+    Refetched {
+        _reservation: MergeReservation,
+    },
     Materialized,
 }
 
@@ -155,8 +159,10 @@ impl Service {
                 let mut found = None;
                 for batch in &bodies {
                     if row < batch.num_rows() {
-                        let original =
-                            RecordBatch::try_new(spec.body_schema().clone(), batch.columns().to_vec())?;
+                        let original = RecordBatch::try_new(
+                            spec.body_schema().clone(),
+                            batch.columns().to_vec(),
+                        )?;
                         ensure!(
                             spec.row_key(&original, row, key.len())? == key,
                             "refetched body row differs from turn origin"

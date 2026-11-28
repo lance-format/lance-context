@@ -567,18 +567,20 @@ impl FrozenCheckpoint {
             rows as u64 == batch.rows(),
             "owner write batch differs from frozen first-create rows"
         );
-        let service = self.owner.as_ref().context("owner batch lost its service")?;
+        let service = self
+            .owner
+            .as_ref()
+            .context("owner batch lost its service")?;
         let stream = service.survivor_stream(batch.clone(), expected)?;
         let annotations = self
             .annotations
             .prepare_immutable_body_stream(workspace, rows, stream, batch.clone())
             .await
             .map_err(runtime::publication_write_error)?;
-        self.origin
-            .batch_metrics
-            .lock()
-            .unwrap()
-            .fragment(rows as u64, started.elapsed().as_micros().try_into().unwrap_or(u64::MAX));
+        self.origin.batch_metrics.lock().unwrap().fragment(
+            rows as u64,
+            started.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+        );
         Ok(PreparedCheckpoint {
             origin: self.origin.clone(),
             annotations,
@@ -769,7 +771,10 @@ impl Service {
             "body source generation differs from prepared checkpoint"
         );
         ensure!(
-            match (&prepared.write_batch, self.shared.write_batch.lock().unwrap().as_ref()) {
+            match (
+                &prepared.write_batch,
+                self.shared.write_batch.lock().unwrap().as_ref()
+            ) {
                 (Some(frozen), Some(batch)) => batch.is_current(frozen),
                 (None, None) => true,
                 _ => false,

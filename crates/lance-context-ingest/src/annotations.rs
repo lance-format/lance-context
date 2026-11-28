@@ -22,12 +22,12 @@ use tokio::sync::watch;
 mod accepted;
 pub(crate) mod checkpoint;
 mod local_payload;
-pub mod owner_batch;
 pub mod lookup_capture;
 mod lookup_observation;
 #[cfg(feature = "service")]
 pub mod metadata_upload;
 pub mod mixed;
+pub mod owner_batch;
 mod pipeline;
 mod prefetch;
 #[cfg(all(feature = "service", feature = "lance-io-metrics"))]

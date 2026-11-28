@@ -158,7 +158,9 @@ impl WriteBatch {
     pub(super) fn record(&mut self, survivors: Survivors) -> Result<()> {
         self.active.rows += survivors.rows.len() as u64;
         if !survivors.rows.is_empty() {
-            self.active.metas.insert(survivors.index, survivors.meta.clone());
+            self.active
+                .metas
+                .insert(survivors.index, survivors.meta.clone());
         }
         self.active.ram_bytes += survivors.ram_bytes();
         self.active.ram.push(survivors);
@@ -224,7 +226,11 @@ impl WriteBatch {
         self.active
             .metas
             .get(&index)
-            .or_else(|| self.frozen.as_ref().and_then(|f| f.segment.metas.get(&index)))
+            .or_else(|| {
+                self.frozen
+                    .as_ref()
+                    .and_then(|f| f.segment.metas.get(&index))
+            })
             .cloned()
     }
 }
@@ -592,7 +598,12 @@ fn cluster(
     }
     let selected = selected
         .into_iter()
-        .map(|batch| Ok(RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?))
+        .map(|batch| {
+            Ok(RecordBatch::try_new(
+                schema.clone(),
+                batch.columns().to_vec(),
+            )?)
+        })
         .collect::<Result<Vec<_>>>()?;
     if rows < cluster_rows {
         // No clustering: the survivor runs are already in source order. Hand
