@@ -195,7 +195,10 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
         let result = phases
             .measure(
                 Phase::BlobWrite,
-                phases.measure(Phase::NativeCompaction, task.execute(&dataset)),
+                phases.measure(
+                    Phase::NativeCompaction,
+                    compaction::execute_rewrite(task, &dataset),
+                ),
             )
             .await?;
         // Keep native admission even if the owner is cancelled or the result
