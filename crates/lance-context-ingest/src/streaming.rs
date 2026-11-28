@@ -328,6 +328,7 @@ impl StreamingProducer {
         let keys = cache.batch_keys(bucket, &batch, &self.shared.key_columns)?;
         let found = tokio::task::spawn_blocking(move || cache.contains_many(&keys)).await??;
         let hits = found.iter().filter(|hit| **hit).count();
+        self.shared.metrics.cache_lookup(hits, found.len() - hits);
         if hits == 0 {
             return Ok(batch);
         }
@@ -474,7 +475,7 @@ impl StreamingProducer {
             // Nothing committed after the snapshot: sender lock held.
             let keys = slot.pending.lock().unwrap().take().map(|p| p.keys).unwrap_or_default();
             let applied_ok = applied.reply.completion.result == MutationResult::Applied;
-            cache_updates.push((keys, applied_ok));
+            cache_updates.push((slot.shard.bucket, applied.reply.completion.index, keys, applied_ok));
             fence
                 .shards
                 .entry(slot.shard.bucket)
@@ -486,25 +487,22 @@ impl StreamingProducer {
                 .push(applied);
         }
         // The cut is recorded above and is returned regardless. The cache is
-        // best-effort: a failed update cannot lose this fence's cut, but a
-        // missed remove could leave a stale skip, so any failure permanently
-        // fails the producer and no later fence can report success over it.
+        // best-effort: a failed update cannot lose this fence's cut, but any
+        // failure permanently fails the producer and no later fence can
+        // report success over it. Applied keys are only STAGED here; they
+        // become skips via `AppliedKeyCache::prove` once a selected full body
+        // covers their WAL index. A non-Applied outcome stages nothing.
         if let Some(cache) = self.shared.key_cache.clone() {
-            let update = tokio::task::spawn_blocking(move || -> Result<()> {
-                for (keys, applied_ok) in cache_updates {
+            let update = (|| -> Result<()> {
+                for (bucket, index, keys, applied_ok) in cache_updates {
                     if applied_ok {
-                        cache.insert(&keys, key_cache::Reason::Applied)?;
+                        cache.stage_applied(bucket, index, keys)?;
                     } else {
-                        // The latest outcome covers the lane's records since
-                        // the previous fence: drop their commit-time inserts.
-                        cache.remove(&keys)?;
+                        self.shared.metrics.unproven_skipped(keys.len());
                     }
                 }
                 Ok(())
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("key cache update task: {error}"))
-            .and_then(|result| result);
+            })();
             if let Err(error) = update {
                 let error = error.context("streaming fence: key cache update failed");
                 self.shared.buffer.fail(&error);

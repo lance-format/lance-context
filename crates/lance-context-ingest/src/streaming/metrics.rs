@@ -29,6 +29,9 @@ pub struct Metrics {
     applied_wait_failures: AtomicU64,
     applied_wait_nanos: AtomicU64,
     dropped_known: AtomicU64,
+    cache_hit: AtomicU64,
+    cache_miss: AtomicU64,
+    cache_skipped: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -56,6 +59,9 @@ impl Default for Metrics {
             applied_wait_failures: AtomicU64::new(0),
             applied_wait_nanos: AtomicU64::new(0),
             dropped_known: AtomicU64::new(0),
+            cache_hit: AtomicU64::new(0),
+            cache_miss: AtomicU64::new(0),
+            cache_skipped: AtomicU64::new(0),
         }
     }
 }
@@ -86,6 +92,11 @@ pub struct MetricsSnapshot {
     pub applied_wait_seconds: f64,
     /// Rows dropped before buffering because the key was already known.
     pub dropped_known_rows: u64,
+    /// Applied-key cache lookups of this producer's turns.
+    pub cache_hit_turns: u64,
+    pub cache_miss_turns: u64,
+    /// Turns whose keys were never offered to the cache (non-Applied outcome).
+    pub cache_skipped_turns: u64,
 }
 
 pub(super) struct Backpressure<'a>(&'a Metrics, Instant);
@@ -141,6 +152,15 @@ impl Metrics {
         self.applied_wait_failures.fetch_add(u64::from(!ok), Relaxed);
         self.applied_wait_nanos.fetch_add(nanos(d), Relaxed);
     }
+    pub(super) fn cache_lookup(&self, hits: usize, misses: usize) {
+        self.cache_hit.fetch_add(hits as u64, Relaxed);
+        self.cache_miss.fetch_add(misses as u64, Relaxed);
+    }
+
+    pub(super) fn unproven_skipped(&self, rows: usize) {
+        self.cache_skipped.fetch_add(rows as u64, Relaxed);
+    }
+
     pub(super) fn dropped_known(&self, rows: usize) {
         self.dropped_known.fetch_add(rows as u64, Relaxed);
     }
@@ -173,6 +193,9 @@ impl Metrics {
             applied_wait_failures: self.applied_wait_failures.load(Relaxed),
             applied_wait_seconds: secs(&self.applied_wait_nanos),
             dropped_known_rows: self.dropped_known.load(Relaxed),
+            cache_hit_turns: self.cache_hit.load(Relaxed),
+            cache_miss_turns: self.cache_miss.load(Relaxed),
+            cache_skipped_turns: self.cache_skipped.load(Relaxed),
         }
     }
 }
