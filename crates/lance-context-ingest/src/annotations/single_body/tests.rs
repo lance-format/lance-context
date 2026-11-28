@@ -59,6 +59,42 @@ fn full_body_binding_preserves_columns_metadata_and_arrow_owners() -> Result<()>
 }
 
 #[test]
+fn full_body_decode_keeps_escaped_routing_values_and_body_columns() -> Result<()> {
+    let (spec, original) = input()?;
+    let spec = TurnIngestionSpec::new(
+        spec.body_schema().clone(),
+        spec.primary_key().to_vec(),
+        "id",
+    )?;
+    let routing = ["quote\"\\雪", "plain"];
+    let mut columns = original.columns().to_vec();
+    columns[spec.body_schema().index_of("id")?] = Arc::new(StringArray::from(routing.to_vec()));
+    let original = RecordBatch::try_new(original.schema(), columns)?;
+    let wire = batch(&spec, &Limits::default(), Shard { bucket: 7 }, &original)?;
+    let mut encoded = Vec::new();
+    {
+        let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut encoded, &wire.schema())?;
+        writer.write(&wire)?;
+        writer.finish()?;
+    }
+
+    let mixed::Decoded::Creates { rows, bodies } =
+        decode(Bytes::from(encoded), wire.schema(), 2, 4096)?
+    else {
+        panic!("full-body IPC must decode as creates");
+    };
+    assert_eq!(rows.len(), 2);
+    for (row, value) in rows.iter().zip(routing) {
+        assert_eq!(row.turn, spec.business_key(&["session", value], 4096)?);
+        assert_eq!(row.rollout_id, value);
+    }
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0].schema(), storage_schema(&spec)?);
+    assert_eq!(bodies[0].columns(), original.columns());
+    Ok(())
+}
+
+#[test]
 fn body_contract_binds_routing_limits_and_reserved_metadata() -> Result<()> {
     let (spec, original) = input()?;
     let binding = TableBinding {
