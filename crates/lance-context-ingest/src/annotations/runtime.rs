@@ -110,6 +110,34 @@ impl Runtime {
         Ok(self)
     }
 
+    /// Opt in to the streaming owner batch pipeline for full-body ingestion.
+    /// Collect keeps keys only (bodies stay in the WAL); one historical
+    /// lookup covers each large buffered id batch while the next collects;
+    /// ordered apply records only surviving ordinals, spilled to
+    /// `options.spill_dir` (e.g. a PVC) when large; publication refetches
+    /// survivors from the WAL, clusters them by (session_id, id) and writes
+    /// ONE fragment. Configure before running this owner. A max wait for the
+    /// collect stage comes from `with_body_lookup_batch_wait`.
+    pub fn with_owner_batch(self, options: super::owner_batch::Options) -> Result<Self> {
+        self.driver.service.enable_owner_batch(options)?;
+        Ok(self)
+    }
+
+    /// Disable the default owner batch pipeline before running this owner.
+    pub fn without_owner_batch(self) -> Result<Self> {
+        let service = &self.driver.service;
+        service.ensure_owner_batch_unstarted()?;
+        *service.shared.write_batch.lock().unwrap() = None;
+        service
+            .shared
+            .batch_metrics
+            .lock()
+            .unwrap()
+            .observed
+            .enabled = false;
+        Ok(self)
+    }
+
     /// Cap the full-body key window below its half-lookup-budget default,
     /// so a fixture can force a real `KeyBound` window boundary.
     #[cfg(test)]
@@ -513,6 +541,12 @@ impl Runtime {
                 });
             materializer::TurnIdIndex::validate_base(&base, index_type)?;
         }
+        if service.is_single_body() {
+            // Single-body Turns owners run the streaming owner batch pipeline
+            // by default; `with_owner_batch` reconfigures it and
+            // `without_owner_batch` restores the resident-frame path.
+            service.enable_owner_batch(super::owner_batch::Options::default())?;
+        }
         driver = driver.with_publication_limits(
             c.publication.max_records,
             c.publication.max_source_bytes as u64,
@@ -698,6 +732,7 @@ impl Publisher {
                 .get_or_insert_with(tokio::time::Instant::now);
             if source.bytes < self.options.min_source_bytes as u64
                 && source.records < self.options.max_records
+                && !self.service.write_batch_full()
                 && self.service.shared.progress.borrow().backpressure.is_none()
                 && started.elapsed() < self.options.max_batch_wait
             {
