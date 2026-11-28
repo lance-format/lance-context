@@ -151,7 +151,7 @@ pub(crate) async fn start(publisher: &Publisher, version: u64) -> Result<Option<
         // path; concurrent object-store writes must all register their outputs.
         return Ok(None);
     }
-    let Some(task) = compaction::prepare_task(publisher, &source).await? else {
+    let Some(task) = compaction::prepare_task(publisher, &source, false).await? else {
         return Ok(None);
     };
     if task.task.fragments.iter().any(|f| !f.overlays.is_empty()) {

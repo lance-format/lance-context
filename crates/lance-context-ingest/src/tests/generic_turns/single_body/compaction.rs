@@ -3,6 +3,209 @@ use crate::materializer::SmallFileCompaction;
 use futures::TryStreamExt;
 use std::collections::BTreeMap;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_full_body_rewrite_publishes_after_enabling_bloom() -> Result<()> {
+    use crate::materializer::{self, turn_id_index::MAX_BUILD_ROWS, TurnIdIndex, TurnIdIndexType};
+    use arrow_array::RecordBatchIterator;
+    use lance::dataset::WriteParams;
+    use lance_table::io::commit::ConditionalPutCommitHandler;
+
+    let rows_per_fragment = MAX_BUILD_ROWS / 2 + 1;
+    let spec = TurnIngestionSpec::new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+        vec!["id".into()],
+        "id",
+    )?;
+    let schema = single_body::storage_schema(&spec)?;
+    let rows = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from_iter_values(
+            (0..2 * rows_per_fragment).map(|id| format!("turn-{id:08}")),
+        ))],
+    )?;
+    let root = tempfile::tempdir()?;
+    let layout = annotation_publication::one_shard();
+    let cluster = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+    let storage = fixture::storage(root.path(), "legacy-layout.lance").await?;
+    let base = lance::Dataset::write(
+        RecordBatchIterator::new(vec![Ok(rows)], schema),
+        &storage.uri,
+        Some(WriteParams {
+            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
+            enable_stable_row_ids: true,
+            max_rows_per_file: rows_per_fragment,
+            max_rows_per_group: rows_per_fragment,
+            ..Default::default()
+        }),
+    )
+    .await?;
+    assert_eq!(
+        base.fragments()
+            .iter()
+            .map(|fragment| fragment.physical_rows)
+            .collect::<Vec<_>>(),
+        [Some(rows_per_fragment), Some(rows_per_fragment)]
+    );
+    let limits = fixture::limits();
+    let shard = Shard { bucket: 0 };
+    annotation_publication::seed_base(
+        &cluster,
+        single_body::contract(&binding(), &spec, &limits, shard)?,
+        &base,
+    )
+    .await?;
+    // Publish a real duplicate request to establish a nonzero application
+    // checkpoint without adding a fragment to the legacy layout.
+    let duplicate = RecordBatch::try_new(
+        spec.body_schema().clone(),
+        vec![Arc::new(StringArray::from(vec!["turn-00000000"]))],
+    )?;
+    let key = spec.row_key(&duplicate, 0, 4096)?;
+    let (service, runtime) = owner(&cluster, &storage, &spec).await?;
+    let (stop, task) = run_owner(runtime);
+    let lane = producer(&service, 1).await?;
+    let body = fixture::encoded(single_body::batch(&spec, &limits, shard, &duplicate)?)?;
+    let append = request(&service, &lane, 1, body).await?;
+    let receipt = service.submit(&append, DEADLINE).await?;
+    assert_eq!(receipt.result, MutationResult::Applied);
+    drained(&cluster, &service, receipt.index).await?;
+    let original = service.selected_full_body(DEADLINE).await?;
+    assert_eq!(original.rows, Some(2 * rows_per_fragment as u64));
+    assert!(original.through >= receipt.index);
+    let original_base =
+        annotation_publication::read(&cluster, &storage, Some(original.manifest.version)).await?;
+    assert_eq!(original_base.fragments(), base.fragments());
+    stop.send(()).unwrap();
+    task.await??;
+    drop(service);
+
+    let ingress = single_body::connect_ingress(
+        cluster.client.clone(),
+        layout.clone(),
+        binding(),
+        &limits,
+        MergeMemoryBudget::new(8 << 20),
+        shard,
+        &spec,
+    )
+    .await?;
+    let mut options = Options {
+        max_source_bytes: 1 << 20,
+        compaction: Some(SmallFileCompaction {
+            target_file_bytes: 32 << 20,
+            min_fragments: 2,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let acquire = |expected_epoch| Acquisition {
+        owner: Uuid::new_v4(),
+        request: Uuid::new_v4(),
+        expected_epoch,
+    };
+    let old = materializer::Publisher::acquire(
+        ingress.clone(),
+        storage.clone(),
+        options.clone(),
+        MergeMemoryBudget::new(512 << 20),
+        acquire(
+            annotation_publication::state(&cluster)
+                .await?
+                .authority
+                .epoch,
+        ),
+    )
+    .await?;
+    let before = old.state().await?;
+    let plan = old
+        .maintenance_plan(&before)
+        .await?
+        .context("legacy compaction should select both fragments")?;
+    assert!(plan.is_maintenance());
+    old.record_plan(plan.clone()).await?;
+    let retained = old.state().await?;
+    let pending = retained.progress.pending.context("missing retained plan")?;
+    assert!(retained.progress.prepared.is_none());
+    drop(old);
+    cluster.shutdown().await?;
+
+    options.turn_id_index = Some(TurnIdIndex {
+        min_rows: MAX_BUILD_ROWS,
+        index_type: TurnIdIndexType::Bloomfilter,
+        routing_zonemap: false,
+    });
+    let cluster = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+    let (service, runtime) = Runtime::connect_body_shard(
+        cluster.client.clone(),
+        layout,
+        binding(),
+        storage.clone(),
+        Configuration {
+            limits,
+            upload_budget: MergeMemoryBudget::new(8 << 20),
+            apply_budget: MergeMemoryBudget::new(8 << 20),
+            publication_budget: MergeMemoryBudget::new(512 << 20),
+            publication: options,
+        },
+        acquire(retained.authority.epoch),
+        shard,
+        &spec,
+    )
+    .await?;
+    let (stop, mut task) = run_owner(runtime);
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let view = annotation_publication::state(&cluster).await?;
+            if view.progress.pending.is_none() {
+                let advanced = view
+                    .progress
+                    .advanced
+                    .context("missing rewrite completion")?;
+                assert!(advanced.sources.is_empty());
+                assert_eq!(advanced.publication.manifest.transaction, plan.transaction);
+                assert_eq!(advanced.publication.manifest.plan_index, pending.index);
+                assert_eq!(view.progress.checkpoint, before.progress.checkpoint);
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::select! {
+                stopped = &mut task => bail!("recovered compactor stopped: {stopped:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
+    .await??;
+    let selected = service.selected_full_body(DEADLINE).await?;
+    assert_eq!(selected.manifest.version, plan.target_version()?);
+    assert_eq!(selected.through, original.through);
+    let rewritten =
+        annotation_publication::read(&cluster, &storage, Some(selected.manifest.version)).await?;
+    let transaction = rewritten
+        .read_transaction()
+        .await?
+        .context("selected rewrite has no transaction")?;
+    assert!(matches!(
+        transaction.operation,
+        lance_table::transaction::Operation::Rewrite { .. }
+    ));
+    assert_eq!(rewritten.fragments().len(), 1);
+    assert_eq!(
+        rewritten.fragments()[0].physical_rows,
+        Some(2 * rows_per_fragment)
+    );
+    assert_eq!(service.submit(&append, DEADLINE).await?, receipt);
+    assert_eq!(
+        service
+            .get_full_body(&key, DEADLINE)
+            .await?
+            .unwrap()
+            .batch(),
+        &duplicate
+    );
+    stop.send(()).unwrap();
+    task.await??;
+    cluster.shutdown().await
+}
+
 fn compact_binding() -> TableBinding {
     TableBinding {
         max_record_bytes: 256 << 10,
