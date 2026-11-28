@@ -74,7 +74,7 @@ impl StatusIndex {
         dataset: &Dataset,
         min_rows: usize,
     ) -> Result<Option<Action>> {
-        TurnIdIndex::validate_base(dataset)?;
+        TurnIdIndex::validate_base(dataset, TurnIdIndexType::Btree)?;
         let fragments: BTreeMap<_, _> = dataset
             .fragments()
             .iter()

@@ -61,12 +61,13 @@ impl TurnIdIndex {
         Ok(())
     }
 
-    pub(crate) fn validate_base(dataset: &Dataset) -> Result<()> {
+    pub(crate) fn validate_base(dataset: &Dataset, index_type: TurnIdIndexType) -> Result<()> {
+        let strict_row_limit = index_type == TurnIdIndexType::Btree;
         ensure!(
             dataset.manifest().uses_stable_row_ids()
                 && dataset.fragments().iter().all(|f| f.deletion_file.is_none()
-                    && f.physical_rows.is_some_and(|n| n <= MAX_BUILD_ROWS)),
-            "turn ID indexing requires stable IDs and fragments of at most 1048576 physical rows without deletions"
+                    && f.physical_rows.is_some_and(|n| !strict_row_limit || n <= MAX_BUILD_ROWS)),
+            "turn ID indexing requires stable IDs, known fragment row counts and no deletions. BTree and status indexes require at most {MAX_BUILD_ROWS} rows per fragment"
         );
         Ok(())
     }
@@ -99,6 +100,7 @@ impl TurnIdIndex {
 
     /// The next bounded index action: turn IDs first, then the routing ZoneMap.
     pub(super) async fn action(&self, dataset: &Dataset) -> Result<Option<(Action, Key)>> {
+        Self::validate_base(dataset, self.index_type)?;
         // A full-body table may name its turn key differently; it then gets
         // only the routing ZoneMap.
         let has_id = dataset.schema().field(Key::Turn.column()).is_some();
@@ -116,7 +118,6 @@ impl TurnIdIndex {
     }
 
     async fn action_for(&self, dataset: &Dataset, key: Key) -> Result<Option<Action>> {
-        Self::validate_base(dataset)?;
         let fragments: BTreeMap<_, _> = dataset
             .fragments()
             .iter()
@@ -179,6 +180,8 @@ impl TurnIdIndex {
         }
         let mut selected = Vec::new();
         let mut rows = 0;
+        // Skipping indexes can leave larger historical fragments uncovered.
+        // The native scan still visits them and applies the exact predicate.
         for (id, count) in fragments {
             if covered.contains(&id) || count == 0 || count > MAX_BUILD_ROWS - rows {
                 continue;
