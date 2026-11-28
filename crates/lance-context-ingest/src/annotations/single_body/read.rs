@@ -29,6 +29,25 @@ impl Body {
 }
 
 impl Service {
+    #[cfg(all(test, feature = "http-client", feature = "service"))]
+    pub(crate) fn pause_body_fetch_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, captured) = tokio::sync::oneshot::channel();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        assert!(self
+            .shared
+            .pause_body_fetch
+            .lock()
+            .unwrap()
+            .replace((entered, wait))
+            .is_none());
+        (captured, resume)
+    }
+
     /// The staged source at `index` was retired from the WAL. Recapture this
     /// owner's installed compatible view and require it to cover `index` for
     /// exactly this table, group and incarnation (the source closure's cut
@@ -138,6 +157,15 @@ impl Service {
             let mut refetched = None;
             let mut recaptured = false;
             if let Some((source, meta)) = deferred {
+                #[cfg(all(test, feature = "http-client", feature = "service"))]
+                {
+                    let pause = self.shared.pause_body_fetch.lock().unwrap().take();
+                    if let Some((entered, wait)) = pause {
+                        let _ = entered.send(());
+                        wait.await
+                            .context("test released the body fetch gate without resuming")?;
+                    }
+                }
                 // Capture -> Close -> Fetch: publication can retire the WAL
                 // record after the ordered capture. The row is then in the
                 // installed base; recapture it below and read from Lance.

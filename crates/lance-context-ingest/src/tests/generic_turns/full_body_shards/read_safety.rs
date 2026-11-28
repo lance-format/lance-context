@@ -1,4 +1,4 @@
-//! Exercise real owner response ownership without a socket draining it first.
+//! Full-body HTTP reads across WAL retirement, owner takeover, and restart.
 use super::*;
 use crate::http::annotations::PointRequest;
 use lance_context_core::MergeReservation;
@@ -178,4 +178,248 @@ async fn fenced_read() -> Result<()> {
     stop_new.send(()).unwrap();
     new_task.await??;
     c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_body_http_crosses_wal_retirement_with_one_reader_permit() -> Result<()> {
+    tokio::time::timeout(DEADLINE, read_across_retirement()).await?
+}
+
+async fn read_across_retirement() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let input = body("session", "retired-before-fetch", 7)?;
+    let spec = TurnIngestionSpec::new(
+        input.schema(),
+        vec!["session_id".into(), "id".into()],
+        "session_id",
+    )?;
+    let shard = Shard::for_session(&layout, &binding(), "session")?;
+    let c = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+    let storage = fixture::storage(root.path(), "bodies.lance").await?;
+    let limits = lance_context_core::annotation_staging::Limits {
+        readers: 1,
+        ..fixture::limits()
+    };
+    crate::bootstrap::provision_body_shard(
+        c.client.clone(),
+        layout.clone(),
+        binding(),
+        storage.clone(),
+        Identity {
+            owner: Uuid::new_v4(),
+            acquisition: Uuid::new_v4(),
+            manifest: Uuid::new_v4(),
+        },
+        &limits,
+        shard,
+        &spec,
+    )
+    .await?;
+    let physical = Physical {
+        binding: binding(),
+        shard,
+        storage,
+    };
+    let (service, runtime) = physical
+        .owner_with_limits(&c, &layout, &spec, MergeMemoryBudget::new(32 << 20), limits)
+        .await?;
+    let mut runtime = runtime.with_owner_batch(Default::default())?;
+    let lane = service
+        .open_producer(ProducerOpen {
+            bucket: shard.bucket,
+            slot: 1,
+            expected_generation: 0,
+            operation: Uuid::new_v4(),
+        })
+        .await?;
+    let append = super::super::request(&service, &lane, 1, physical.wire(&spec, &input)?).await?;
+    let ack = {
+        let submitted = service.submit(&append, DEADLINE);
+        tokio::pin!(submitted);
+        loop {
+            runtime.apply_once_for_test().await?;
+            tokio::select! {
+                result = &mut submitted => break result?,
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {},
+            }
+        }
+    };
+    drop(append);
+    assert_eq!(ack.result, MutationResult::Applied);
+    assert!(service.selected_full_body(DEADLINE).await?.through < ack.index);
+
+    let owner = Owner::new(&runtime, keys()?, Default::default())?;
+    let server = Server::start(owner.router()).await?;
+    let (mut captured, resume) = service.pause_body_fetch_for_test();
+    let read = {
+        let base = server.base.clone();
+        let spec = spec.clone();
+        let input = input.clone();
+        tokio::spawn(async move { http_check(&base, &spec, &input).await })
+    };
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut captured => { result?; break; }
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                runtime.apply_once_for_test().await?;
+            }
+        }
+    }
+    assert_eq!(service.observation().await.0.readers, 1);
+    assert!(!read.is_finished());
+
+    publish_and_retire(&c, &physical, &service, &mut runtime, ack.index, None).await?;
+    assert_eq!(service.observation().await.0.readers, 1);
+    resume
+        .send(())
+        .expect("body read still waiting for WAL fetch");
+    read.await??;
+    owner.shutdown().await;
+    server.shutdown().await?;
+    drop((runtime, service));
+    c.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_commit_ack_survives_owner_and_source_leader_shutdown() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(45), Box::pin(ack_across_restart(false))).await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_commit_ack_survives_reopen_of_all_replica_disks() -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(45), Box::pin(ack_across_restart(true))).await?
+}
+
+async fn ack_across_restart(restart_all: bool) -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let layout = layout();
+    let input = body("session", "committed-before-owner-loss", 81)?;
+    let spec = TurnIngestionSpec::new(
+        input.schema(),
+        vec!["session_id".into(), "id".into()],
+        "session_id",
+    )?;
+    let shard = Shard::for_session(&layout, &binding(), "session")?;
+    let mut c = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+    let storage = fixture::storage(root.path(), "bodies.lance").await?;
+    crate::bootstrap::provision_body_shard(
+        c.client.clone(),
+        layout.clone(),
+        binding(),
+        storage.clone(),
+        Identity {
+            owner: Uuid::new_v4(),
+            acquisition: Uuid::new_v4(),
+            manifest: Uuid::new_v4(),
+        },
+        &fixture::limits(),
+        shard,
+        &spec,
+    )
+    .await?;
+    let physical = Physical {
+        binding: binding(),
+        shard,
+        storage,
+    };
+    let uploads = MergeMemoryBudget::new(32 << 20);
+    let (old_service, old_runtime) = physical.owner(&c, &layout, &spec, uploads.clone()).await?;
+    let old_owner = Owner::new(&old_runtime, keys()?, Default::default())?;
+    let old_server = Server::start(old_owner.router()).await?;
+    let journal = root.path().join("producer-journal");
+    let client = physical
+        .client(&journal, old_server.base.clone(), &layout, &spec, 1)
+        .await?;
+    let ack = client.commit(0, physical.wire(&spec, &input)?).await?;
+    // The old applier never runs. This is purely a durable WAL commit ACK.
+    assert!(old_service.observation().await.0.applied < ack.index);
+    assert!(client.selected_full_body().await?.through < ack.index);
+    client.shutdown().await?;
+    old_owner.shutdown().await;
+    old_server.shutdown().await?;
+    drop((old_runtime, old_service));
+    let group = layout.group_for_bucket(shard.bucket)?;
+    let stopped = if restart_all {
+        c.shutdown().await?;
+        c = network::Cluster::open_signed(root.path(), layout.clone()).await?;
+        None
+    } else {
+        Some(c.stop_source_leader(group).await?)
+    };
+
+    let (service, mut runtime) = physical.owner(&c, &layout, &spec, uploads).await?;
+    let owner = Owner::new(&runtime, keys()?, Default::default())?;
+    let server = Server::start(owner.router()).await?;
+    let client = physical
+        .client(&journal, server.base.clone(), &layout, &spec, 1)
+        .await?;
+    let recovered = client
+        .last_committed(0)
+        .await?
+        .context("durable journal lost the ACK")?;
+    assert_eq!(recovered.index, ack.index);
+    assert_eq!(recovered.receipt, ack.receipt);
+    assert_eq!(recovered.meta, ack.meta);
+    let recovery_cut = runtime.http_binding().2.max(ack.index);
+    while service.observation().await.0.applied < recovery_cut {
+        runtime.apply_once_for_test().await?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let applied = client
+        .wait_applied(0, &recovered)
+        .await
+        .context("recover original receipt")?;
+    assert_eq!(applied.completion.index, ack.index);
+    assert_eq!(applied.completion.result, MutationResult::Applied);
+    assert!(client.selected_full_body().await?.through < ack.index);
+    http_check(&server.base, &spec, &input)
+        .await
+        .context("read replayed staging before publication")?;
+
+    publish_and_retire(&c, &physical, &service, &mut runtime, ack.index, stopped).await?;
+    let selected = client.selected_full_body().await?;
+    assert!(selected.through >= ack.index);
+    assert_eq!(selected.rows, Some(1));
+    http_check(&server.base, &spec, &input).await?;
+    client.shutdown().await?;
+    owner.shutdown().await;
+    server.shutdown().await?;
+    drop((runtime, service));
+    c.shutdown().await
+}
+
+// A selected manifest alone does not prove that the bytes were retired. Query
+// each live voter directly before allowing the pending read to continue.
+async fn publish_and_retire(
+    c: &network::Cluster,
+    physical: &Physical,
+    service: &Service,
+    runtime: &mut Runtime,
+    cut: u64,
+    stopped: Option<u64>,
+) -> Result<()> {
+    while service.observation().await.0.materialized < cut {
+        runtime.publish_once_for_test().await?;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    physical.drained(c, service, cut).await?;
+    let group = service
+        .ingress()
+        .layout
+        .group_for_bucket(physical.shard.bucket)?;
+    for node in (1..=3).filter(|&node| Some(node) != stopped) {
+        loop {
+            let response = c
+                .client
+                .request(node, Request::Fetch { group, index: cut })
+                .await?;
+            if matches!(response.reply, Reply::Record(None)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    Ok(())
 }
